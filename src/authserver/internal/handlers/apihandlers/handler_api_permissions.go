@@ -1,0 +1,308 @@
+package apihandlers
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"slices"
+	"strconv"
+	"strings"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/leodip/goiabada/authserver/internal/accountvalidation"
+	"github.com/leodip/goiabada/authserver/internal/apimapping"
+	"github.com/leodip/goiabada/authserver/internal/audit"
+	"github.com/leodip/goiabada/authserver/internal/models"
+	"github.com/leodip/goiabada/core/api"
+	"github.com/leodip/goiabada/core/constants"
+	"github.com/leodip/goiabada/core/errs"
+	"github.com/leodip/goiabada/core/i18n"
+	"github.com/leodip/goiabada/core/validators"
+)
+
+// permissionsDatabase is what the permission endpoints need: the resource that owns a permission
+// and the permission rows under it.
+type permissionsDatabase interface {
+	CreatePermission(ctx context.Context, tx *sql.Tx, permission *models.Permission) error
+	DeletePermission(ctx context.Context, tx *sql.Tx, permissionId int64) error
+	GetPermissionsByResourceId(ctx context.Context, tx *sql.Tx, resourceId int64) ([]models.Permission, error)
+	GetResourceById(ctx context.Context, tx *sql.Tx, resourceId int64) (*models.Resource, error)
+	PermissionsLoadResources(ctx context.Context, tx *sql.Tx, permissions []models.Permission) error
+	UpdatePermission(ctx context.Context, tx *sql.Tx, permission *models.Permission) error
+}
+
+func HandleAPIPermissionsByResourceGet(
+	database permissionsDatabase,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		resourceIdStr := chi.URLParam(r, "resourceId")
+		if len(resourceIdStr) == 0 {
+			writeJSONError(w, "Resource ID is required", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		resourceId, err := strconv.ParseInt(resourceIdStr, 10, 64)
+		if err != nil {
+			writeJSONError(w, "Invalid resource ID format", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		permissions, err := database.GetPermissionsByResourceId(r.Context(), nil, resourceId)
+		if err != nil {
+			writeInternalServerError(w, r, errs.Wrap(err, "database error getting permissions"), "resource_id", resourceId)
+			return
+		}
+
+		// Ensure permissions is never nil
+		if permissions == nil {
+			permissions = []models.Permission{}
+		}
+
+		// Load resource information for each permission if we have any
+		if len(permissions) > 0 {
+			err = database.PermissionsLoadResources(r.Context(), nil, permissions)
+			if err != nil {
+				writeInternalServerError(w, r, err)
+				return
+			}
+
+			// Filter out the userinfo permission if the resource is authserver
+			if permissions[0].Resource.ResourceIdentifier == constants.AuthServerResourceIdentifier {
+				permissions = slices.DeleteFunc(permissions, func(p models.Permission) bool {
+					return p.PermissionIdentifier == constants.UserinfoPermissionIdentifier
+				})
+			}
+		}
+
+		response := api.GetPermissionsByResourceResponse{
+			Permissions: apimapping.ToPermissionResponses(permissions),
+		}
+
+		writeJSON(w, r, http.StatusOK, response)
+	}
+}
+
+// HandleAPIResourcePermissionsPut - PUT /api/v1/admin/resources/{resourceId}/permissions
+// Replaces the full set of permission definitions for a resource.
+func HandleAPIResourcePermissionsPut(
+	database permissionsDatabase,
+	identifierValidator *validators.IdentifierValidator,
+	auditLogger AuditLogger,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		resourceIdStr := chi.URLParam(r, "resourceId")
+		if len(resourceIdStr) == 0 {
+			writeJSONError(w, "Resource ID is required", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		resourceId, err := strconv.ParseInt(resourceIdStr, 10, 64)
+		if err != nil {
+			writeJSONError(w, "Invalid resource ID format", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		resource, err := database.GetResourceById(r.Context(), nil, resourceId)
+		if err != nil {
+			writeInternalServerError(w, r, errs.Wrap(err, "database error getting resource by ID for permissions update"), "resource_id", resourceId)
+			return
+		}
+		if resource == nil {
+			writeJSONError(w, "Resource not found", "NOT_FOUND", http.StatusNotFound)
+			return
+		}
+
+		var req api.UpdateResourcePermissionsRequest
+		if decodeErr := json.NewDecoder(r.Body).Decode(&req); decodeErr != nil {
+			writeJSONError(w, "Invalid request body", "INVALID_REQUEST_BODY", http.StatusBadRequest)
+			return
+		}
+
+		// Deduplicate identifiers and validate entries
+		seenIdentifiers := map[string]bool{}
+		seenIds := map[int64]bool{}
+		for i := range req.Permissions {
+			// Reject duplicate IDs (prevents bypass of built-in permission protection)
+			if req.Permissions[i].Id > 0 {
+				if seenIds[req.Permissions[i].Id] {
+					writeJSONError(w, "Duplicate permission IDs in request are not allowed", "VALIDATION_ERROR", http.StatusBadRequest)
+					return
+				}
+				seenIds[req.Permissions[i].Id] = true
+			}
+
+			// Trim inputs
+			rawIdentifier := strings.TrimSpace(req.Permissions[i].PermissionIdentifier)
+			rawDescription := strings.TrimSpace(req.Permissions[i].Description)
+
+			// Explicitly forbid HTML angle brackets in description
+			if validateNoAngleBracketsErr := accountvalidation.ValidateNoAngleBrackets(rawDescription,
+				i18n.ErrCodeAdminResourcePermissionsDescriptionHtmlNotAllowed); validateNoAngleBracketsErr != nil {
+				writeValidationError(w, r, validateNoAngleBracketsErr)
+				return
+			}
+
+			// The identifier is validated as it was sent, trimmed and nothing else. It used to be
+			// run through the HTML sanitizer first, which meant "valid<b" was stored as "valid":
+			// the sanitizer dropped everything from the "<" onwards and ValidateIdentifier then
+			// saw a name the caller never asked for. It is now refused instead (#275).
+			if len(rawIdentifier) == 0 {
+				writeJSONError(w, "Permission identifier is required", "VALIDATION_ERROR", http.StatusBadRequest)
+				return
+			}
+
+			if validateIdentifierErr := identifierValidator.ValidateIdentifier(rawIdentifier, true); validateIdentifierErr != nil {
+				writeValidationError(w, r, validateIdentifierErr)
+				return
+			}
+
+			const maxLengthDescription = 100
+			if len(rawDescription) > maxLengthDescription {
+				writeJSONError(w, fmt.Sprintf("The description cannot exceed a maximum length of %d characters.", maxLengthDescription), "VALIDATION_ERROR", http.StatusBadRequest)
+				return
+			}
+
+			if seenIdentifiers[rawIdentifier] {
+				writeJSONError(w, fmt.Sprintf("Permission %s is duplicated.", rawIdentifier), "VALIDATION_ERROR", http.StatusBadRequest)
+				return
+			}
+			seenIdentifiers[rawIdentifier] = true
+
+			// Persist the trimmed values back on request for subsequent operations
+			req.Permissions[i].PermissionIdentifier = rawIdentifier
+			req.Permissions[i].Description = rawDescription
+		}
+
+		// Load existing permissions once
+		existing, err := database.GetPermissionsByResourceId(r.Context(), nil, resource.Id)
+		if err != nil {
+			writeInternalServerError(w, r, errs.Wrap(err, "database error getting existing permissions"), "resource_id", resource.Id)
+			return
+		}
+
+		// Build a map for uniqueness checks
+		existingById := map[int64]models.Permission{}
+		existingByIdentifier := map[string]models.Permission{}
+		for _, p := range existing {
+			existingById[p.Id] = p
+			existingByIdentifier[p.PermissionIdentifier] = p
+		}
+
+		// System-level resource protection: validate built-in permissions for the authserver resource
+		if resource.ResourceIdentifier == constants.AuthServerResourceIdentifier {
+			for _, builtInIdentifier := range constants.BuiltInAuthServerPermissionIdentifiers {
+				// Check if the built-in permission exists in the database
+				existingPerm, found := existingByIdentifier[builtInIdentifier]
+				if !found {
+					writeInternalServerError(w, r,
+						errs.Errorf("built-in permission %q is missing from the system resource; the database may be corrupted or mis-seeded", builtInIdentifier),
+						"built_in_identifier", builtInIdentifier, "resource_id", resource.Id)
+					return
+				}
+
+				// The request must include an entry with the same DB row ID
+				var requestEntry *api.ResourcePermissionUpsert
+				for i := range req.Permissions {
+					if req.Permissions[i].Id == existingPerm.Id {
+						requestEntry = &req.Permissions[i]
+						break
+					}
+				}
+
+				if requestEntry == nil {
+					writeJSONError(w, fmt.Sprintf("Built-in permission '%s' cannot be deleted.", builtInIdentifier), "VALIDATION_ERROR", http.StatusBadRequest)
+					return
+				}
+
+				// The identifier must not be changed
+				if requestEntry.PermissionIdentifier != builtInIdentifier {
+					writeJSONError(w, fmt.Sprintf("Built-in permission '%s' cannot be renamed.", builtInIdentifier), "VALIDATION_ERROR", http.StatusBadRequest)
+					return
+				}
+
+				// Description changes are allowed (no check needed)
+			}
+		}
+
+		// First update existing permissions (Id > 0)
+		for _, p := range req.Permissions {
+			if p.Id > 0 {
+				cur, ok := existingById[p.Id]
+				if !ok {
+					writeJSONError(w, "Permission not found", "NOT_FOUND", http.StatusNotFound)
+					return
+				}
+				// If changing identifier, ensure no conflict with another permission
+				if other, exists := existingByIdentifier[p.PermissionIdentifier]; exists && other.Id != cur.Id {
+					writeJSONError(w, fmt.Sprintf("Permission identifier %s is already in use.", p.PermissionIdentifier), "VALIDATION_ERROR", http.StatusBadRequest)
+					return
+				}
+
+				cur.PermissionIdentifier = p.PermissionIdentifier
+				cur.Description = p.Description
+				if updatePermissionErr := database.UpdatePermission(r.Context(), nil, &cur); updatePermissionErr != nil {
+					writeInternalServerError(w, r, errs.Wrap(updatePermissionErr, "database error updating permission"), "permission_id", cur.Id)
+					return
+				}
+				// reflect change in maps
+				existingByIdentifier[p.PermissionIdentifier] = cur
+				existingById[p.Id] = cur
+			}
+		}
+
+		// Then create new permissions (Id <= 0)
+		for _, p := range req.Permissions {
+			if p.Id <= 0 {
+				if _, exists := existingByIdentifier[p.PermissionIdentifier]; exists {
+					writeJSONError(w, fmt.Sprintf("Permission identifier %s is already in use.", p.PermissionIdentifier), "VALIDATION_ERROR", http.StatusBadRequest)
+					return
+				}
+				perm := &models.Permission{
+					ResourceId:           resource.Id,
+					PermissionIdentifier: p.PermissionIdentifier,
+					Description:          p.Description,
+				}
+				if createPermissionErr := database.CreatePermission(r.Context(), nil, perm); createPermissionErr != nil {
+					writeInternalServerError(w, r, errs.Wrap(createPermissionErr, "database error creating permission"), "resource_id", resource.Id)
+					return
+				}
+				existingByIdentifier[perm.PermissionIdentifier] = *perm
+				existingById[perm.Id] = *perm
+			}
+		}
+
+		// Delete any permissions that are no longer present (by identifier set)
+		// Reload current permissions to be safe
+		current, err := database.GetPermissionsByResourceId(r.Context(), nil, resource.Id)
+		if err != nil {
+			writeInternalServerError(w, r, errs.Wrap(err, "database error getting current permissions for deletion"), "resource_id", resource.Id)
+			return
+		}
+		desiredIdentifiers := map[string]bool{}
+		for _, p := range req.Permissions {
+			desiredIdentifiers[p.PermissionIdentifier] = true
+		}
+		for _, existingPerm := range current {
+			if !desiredIdentifiers[existingPerm.PermissionIdentifier] {
+				if err := database.DeletePermission(r.Context(), nil, existingPerm.Id); err != nil {
+					writeInternalServerError(w, r, errs.Wrap(err, "database error deleting permission"), "permission_id", existingPerm.Id)
+					return
+				}
+			}
+		}
+
+		// Audit consolidated update
+		auditLogger.Log(r.Context(), audit.AuditUpdatedResourcePermissions, map[string]interface{}{
+			"resourceId":   resource.Id,
+			"loggedInUser": callerSubject(r),
+		})
+
+		// Respond success
+		resp := api.SuccessResponse{Success: true}
+		writeJSON(w, r, http.StatusOK, resp)
+	}
+}
+
+// Note: The previous validation endpoint [/resources/validate-permission] was removed.

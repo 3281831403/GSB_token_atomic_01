@@ -1,0 +1,605 @@
+package integrationtests
+
+import (
+	"context"
+	"io"
+	"net/url"
+	"testing"
+
+	"github.com/leodip/goiabada/authserver/internal/config"
+	"github.com/leodip/goiabada/authserver/internal/encryption"
+	"github.com/leodip/goiabada/authserver/internal/models"
+	"github.com/leodip/goiabada/authserver/internal/passwordhash"
+	"github.com/leodip/goiabada/authserver/internal/testutil/fake"
+	"github.com/leodip/goiabada/core/oauth"
+	"github.com/stretchr/testify/assert"
+)
+
+// =============================================================================
+// id_token_hint Persistence Tests
+// =============================================================================
+
+// TestIdTokenHint_PromptLogin_MismatchedUser_BlocksAtIssuance verifies that:
+// 1. id_token_hint is stored in AuthContext from the authorize endpoint
+// 2. The hint persists through the entire authentication state machine
+// 3. The issuance endpoint detects user mismatch and returns error=login_required
+// 4. State parameter is preserved in the error response
+func TestIdTokenHint_PromptLogin_MismatchedUser_BlocksAtIssuance(t *testing.T) {
+	// =========================================================================
+	// Step 1: Create User A and User B
+	// =========================================================================
+	passwordA := fake.Password(10)
+	passwordHashedA, err := passwordhash.Hash(passwordA)
+	assert.NoError(t, err)
+
+	userA := &models.User{
+		Subject:      fake.UUID(),
+		Enabled:      true,
+		Email:        fake.Email(),
+		PasswordHash: passwordHashedA,
+	}
+	err = database.CreateUser(context.Background(), nil, userA)
+	assert.NoError(t, err)
+
+	passwordB := fake.Password(10)
+	passwordHashedB, err := passwordhash.Hash(passwordB)
+	assert.NoError(t, err)
+
+	userB := &models.User{
+		Subject:      fake.UUID(),
+		Enabled:      true,
+		Email:        fake.Email(),
+		PasswordHash: passwordHashedB,
+	}
+	err = database.CreateUser(context.Background(), nil, userB)
+	assert.NoError(t, err)
+
+	// =========================================================================
+	// Step 2: Create client with confidential credentials
+	// =========================================================================
+	clientSecret := fake.LetterN(32)
+	clientSecretEncrypted, err := encryption.EncryptData(clientSecret)
+	assert.NoError(t, err)
+
+	client := &models.Client{
+		ClientIdentifier:         "test-client-" + fake.LetterN(8),
+		Enabled:                  true,
+		AuthorizationCodeEnabled: true,
+		IsPublic:                 false,
+		ConsentRequired:          false,
+		DefaultAcrLevel:          models.AcrLevel1,
+		ClientSecretEncrypted:    clientSecretEncrypted,
+	}
+	err = database.CreateClient(context.Background(), nil, client)
+	assert.NoError(t, err)
+
+	redirectUri := &models.RedirectURI{
+		ClientId: client.Id,
+		URI:      "https://example.com/callback",
+	}
+	err = database.CreateRedirectURI(context.Background(), nil, redirectUri)
+	assert.NoError(t, err)
+
+	// =========================================================================
+	// Step 3: Get an ID token for User A (complete full auth flow)
+	// =========================================================================
+	httpClientA := createHttpClient(t)
+	codeVerifierA := "code-verifier-a"
+	requestCodeChallengeA := oauth.GeneratePKCECodeChallenge(codeVerifierA)
+	requestStateA := fake.LetterN(8)
+	requestNonceA := fake.LetterN(8)
+	requestScope := "openid profile email"
+
+	destUrlA := config.GetAuthServer().BaseURL + "/auth/authorize/?client_id=" + client.ClientIdentifier +
+		"&redirect_uri=" + url.QueryEscape(redirectUri.URI) +
+		"&response_type=code" +
+		"&code_challenge_method=S256" +
+		"&code_challenge=" + requestCodeChallengeA +
+		"&scope=" + url.QueryEscape(requestScope) +
+		"&state=" + requestStateA +
+		"&nonce=" + requestNonceA
+
+	// Start auth flow for User A.
+	//
+	// The hops below reassign one respA, so each body is passed into its deferred close rather than
+	// read out of respA when the test returns: the bare `defer func() { _ = respA.Body.Close() }()`
+	// used elsewhere in this file captures the variable, so under reassignment every defer closes
+	// the last response and the earlier ones are never closed. The replay hop at the end of this
+	// function adds one more, which makes that worse.
+	respA, err := httpClientA.Get(destUrlA)
+	assert.NoError(t, err)
+	defer func(body io.ReadCloser) { _ = body.Close() }(respA.Body)
+
+	redirectLocation := assertRedirect(t, respA, "/auth/level1")
+	respA = loadPage(t, httpClientA, redirectLocation)
+	defer func(body io.ReadCloser) { _ = body.Close() }(respA.Body)
+
+	redirectLocation = assertRedirect(t, respA, "/auth/pwd")
+	respA = loadPage(t, httpClientA, redirectLocation)
+	defer func(body io.ReadCloser) { _ = body.Close() }(respA.Body)
+
+	respA = authenticateWithPassword(t, httpClientA, redirectLocation, respA, userA.Email, passwordA)
+	defer func(body io.ReadCloser) { _ = body.Close() }(respA.Body)
+
+	redirectLocation = assertRedirect(t, respA, "/auth/level1completed")
+	respA = loadPage(t, httpClientA, redirectLocation)
+	defer func(body io.ReadCloser) { _ = body.Close() }(respA.Body)
+
+	redirectLocation = assertRedirect(t, respA, "/auth/completed")
+	respA = loadPage(t, httpClientA, redirectLocation)
+	defer func(body io.ReadCloser) { _ = body.Close() }(respA.Body)
+
+	redirectLocation = assertRedirect(t, respA, "/auth/issue")
+	respA = loadPage(t, httpClientA, redirectLocation)
+	defer func(body io.ReadCloser) { _ = body.Close() }(respA.Body)
+
+	codeA, stateA := getCodeAndStateFromUrl(t, respA)
+	assert.Equal(t, requestStateA, stateA)
+
+	// Exchange code for tokens to get User A's ID token
+	tokenUrl := config.GetAuthServer().BaseURL + "/auth/token/"
+	formDataA := url.Values{
+		"grant_type":    {"authorization_code"},
+		"client_id":     {client.ClientIdentifier},
+		"client_secret": {clientSecret},
+		"code":          {codeA},
+		"redirect_uri":  {redirectUri.URI},
+		"code_verifier": {codeVerifierA},
+	}
+
+	tokenDataA := postToTokenEndpoint(t, httpClientA, tokenUrl, formDataA)
+	assert.NotNil(t, tokenDataA["id_token"], "id_token should be present in token response")
+	idTokenUserA := tokenDataA["id_token"].(string)
+	assert.NotEmpty(t, idTokenUserA)
+
+	// Verify User A's ID token contains correct subject
+	idClaimsA := decodeJWTPayload(t, idTokenUserA)
+	assert.Equal(t, userA.Subject, idClaimsA["sub"], "ID token should have User A's subject")
+
+	// =========================================================================
+	// Step 4: Start NEW auth request with id_token_hint and prompt=login
+	// Use a fresh HTTP client (no cookies, simulating fresh browser)
+	// =========================================================================
+	httpClientB := createHttpClient(t) // Fresh client, no session
+	codeVerifierB := "code-verifier-b"
+	requestCodeChallengeB := oauth.GeneratePKCECodeChallenge(codeVerifierB)
+	requestStateB := fake.LetterN(8)
+	requestNonceB := fake.LetterN(8)
+
+	destUrlB := config.GetAuthServer().BaseURL + "/auth/authorize/?client_id=" + client.ClientIdentifier +
+		"&redirect_uri=" + url.QueryEscape(redirectUri.URI) +
+		"&response_type=code" +
+		"&code_challenge_method=S256" +
+		"&code_challenge=" + requestCodeChallengeB +
+		"&scope=" + url.QueryEscape(requestScope) +
+		"&state=" + requestStateB +
+		"&nonce=" + requestNonceB +
+		"&id_token_hint=" + url.QueryEscape(idTokenUserA) +
+		"&prompt=login"
+
+	// =========================================================================
+	// Step 5: User B authenticates (different user than the hint)
+	// =========================================================================
+	respB, err := httpClientB.Get(destUrlB)
+	assert.NoError(t, err)
+	defer func(body io.ReadCloser) { _ = body.Close() }(respB.Body)
+
+	// Should redirect to login even with prompt=login (since no session exists)
+	redirectLocation = assertRedirect(t, respB, "/auth/level1")
+	respB = loadPage(t, httpClientB, redirectLocation)
+	defer func(body io.ReadCloser) { _ = body.Close() }(respB.Body)
+
+	redirectLocation = assertRedirect(t, respB, "/auth/pwd")
+	respB = loadPage(t, httpClientB, redirectLocation)
+	defer func(body io.ReadCloser) { _ = body.Close() }(respB.Body)
+
+	respB = authenticateWithPassword(t, httpClientB, redirectLocation, respB, userB.Email, passwordB)
+	defer func(body io.ReadCloser) { _ = body.Close() }(respB.Body)
+
+	redirectLocation = assertRedirect(t, respB, "/auth/level1completed")
+	respB = loadPage(t, httpClientB, redirectLocation)
+	defer func(body io.ReadCloser) { _ = body.Close() }(respB.Body)
+
+	redirectLocation = assertRedirect(t, respB, "/auth/completed")
+	respB = loadPage(t, httpClientB, redirectLocation)
+	defer func(body io.ReadCloser) { _ = body.Close() }(respB.Body)
+
+	// =========================================================================
+	// Step 6: At /auth/issue, expect error=login_required due to mismatch
+	// =========================================================================
+	issueUrl := assertRedirect(t, respB, "/auth/issue")
+	respB = loadPage(t, httpClientB, issueUrl)
+	defer func(body io.ReadCloser) { _ = body.Close() }(respB.Body)
+
+	// Should redirect back to client with error
+	assert.Equal(t, 302, respB.StatusCode, "Expected redirect to client callback")
+
+	errorCode, errorDescription, state := getErrorFromUrl(t, respB)
+
+	// Verify error response
+	assert.Equal(t, "login_required", errorCode,
+		"Expected error=login_required when authenticated user differs from id_token_hint subject")
+	assert.Contains(t, errorDescription, "authenticated user",
+		"Error description should mention user mismatch")
+	assert.Equal(t, requestStateB, state,
+		"State parameter should be preserved in error response")
+
+	// Verify redirect goes to the correct callback URI
+	location := respB.Header.Get("Location")
+	assert.Contains(t, location, redirectUri.URI,
+		"Should redirect to client's registered redirect_uri")
+
+	// =========================================================================
+	// Step 7: The refusal ended the ceremony, so it cannot be replayed
+	// =========================================================================
+	// This is the one refusal that left the browser holding a ready_to_issue_code context, the
+	// state that mints codes, with only the id_token_hint comparison between a replay and a code.
+	// The clear now reaches the browser, so replaying /auth/issue on the same jar has no context
+	// to resume and lands on the account profile instead of refusing a second time (#141).
+	respB = loadPage(t, httpClientB, issueUrl)
+	defer func(body io.ReadCloser) { _ = body.Close() }(respB.Body)
+
+	assert.Equal(t, 302, respB.StatusCode)
+	assert.Equal(t, config.GetAdminConsole().BaseURL+"/account/profile", respB.Header.Get("Location"),
+		"replaying the refused ceremony must not reach the auth context again")
+}
+
+// TestIdTokenHint_PromptLogin_MatchingUser_Success verifies that when the
+// id_token_hint matches the authenticated user, the flow completes successfully.
+func TestIdTokenHint_PromptLogin_MatchingUser_Success(t *testing.T) {
+	// =========================================================================
+	// Step 1: Create User A
+	// =========================================================================
+	password := fake.Password(10)
+	passwordHashed, err := passwordhash.Hash(password)
+	assert.NoError(t, err)
+
+	user := &models.User{
+		Subject:      fake.UUID(),
+		Enabled:      true,
+		Email:        fake.Email(),
+		PasswordHash: passwordHashed,
+	}
+	err = database.CreateUser(context.Background(), nil, user)
+	assert.NoError(t, err)
+
+	// =========================================================================
+	// Step 2: Create client
+	// =========================================================================
+	clientSecret := fake.LetterN(32)
+	clientSecretEncrypted, err := encryption.EncryptData(clientSecret)
+	assert.NoError(t, err)
+
+	client := &models.Client{
+		ClientIdentifier:         "test-client-" + fake.LetterN(8),
+		Enabled:                  true,
+		AuthorizationCodeEnabled: true,
+		IsPublic:                 false,
+		ConsentRequired:          false,
+		DefaultAcrLevel:          models.AcrLevel1,
+		ClientSecretEncrypted:    clientSecretEncrypted,
+	}
+	err = database.CreateClient(context.Background(), nil, client)
+	assert.NoError(t, err)
+
+	redirectUri := &models.RedirectURI{
+		ClientId: client.Id,
+		URI:      "https://example.com/callback",
+	}
+	err = database.CreateRedirectURI(context.Background(), nil, redirectUri)
+	assert.NoError(t, err)
+
+	// =========================================================================
+	// Step 3: Get an ID token for User A
+	// =========================================================================
+	httpClient1 := createHttpClient(t)
+	codeVerifier1 := "code-verifier-1"
+	requestCodeChallenge1 := oauth.GeneratePKCECodeChallenge(codeVerifier1)
+	requestState1 := fake.LetterN(8)
+	requestNonce1 := fake.LetterN(8)
+	requestScope := "openid profile email"
+
+	destUrl1 := config.GetAuthServer().BaseURL + "/auth/authorize/?client_id=" + client.ClientIdentifier +
+		"&redirect_uri=" + url.QueryEscape(redirectUri.URI) +
+		"&response_type=code" +
+		"&code_challenge_method=S256" +
+		"&code_challenge=" + requestCodeChallenge1 +
+		"&scope=" + url.QueryEscape(requestScope) +
+		"&state=" + requestState1 +
+		"&nonce=" + requestNonce1
+
+	resp, err := httpClient1.Get(destUrl1)
+	assert.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation := assertRedirect(t, resp, "/auth/level1")
+	resp = loadPage(t, httpClient1, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/pwd")
+	resp = loadPage(t, httpClient1, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	resp = authenticateWithPassword(t, httpClient1, redirectLocation, resp, user.Email, password)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/level1completed")
+	resp = loadPage(t, httpClient1, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/completed")
+	resp = loadPage(t, httpClient1, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/issue")
+	resp = loadPage(t, httpClient1, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	code1, state1 := getCodeAndStateFromUrl(t, resp)
+	assert.Equal(t, requestState1, state1)
+
+	// Exchange code for tokens
+	tokenUrl := config.GetAuthServer().BaseURL + "/auth/token/"
+	formData1 := url.Values{
+		"grant_type":    {"authorization_code"},
+		"client_id":     {client.ClientIdentifier},
+		"client_secret": {clientSecret},
+		"code":          {code1},
+		"redirect_uri":  {redirectUri.URI},
+		"code_verifier": {codeVerifier1},
+	}
+
+	tokenData1 := postToTokenEndpoint(t, httpClient1, tokenUrl, formData1)
+	assert.NotNil(t, tokenData1["id_token"])
+	idToken := tokenData1["id_token"].(string)
+	assert.NotEmpty(t, idToken)
+
+	// Verify ID token
+	idClaims := decodeJWTPayload(t, idToken)
+	assert.Equal(t, user.Subject, idClaims["sub"])
+
+	// =========================================================================
+	// Step 4: Start NEW auth with same user using id_token_hint + prompt=login
+	// =========================================================================
+	httpClient2 := createHttpClient(t) // Fresh client
+	codeVerifier2 := "code-verifier-2"
+	requestCodeChallenge2 := oauth.GeneratePKCECodeChallenge(codeVerifier2)
+	requestState2 := fake.LetterN(8)
+	requestNonce2 := fake.LetterN(8)
+
+	destUrl2 := config.GetAuthServer().BaseURL + "/auth/authorize/?client_id=" + client.ClientIdentifier +
+		"&redirect_uri=" + url.QueryEscape(redirectUri.URI) +
+		"&response_type=code" +
+		"&code_challenge_method=S256" +
+		"&code_challenge=" + requestCodeChallenge2 +
+		"&scope=" + url.QueryEscape(requestScope) +
+		"&state=" + requestState2 +
+		"&nonce=" + requestNonce2 +
+		"&id_token_hint=" + url.QueryEscape(idToken) +
+		"&prompt=login"
+
+	// =========================================================================
+	// Step 5: Same user authenticates again
+	// =========================================================================
+	resp2, err := httpClient2.Get(destUrl2)
+	assert.NoError(t, err)
+	defer func() { _ = resp2.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp2, "/auth/level1")
+	resp2 = loadPage(t, httpClient2, redirectLocation)
+	defer func() { _ = resp2.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp2, "/auth/pwd")
+	resp2 = loadPage(t, httpClient2, redirectLocation)
+	defer func() { _ = resp2.Body.Close() }()
+
+	resp2 = authenticateWithPassword(t, httpClient2, redirectLocation, resp2, user.Email, password)
+	defer func() { _ = resp2.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp2, "/auth/level1completed")
+	resp2 = loadPage(t, httpClient2, redirectLocation)
+	defer func() { _ = resp2.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp2, "/auth/completed")
+	resp2 = loadPage(t, httpClient2, redirectLocation)
+	defer func() { _ = resp2.Body.Close() }()
+
+	// =========================================================================
+	// Step 6: Should succeed and issue code (user matches hint)
+	// =========================================================================
+	redirectLocation = assertRedirect(t, resp2, "/auth/issue")
+	resp2 = loadPage(t, httpClient2, redirectLocation)
+	defer func() { _ = resp2.Body.Close() }()
+
+	// Should get a code, not an error
+	code2, state2 := getCodeAndStateFromUrl(t, resp2)
+	assert.NotEmpty(t, code2, "Should receive authorization code when user matches id_token_hint")
+	assert.Equal(t, requestState2, state2)
+
+	// Exchange code for new tokens - should succeed
+	formData2 := url.Values{
+		"grant_type":    {"authorization_code"},
+		"client_id":     {client.ClientIdentifier},
+		"client_secret": {clientSecret},
+		"code":          {code2},
+		"redirect_uri":  {redirectUri.URI},
+		"code_verifier": {codeVerifier2},
+	}
+
+	tokenData2 := postToTokenEndpoint(t, httpClient2, tokenUrl, formData2)
+	assert.NotNil(t, tokenData2["access_token"], "Should receive access_token")
+	assert.NotNil(t, tokenData2["id_token"], "Should receive id_token")
+
+	// Verify new ID token still has same subject
+	newIdToken := tokenData2["id_token"].(string)
+	newIdClaims := decodeJWTPayload(t, newIdToken)
+	assert.Equal(t, user.Subject, newIdClaims["sub"])
+}
+
+// TestIdTokenHint_NoPrompt_MismatchedUser_BlocksAtIssuance verifies that
+// id_token_hint works even without prompt=login parameter.
+func TestIdTokenHint_NoPrompt_MismatchedUser_BlocksAtIssuance(t *testing.T) {
+	// Create two users
+	passwordA := fake.Password(10)
+	passwordHashedA, err := passwordhash.Hash(passwordA)
+	assert.NoError(t, err)
+
+	userA := &models.User{
+		Subject:      fake.UUID(),
+		Enabled:      true,
+		Email:        fake.Email(),
+		PasswordHash: passwordHashedA,
+	}
+	err = database.CreateUser(context.Background(), nil, userA)
+	assert.NoError(t, err)
+
+	passwordB := fake.Password(10)
+	passwordHashedB, err := passwordhash.Hash(passwordB)
+	assert.NoError(t, err)
+
+	userB := &models.User{
+		Subject:      fake.UUID(),
+		Enabled:      true,
+		Email:        fake.Email(),
+		PasswordHash: passwordHashedB,
+	}
+	err = database.CreateUser(context.Background(), nil, userB)
+	assert.NoError(t, err)
+
+	// Create client
+	clientSecret := fake.LetterN(32)
+	clientSecretEncrypted, err := encryption.EncryptData(clientSecret)
+	assert.NoError(t, err)
+
+	client := &models.Client{
+		ClientIdentifier:         "test-client-" + fake.LetterN(8),
+		Enabled:                  true,
+		AuthorizationCodeEnabled: true,
+		IsPublic:                 false,
+		ConsentRequired:          false,
+		DefaultAcrLevel:          models.AcrLevel1,
+		ClientSecretEncrypted:    clientSecretEncrypted,
+	}
+	err = database.CreateClient(context.Background(), nil, client)
+	assert.NoError(t, err)
+
+	redirectUri := &models.RedirectURI{
+		ClientId: client.Id,
+		URI:      "https://example.com/callback",
+	}
+	err = database.CreateRedirectURI(context.Background(), nil, redirectUri)
+	assert.NoError(t, err)
+
+	// Get ID token for User A (complete flow and token exchange)
+	httpClientA := createHttpClient(t)
+	codeVerifierA := "code-verifier-a"
+	requestCodeChallengeA := oauth.GeneratePKCECodeChallenge(codeVerifierA)
+	requestStateA := fake.LetterN(8)
+	requestNonceA := fake.LetterN(8)
+	requestScope := "openid profile"
+
+	destUrlA := config.GetAuthServer().BaseURL + "/auth/authorize/?client_id=" + client.ClientIdentifier +
+		"&redirect_uri=" + url.QueryEscape(redirectUri.URI) +
+		"&response_type=code" +
+		"&code_challenge_method=S256" +
+		"&code_challenge=" + requestCodeChallengeA +
+		"&scope=" + url.QueryEscape(requestScope) +
+		"&state=" + requestStateA +
+		"&nonce=" + requestNonceA
+
+	respA, err := httpClientA.Get(destUrlA)
+	assert.NoError(t, err)
+	defer func() { _ = respA.Body.Close() }()
+
+	redirectLocation := assertRedirect(t, respA, "/auth/level1")
+	respA = loadPage(t, httpClientA, redirectLocation)
+	defer func() { _ = respA.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, respA, "/auth/pwd")
+	respA = loadPage(t, httpClientA, redirectLocation)
+	defer func() { _ = respA.Body.Close() }()
+
+	respA = authenticateWithPassword(t, httpClientA, redirectLocation, respA, userA.Email, passwordA)
+	defer func() { _ = respA.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, respA, "/auth/level1completed")
+	respA = loadPage(t, httpClientA, redirectLocation)
+	defer func() { _ = respA.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, respA, "/auth/completed")
+	respA = loadPage(t, httpClientA, redirectLocation)
+	defer func() { _ = respA.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, respA, "/auth/issue")
+	respA = loadPage(t, httpClientA, redirectLocation)
+	defer func() { _ = respA.Body.Close() }()
+
+	codeA, _ := getCodeAndStateFromUrl(t, respA)
+
+	// Exchange for ID token
+	tokenUrl := config.GetAuthServer().BaseURL + "/auth/token/"
+	formDataA := url.Values{
+		"grant_type":    {"authorization_code"},
+		"client_id":     {client.ClientIdentifier},
+		"client_secret": {clientSecret},
+		"code":          {codeA},
+		"redirect_uri":  {redirectUri.URI},
+		"code_verifier": {codeVerifierA},
+	}
+
+	tokenDataA := postToTokenEndpoint(t, httpClientA, tokenUrl, formDataA)
+	idTokenUserA := tokenDataA["id_token"].(string)
+
+	// Start new auth with User B using User A's id_token_hint (NO prompt parameter)
+	httpClientB := createHttpClient(t)
+	codeVerifierB := "code-verifier-b"
+	requestCodeChallengeB := oauth.GeneratePKCECodeChallenge(codeVerifierB)
+	requestStateB := fake.LetterN(8)
+	requestNonceB := fake.LetterN(8)
+
+	// Note: NO prompt=login parameter here
+	destUrlB := config.GetAuthServer().BaseURL + "/auth/authorize/?client_id=" + client.ClientIdentifier +
+		"&redirect_uri=" + url.QueryEscape(redirectUri.URI) +
+		"&response_type=code" +
+		"&code_challenge_method=S256" +
+		"&code_challenge=" + requestCodeChallengeB +
+		"&scope=" + url.QueryEscape(requestScope) +
+		"&state=" + requestStateB +
+		"&nonce=" + requestNonceB +
+		"&id_token_hint=" + url.QueryEscape(idTokenUserA)
+
+	// User B authenticates
+	respB, err := httpClientB.Get(destUrlB)
+	assert.NoError(t, err)
+	defer func() { _ = respB.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, respB, "/auth/level1")
+	respB = loadPage(t, httpClientB, redirectLocation)
+	defer func() { _ = respB.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, respB, "/auth/pwd")
+	respB = loadPage(t, httpClientB, redirectLocation)
+	defer func() { _ = respB.Body.Close() }()
+
+	respB = authenticateWithPassword(t, httpClientB, redirectLocation, respB, userB.Email, passwordB)
+	defer func() { _ = respB.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, respB, "/auth/level1completed")
+	respB = loadPage(t, httpClientB, redirectLocation)
+	defer func() { _ = respB.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, respB, "/auth/completed")
+	respB = loadPage(t, httpClientB, redirectLocation)
+	defer func() { _ = respB.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, respB, "/auth/issue")
+	respB = loadPage(t, httpClientB, redirectLocation)
+	defer func() { _ = respB.Body.Close() }()
+
+	// Should get error=login_required even without prompt parameter
+	errorCode, errorDescription, state := getErrorFromUrl(t, respB)
+	assert.Equal(t, "login_required", errorCode,
+		"Should return login_required error when user differs from id_token_hint, even without prompt parameter")
+	assert.Contains(t, errorDescription, "authenticated user")
+	assert.Equal(t, requestStateB, state)
+}

@@ -1,0 +1,240 @@
+package adminuserhandlers
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/leodip/goiabada/adminconsole/internal/constants"
+	"github.com/leodip/goiabada/adminconsole/internal/handlers"
+	"github.com/leodip/goiabada/adminconsole/internal/oauthclient"
+	"github.com/leodip/goiabada/core/api"
+	coreconstants "github.com/leodip/goiabada/core/constants"
+	"github.com/leodip/goiabada/core/errs"
+	"github.com/leodip/goiabada/core/gender"
+	"github.com/leodip/goiabada/core/locales"
+	"github.com/leodip/goiabada/core/sessionstore"
+	"github.com/leodip/goiabada/core/timezones"
+)
+
+// userProfileAPI is what the user profile page needs: the user, and the profile write.
+type userProfileAPI interface {
+	GetUserById(ctx context.Context, accessToken string, userId int64) (*api.UserResponse, error)
+	UpdateUserProfile(ctx context.Context, accessToken string, userId int64, request *api.UpdateUserProfileRequest) (*api.UserResponse, error)
+}
+
+func HandleAdminUserProfileGet(
+	httpHelper handlers.HttpHelper,
+	httpSession sessionstore.Store,
+	apiClient userProfileAPI,
+) http.HandlerFunc {
+
+	timezones := timezones.Get()
+	locales := locales.Get()
+
+	return func(w http.ResponseWriter, r *http.Request) {
+
+		idStr := chi.URLParam(r, "userId")
+		if len(idStr) == 0 {
+			httpHelper.NotFound(w, r)
+			return
+		}
+
+		id, err := strconv.ParseInt(idStr, 10, 64)
+		if err != nil {
+			httpHelper.NotFound(w, r)
+			return
+		}
+		// Get JWT info from context to extract access token
+		jwtInfo, ok := r.Context().Value(constants.ContextKeyJwtInfo).(oauthclient.JwtInfo)
+		if !ok {
+			httpHelper.InternalServerError(w, r, errs.New("no JWT info found in context"))
+			return
+		}
+
+		user, err := apiClient.GetUserById(r.Context(), jwtInfo.TokenResponse.AccessToken, id)
+		if err != nil {
+			handlers.HandleAPIError(httpHelper, w, r, err)
+			return
+		}
+		if user == nil {
+			httpHelper.NotFound(w, r)
+			return
+		}
+
+		sess, err := httpSession.Get(r, coreconstants.AdminConsoleSessionName)
+		if err != nil {
+			httpHelper.InternalServerError(w, r, err)
+			return
+		}
+
+		_, savedSuccessfully := sess.TakeFlash("savedSuccessfully")
+		if savedSuccessfully {
+			err = httpSession.Save(r, w, sess)
+			if err != nil {
+				httpHelper.InternalServerError(w, r, err)
+				return
+			}
+		}
+
+		bind := map[string]interface{}{
+			"user":              user,
+			"timezones":         timezones,
+			"locales":           locales,
+			"page":              r.URL.Query().Get("page"),
+			"query":             r.URL.Query().Get("query"),
+			"savedSuccessfully": savedSuccessfully,
+		}
+
+		err = httpHelper.RenderTemplate(w, r, "/layouts/menu_layout.html", "/admin_users_profile.html", bind)
+		if err != nil {
+			httpHelper.InternalServerError(w, r, err)
+			return
+		}
+	}
+}
+
+func HandleAdminUserProfilePost(
+	httpHelper handlers.HttpHelper,
+	httpSession sessionstore.Store,
+	apiClient userProfileAPI,
+) http.HandlerFunc {
+
+	timezones := timezones.Get()
+	locales := locales.Get()
+
+	return func(w http.ResponseWriter, r *http.Request) {
+
+		idStr := chi.URLParam(r, "userId")
+		if len(idStr) == 0 {
+			httpHelper.NotFound(w, r)
+			return
+		}
+
+		id, err := strconv.ParseInt(idStr, 10, 64)
+		if err != nil {
+			httpHelper.NotFound(w, r)
+			return
+		}
+
+		// Get JWT info from context to extract access token
+		jwtInfo, ok := r.Context().Value(constants.ContextKeyJwtInfo).(oauthclient.JwtInfo)
+		if !ok {
+			httpHelper.InternalServerError(w, r, errs.New("no JWT info found in context"))
+			return
+		}
+
+		// Parse zoneInfo form value
+		zoneInfoValue := r.FormValue("zoneInfo")
+		zoneInfoCountry := ""
+		zoneInfo := ""
+
+		if zoneInfoValue != "" {
+			zoneInfoParts := strings.Split(zoneInfoValue, "___")
+			if len(zoneInfoParts) != 2 {
+				httpHelper.InternalServerError(w, r, errs.New("invalid zoneInfo"))
+				return
+			}
+			zoneInfoCountry = zoneInfoParts[0]
+			zoneInfo = zoneInfoParts[1]
+		}
+
+		// Create update request
+		request := &api.UpdateUserProfileRequest{
+			Username:            strings.TrimSpace(r.FormValue("username")),
+			GivenName:           strings.TrimSpace(r.FormValue("givenName")),
+			MiddleName:          strings.TrimSpace(r.FormValue("middleName")),
+			FamilyName:          strings.TrimSpace(r.FormValue("familyName")),
+			Nickname:            strings.TrimSpace(r.FormValue("nickname")),
+			Website:             strings.TrimSpace(r.FormValue("website")),
+			Gender:              r.FormValue("gender"),
+			DateOfBirth:         strings.TrimSpace(r.FormValue("dateOfBirth")),
+			ZoneInfoCountryName: zoneInfoCountry,
+			ZoneInfo:            zoneInfo,
+			Locale:              r.FormValue("locale"),
+		}
+
+		// Call the profile update API
+		user, err := apiClient.UpdateUserProfile(r.Context(), jwtInfo.TokenResponse.AccessToken, id, request)
+		if err != nil {
+			// Handle validation errors by showing them in the form
+			handlers.HandleAPIErrorWithCallback(httpHelper, w, r, err, func(errorMessage string) {
+				// Get formUser data for form display
+				formUser, userErr := apiClient.GetUserById(r.Context(), jwtInfo.TokenResponse.AccessToken, id)
+				if userErr != nil {
+					handlers.HandleAPIError(httpHelper, w, r, userErr)
+					return
+				}
+
+				// Update user fields with form values for display
+				formUser.Username = request.Username
+				formUser.GivenName = request.GivenName
+				formUser.MiddleName = request.MiddleName
+				formUser.FamilyName = request.FamilyName
+				formUser.Nickname = request.Nickname
+				formUser.Website = request.Website
+				formUser.ZoneInfoCountryName = request.ZoneInfoCountryName
+				formUser.ZoneInfo = request.ZoneInfo
+				formUser.Locale = request.Locale
+
+				// Handle gender display
+				if len(request.Gender) > 0 {
+					i, parseErr := strconv.Atoi(request.Gender)
+					if parseErr == nil {
+						formUser.Gender = gender.Gender(i).String()
+					}
+				} else {
+					formUser.Gender = ""
+				}
+
+				// Handle date of birth display
+				if len(request.DateOfBirth) > 0 {
+					layout := "2006-01-02"
+					parsedTime, parseErr := time.Parse(layout, request.DateOfBirth)
+					if parseErr == nil {
+						formUser.BirthDate = &parsedTime
+					}
+				} else {
+					formUser.BirthDate = nil
+				}
+
+				bind := map[string]interface{}{
+					"user":      formUser,
+					"timezones": timezones,
+					"locales":   locales,
+					"page":      r.URL.Query().Get("page"),
+					"query":     r.URL.Query().Get("query"),
+					"error":     errorMessage,
+				}
+
+				err = httpHelper.RenderTemplate(w, r, "/layouts/menu_layout.html", "/admin_users_profile.html", bind)
+				if err != nil {
+					httpHelper.InternalServerError(w, r, err)
+					return
+				}
+			})
+			return
+		}
+
+		// Set success flash message
+		sess, err := httpSession.Get(r, coreconstants.AdminConsoleSessionName)
+		if err != nil {
+			httpHelper.InternalServerError(w, r, err)
+			return
+		}
+
+		sess.SetFlash("savedSuccessfully", "true")
+		err = httpSession.Save(r, w, sess)
+		if err != nil {
+			httpHelper.InternalServerError(w, r, err)
+			return
+		}
+
+		// Redirect to the profile page
+		http.Redirect(w, r, withListPosition(fmt.Sprintf("/admin/users/%v/profile", user.Id), r), http.StatusFound)
+	}
+}

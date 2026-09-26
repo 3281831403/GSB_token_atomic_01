@@ -1,0 +1,108 @@
+{{define "title"}}{{ .appName }} - {{ T $.ctx "adminconsole.account.otp.page_title" }}{{end}}
+{{define "pageTitle"}}{{ T $.ctx "adminconsole.account.otp.page_title" }}{{end}}
+
+{{define "subTitle"}}
+    <div class="text-xl font-semibold">{{ T $.ctx "adminconsole.account.otp.section_title" }}</div>
+    <div class="mt-2 divider"></div>
+{{end}}
+
+{{define "menu"}}
+    {{template "account_menu" . }}
+{{end}}
+
+{{define "head"}}
+
+
+
+{{end}}
+
+{{define "body"}}
+
+<form action="/account/otp" method="post">
+
+    {{ if .otpEnabled }}
+        <div class="grid grid-cols-1 gap-6 md:grid-cols-2">
+            <div>
+                <p class="p-[4px] rounded-lg text-success-content bg-success w-fit">{{ T $.ctx "adminconsole.account.otp.enabled_status" }}</p>
+                <p class="mt-4">{{ T $.ctx "adminconsole.account.otp.what_is" }}</p>
+                <p class="mt-4">{{ T $.ctx "adminconsole.account.otp.disable_recommendation" }}</p>
+            </div>
+        </div>
+
+        <div class="grid grid-cols-1 gap-6 mt-3 md:grid-cols-2">
+            <div class="w-full form-control">
+                <label class="label">
+                    <span class="label-text text-base-content">{{ T $.ctx "adminconsole.account.otp.field.password" }}</span>
+                </label>
+                <input type="password" name="password" value="" class="w-full input input-bordered " autofocus />
+            </div>
+        </div>
+
+        <div class="grid grid-cols-1 gap-6 md:grid-cols-2">
+
+            <div class="mt-6">
+                {{if .error}}
+                <div class="mb-4 text-right text-error">
+                    <p>{{.error}}</p>
+                </div>
+                {{end}}
+                <button class="float-right btn btn-primary">{{ T $.ctx "adminconsole.account.otp.disable_button" }}</button>
+            </div>
+
+        </div>
+    {{else}}
+        <div class="grid grid-cols-1 gap-6 md:grid-cols-2">
+            <div class="">
+                <p class="p-[4px] rounded-lg text-warning-content bg-warning w-fit">{{ T $.ctx "adminconsole.account.otp.disabled_status" }}</p>
+                <p class="mt-4">{{ T $.ctx "adminconsole.account.otp.what_is" }}</p>
+                <p class="mt-4">{{ T $.ctx "adminconsole.account.otp.enable_recommendation" }}</p>
+                <p class="mt-2"><strong class="text-lg text-accent">1.</strong> {{ T $.ctx "adminconsole.account.otp.step1_prefix" }}<a
+                        href="https://www.microsoft.com/en/security/mobile-authenticator-app"><span
+                            class="inline-block transition duration-200 text-primary hover:text-primary hover:underline hover:cursor-pointer">{{ T $.ctx "adminconsole.account.otp.step1_microsoft_label" }}</span></a>{{ T $.ctx "adminconsole.account.otp.step1_separator1" }}<a
+                        href="https://support.google.com/accounts/answer/1066447"><span
+                            class="inline-block transition duration-200 text-primary hover:text-primary hover:underline hover:cursor-pointer">{{ T $.ctx "adminconsole.account.otp.step1_google_label" }}</span></a>{{ T $.ctx "adminconsole.account.otp.step1_separator2" }}<a href="https://freeotp.github.io/"><span
+                            class="inline-block transition duration-200 text-primary hover:text-primary hover:underline hover:cursor-pointer">{{ T $.ctx "adminconsole.account.otp.step1_freeotp_label" }}</span></a>{{ T $.ctx "adminconsole.account.otp.step1_suffix" }}
+                </p>
+                <p class="mt-2"><strong class="text-lg text-accent">2.</strong> {{ T $.ctx "adminconsole.account.otp.step2" }}</p>
+                <img class="mx-auto mt-4 border rounded" src="data:image/png;base64,{{.base64Image}}" alt="{{ T $.ctx "adminconsole.account.otp.qr_alt" }}" />
+
+                <p class="mt-2">{{ T $.ctx "adminconsole.account.otp.scan_alternative" }}</p>
+                <pre class="mt-2">{{.secretKey}}</pre>
+
+                <p class="mt-2"><strong class="text-lg text-accent">3.</strong> {{ T $.ctx "adminconsole.account.otp.step3" }}</p>
+
+                <div class="w-full form-control">
+                    <label class="label">
+                        <span class="label-text text-base-content">{{ T $.ctx "adminconsole.account.otp.field.password" }}</span>
+                    </label>
+                    <input type="password" name="password" value="" class="w-full input input-bordered " autofocus />
+                </div>
+
+            </div>
+        </div>
+
+        <div class="grid grid-cols-1 gap-6 mt-2 md:grid-cols-2">
+            <div class="w-full form-control">
+                <label class="label">
+                    <span class="label-text text-base-content">{{ T $.ctx "adminconsole.account.otp.field.code" }}</span>
+                </label>
+                <input type="text" name="otp" value="" placeholder="123456"
+                    class="w-full input input-bordered" autocomplete="off" />
+            </div>
+        </div>
+
+        <div class="grid grid-cols-1 gap-6 mt-2 md:grid-cols-2">
+            <div class="mt-6">
+                {{if .error}}
+                <div class="mb-4 text-right text-error">
+                    <p>{{.error}}</p>
+                </div>
+                {{end}}
+                <button class="float-right btn btn-primary">{{ T $.ctx "adminconsole.account.otp.enable_button" }}</button>
+            </div>
+        </div>
+    {{end}}
+
+</form>
+
+{{end}}

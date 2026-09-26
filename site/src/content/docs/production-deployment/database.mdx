@@ -1,0 +1,87 @@
+---
+title: Database setup
+description: Pre-create the Goiabada database and run with a least-privilege database user.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+By default Goiabada creates its database at startup if it is not already there, which requires a
+login allowed to create databases on the server. Set `GOIABADA_DB_CREATE=false` when you have
+created the database yourself, or when the login is not allowed to: Goiabada then issues no
+`CREATE DATABASE` and opens no connection to `master` or `postgres`.
+
+Create the database with the statement for your engine, then give the login full rights inside it.
+
+## PostgreSQL
+
+```sql
+CREATE DATABASE goiabada ENCODING 'UTF8';
+```
+
+Make the login the owner, or grant it full rights in the database. It needs no `CREATEDB`
+attribute and no access to the `postgres` database.
+
+Quote the name if `GOIABADA_DB_NAME` is not all lower case. PostgreSQL folds an unquoted
+identifier, so `CREATE DATABASE Goiabada` makes a database called `goiabada`, which is not the one
+Goiabada connects to.
+
+## MySQL
+
+```sql
+CREATE DATABASE goiabada CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_as_cs;
+```
+
+`GRANT ALL PRIVILEGES ON goiabada.* TO 'goiabada'@'%';` is enough. No server-wide privilege is
+needed.
+
+## SQL Server
+
+```sql
+CREATE DATABASE goiabada COLLATE Latin1_General_100_CS_AS_KS_WS_SC_UTF8;
+```
+
+Map the login into the database and add it to `db_owner`. It needs no access to `master`.
+
+<Aside type="caution">
+On SQL Server, spell the `COLLATE` clause. A database default cannot be changed afterwards, because
+`ALTER DATABASE ... COLLATE` blocks while the application is connected, and every text column a
+future Goiabada migration adds inherits it.
+</Aside>
+
+`READ_COMMITTED_SNAPSHOT` is supported, on or off, and both settings are tested. Goiabada never
+requests `SNAPSHOT` isolation, so `ALLOW_SNAPSHOT_ISOLATION` has no effect on it either way.
+
+## SQLite
+
+There is nothing to pre-create, and `GOIABADA_DB_CREATE` does not apply: the driver creates the file.
+To refuse an absent file instead of creating one, put `mode=rw` in `GOIABADA_DB_DSN`.
+
+## Schema migrations and rollback
+
+Goiabada migrates its own schema. The auth server applies whatever migrations its release carries
+when it starts, so the schema needs no step of its own during an upgrade. Anything more a release
+asks of an upgrade, its release notes state. It refuses to start on a database that is half
+migrated, and on one a newer release has already migrated, since it cannot know what that release
+changed. The admin console holds no database
+connection of its own and reaches the auth server through its API, so restarting it migrates
+nothing.
+
+The commands below run against the database in `GOIABADA_DB_*` and do not start the server. The
+`--db-*` flags override those variables, given before or after `migrate`; any other flag goes before
+it. A mistyped command, such as `migrat`, is refused rather than starting the server.
+
+| Command | What it does |
+|---|---|
+| `goiabada-authserver migrate version` | Prints the schema version this binary expects and the one the database records |
+| `goiabada-authserver migrate to <version>` | Steps the schema to that version, up or down |
+
+To roll a deployment back to an earlier release, back the database up first, then run
+`goiabada-authserver migrate to <version>` on the **current** binary, naming the schema version the
+target release expects, which its release notes state. Install the target release afterwards. The
+current binary is the one that must run the step down, because it is the only one carrying the
+migrations being rolled back.
+
+A rollback discards whatever the newer release wrote into columns and tables the older one does not
+have. Rollback is supported between releases from this one onwards: `migrate to` refuses any version
+below the schema version this release ships with, because earlier releases changed stored data in
+ways no migration reverses. `migrate version` prints that number.

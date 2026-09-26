@@ -1,0 +1,621 @@
+package adminresourcehandlers
+
+import (
+	"context"
+	"net/http"
+	"slices"
+	"strconv"
+	"strings"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/leodip/goiabada/adminconsole/internal/constants"
+	"github.com/leodip/goiabada/adminconsole/internal/handlers"
+	"github.com/leodip/goiabada/adminconsole/internal/oauthclient"
+	"github.com/leodip/goiabada/adminconsole/internal/pagination"
+	"github.com/leodip/goiabada/core/api"
+	coreconstants "github.com/leodip/goiabada/core/constants"
+	"github.com/leodip/goiabada/core/errs"
+	"github.com/leodip/goiabada/core/sessionstore"
+)
+
+// resourceUsersWithPermissionAPI is what the users-with-permission page needs: the resource and
+// its permissions, the users holding one, and each user's own set.
+type resourceUsersWithPermissionAPI interface {
+	GetPermissionsByResource(ctx context.Context, accessToken string, resourceId int64) ([]api.PermissionResponse, error)
+	GetResourceById(ctx context.Context, accessToken string, resourceId int64) (*api.ResourceResponse, error)
+	GetUserPermissions(ctx context.Context, accessToken string, userId int64) (*api.UserResponse, []api.PermissionResponse, error)
+	GetUsersByPermission(ctx context.Context, accessToken string, permissionId int64, page, size int) ([]api.UserResponse, int, error)
+	SearchUsersWithPermissionAnnotation(ctx context.Context, accessToken string, permissionId int64, query string, page, size int) ([]api.UserWithPermissionResponse, int, error)
+	UpdateUserPermissions(ctx context.Context, accessToken string, userId int64, request *api.UpdateUserPermissionsRequest) error
+}
+
+func HandleAdminResourceUsersWithPermissionGet(
+	httpHelper handlers.HttpHelper,
+	httpSession sessionstore.Store,
+	apiClient resourceUsersWithPermissionAPI,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		idStr := chi.URLParam(r, "resourceId")
+		if len(idStr) == 0 {
+			httpHelper.NotFound(w, r)
+			return
+		}
+		id, err := strconv.ParseInt(idStr, 10, 64)
+		if err != nil {
+			httpHelper.NotFound(w, r)
+			return
+		}
+
+		// Access token
+		jwtInfo, ok := r.Context().Value(constants.ContextKeyJwtInfo).(oauthclient.JwtInfo)
+		if !ok {
+			httpHelper.InternalServerError(w, r, errs.New("no JWT info found in context"))
+			return
+		}
+		accessToken := jwtInfo.TokenResponse.AccessToken
+
+		resource, err := apiClient.GetResourceById(r.Context(), accessToken, id)
+		if err != nil {
+			handlers.HandleAPIError(httpHelper, w, r, err)
+			return
+		}
+		if resource == nil {
+			httpHelper.NotFound(w, r)
+			return
+		}
+
+		permissions, err := apiClient.GetPermissionsByResource(r.Context(), accessToken, resource.Id)
+		if err != nil {
+			handlers.HandleAPIError(httpHelper, w, r, err)
+			return
+		}
+		// filter out the userinfo permission if the resource is authserver
+		if resource.ResourceIdentifier == coreconstants.AuthServerResourceIdentifier {
+			permissions = slices.DeleteFunc(permissions, func(p api.PermissionResponse) bool {
+				return p.PermissionIdentifier == coreconstants.UserinfoPermissionIdentifier
+			})
+		}
+
+		selectedPermissionStr := r.URL.Query().Get("permission")
+		if len(selectedPermissionStr) == 0 {
+			if len(permissions) > 0 {
+				selectedPermissionStr = strconv.FormatInt(permissions[0].Id, 10)
+			} else {
+				selectedPermissionStr = "0"
+			}
+		}
+		selectedPermission, err := strconv.ParseInt(selectedPermissionStr, 10, 64)
+		if err != nil {
+			httpHelper.NotFound(w, r)
+			return
+		}
+
+		selectedPermissionIdentifier := ""
+		if selectedPermission > 0 {
+			// check if permission belongs to resource
+			var found bool
+			for _, permission := range permissions {
+				if permission.Id == selectedPermission {
+					found = true
+					selectedPermissionIdentifier = permission.PermissionIdentifier
+					break
+				}
+			}
+			if !found {
+				httpHelper.NotFound(w, r)
+				return
+			}
+		}
+
+		pageInt := pagination.ParsePage(r.URL.Query().Get("page"))
+
+		const pageSize = 10
+		var usersWithPermission []api.UserResponse
+		var total int
+		if selectedPermission > 0 {
+			usersWithPermission, total, err = apiClient.GetUsersByPermission(r.Context(), accessToken, selectedPermission, pageInt, pageSize)
+			if err != nil {
+				handlers.HandleAPIError(httpHelper, w, r, err)
+				return
+			}
+
+			// A page past the last one is only visible once the total has come
+			// back. Ask again at the last page rather than render an empty list
+			// under a bar that highlights a full one (#305).
+			if clamped := pagination.ClampPage(total, pageSize, pageInt); clamped != pageInt {
+				pageInt = clamped
+				usersWithPermission, total, err = apiClient.GetUsersByPermission(r.Context(), accessToken, selectedPermission, pageInt, pageSize)
+				if err != nil {
+					handlers.HandleAPIError(httpHelper, w, r, err)
+					return
+				}
+			}
+		} else {
+			// No permission is selected, so nothing is listed and the bar holds a
+			// lone page 1. Any page number lands on it.
+			pageInt = 1
+		}
+
+		pageResult := UsersWithPermissionPageResult{
+			Page:     pageInt,
+			PageSize: pageSize,
+			Total:    total,
+			Users:    usersWithPermission,
+		}
+
+		p := pagination.New(total, pageSize, pageInt, 5)
+
+		sess, err := httpSession.Get(r, coreconstants.AdminConsoleSessionName)
+		if err != nil {
+			httpHelper.InternalServerError(w, r, err)
+			return
+		}
+
+		_, savedSuccessfully := sess.TakeFlash("savedSuccessfully")
+		if savedSuccessfully {
+			err = httpSession.Save(r, w, sess)
+			if err != nil {
+				httpHelper.InternalServerError(w, r, err)
+				return
+			}
+		}
+
+		bind := map[string]interface{}{
+			"resourceId":                   resource.Id,
+			"resourceIdentifier":           resource.ResourceIdentifier,
+			"description":                  resource.Description,
+			"isSystemLevelResource":        resource.IsSystemLevelResource,
+			"permissions":                  permissions,
+			"selectedPermission":           selectedPermission,
+			"selectedPermissionIdentifier": selectedPermissionIdentifier,
+			"pageResult":                   pageResult,
+			"paginator":                    p,
+		}
+
+		err = httpHelper.RenderTemplate(w, r, "/layouts/menu_layout.html", "/admin_resources_users_with_permission.html", bind)
+		if err != nil {
+			httpHelper.InternalServerError(w, r, err)
+			return
+		}
+	}
+}
+
+func HandleAdminResourceUsersWithPermissionRemovePermissionPost(
+	httpHelper handlers.HttpHelper,
+	apiClient resourceUsersWithPermissionAPI,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		idStr := chi.URLParam(r, "resourceId")
+		if len(idStr) == 0 {
+			handlers.JsonNotFound(httpHelper, w, r)
+			return
+		}
+		id, err := strconv.ParseInt(idStr, 10, 64)
+		if err != nil {
+			handlers.JsonNotFound(httpHelper, w, r)
+			return
+		}
+
+		jwtInfo, ok := r.Context().Value(constants.ContextKeyJwtInfo).(oauthclient.JwtInfo)
+		if !ok {
+			httpHelper.JsonError(w, r, errs.New("no JWT info found in context"))
+			return
+		}
+		accessToken := jwtInfo.TokenResponse.AccessToken
+
+		resource, err := apiClient.GetResourceById(r.Context(), accessToken, id)
+		if err != nil {
+			handlers.HandleAPIErrorJson(httpHelper, w, r, err)
+			return
+		}
+		if resource == nil {
+			handlers.JsonNotFound(httpHelper, w, r)
+			return
+		}
+
+		userIdStr := chi.URLParam(r, "userId")
+		if len(userIdStr) == 0 {
+			handlers.JsonNotFound(httpHelper, w, r)
+			return
+		}
+		userId, err := strconv.ParseInt(userIdStr, 10, 64)
+		if err != nil {
+			handlers.JsonNotFound(httpHelper, w, r)
+			return
+		}
+
+		user, currentPerms, err := apiClient.GetUserPermissions(r.Context(), accessToken, userId)
+		if err != nil {
+			handlers.HandleAPIErrorJson(httpHelper, w, r, err)
+			return
+		}
+		if user == nil {
+			handlers.JsonNotFound(httpHelper, w, r)
+			return
+		}
+
+		permissionIdStr := chi.URLParam(r, "permissionId")
+		if len(permissionIdStr) == 0 {
+			handlers.JsonNotFound(httpHelper, w, r)
+			return
+		}
+		permissionId, err := strconv.ParseInt(permissionIdStr, 10, 64)
+		if err != nil {
+			handlers.JsonNotFound(httpHelper, w, r)
+			return
+		}
+
+		permissions, err := apiClient.GetPermissionsByResource(r.Context(), accessToken, resource.Id)
+		if err != nil {
+			handlers.HandleAPIErrorJson(httpHelper, w, r, err)
+			return
+		}
+		// filter out the userinfo permission if the resource is authserver
+		if resource.ResourceIdentifier == coreconstants.AuthServerResourceIdentifier {
+			permissions = slices.DeleteFunc(permissions, func(p api.PermissionResponse) bool {
+				return p.PermissionIdentifier == coreconstants.UserinfoPermissionIdentifier
+			})
+		}
+
+		found := false
+		for _, permission := range permissions {
+			if permission.Id == permissionId {
+				found = true
+				break
+			}
+		}
+		if !found {
+			httpHelper.JsonError(w, r, errs.Errorf("permission %v does not belong to resource %v", permissionId, resource.Id))
+			return
+		}
+
+		found = false
+		for _, permission := range currentPerms {
+			if permission.Id == permissionId {
+				found = true
+				break
+			}
+		}
+		if !found {
+			httpHelper.JsonError(w, r, errs.Errorf("user %v does not have permission %v", user.Id, permissionId))
+			return
+		}
+
+		// Build reduced set and update via API
+		newIds := make([]int64, 0, len(currentPerms))
+		for _, p := range currentPerms {
+			if p.Id != permissionId {
+				newIds = append(newIds, p.Id)
+			}
+		}
+		apiReq := &api.UpdateUserPermissionsRequest{PermissionIds: newIds}
+		if err := apiClient.UpdateUserPermissions(r.Context(), accessToken, user.Id, apiReq); err != nil {
+			handlers.HandleAPIErrorJson(httpHelper, w, r, err)
+			return
+		}
+
+		result := struct{ Success bool }{Success: true}
+		httpHelper.EncodeJson(w, r, result)
+	}
+}
+
+func HandleAdminResourceUsersWithPermissionAddGet(
+	httpHelper handlers.HttpHelper,
+	apiClient resourceUsersWithPermissionAPI,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		idStr := chi.URLParam(r, "resourceId")
+		if len(idStr) == 0 {
+			httpHelper.NotFound(w, r)
+			return
+		}
+		id, err := strconv.ParseInt(idStr, 10, 64)
+		if err != nil {
+			httpHelper.NotFound(w, r)
+			return
+		}
+
+		jwtInfo, ok := r.Context().Value(constants.ContextKeyJwtInfo).(oauthclient.JwtInfo)
+		if !ok {
+			httpHelper.InternalServerError(w, r, errs.New("no JWT info found in context"))
+			return
+		}
+		accessToken := jwtInfo.TokenResponse.AccessToken
+
+		resource, err := apiClient.GetResourceById(r.Context(), accessToken, id)
+		if err != nil {
+			handlers.HandleAPIError(httpHelper, w, r, err)
+			return
+		}
+		if resource == nil {
+			httpHelper.NotFound(w, r)
+			return
+		}
+
+		permissions, err := apiClient.GetPermissionsByResource(r.Context(), accessToken, resource.Id)
+		if err != nil {
+			handlers.HandleAPIError(httpHelper, w, r, err)
+			return
+		}
+		// filter out the userinfo permission if the resource is authserver
+		if resource.ResourceIdentifier == coreconstants.AuthServerResourceIdentifier {
+			permissions = slices.DeleteFunc(permissions, func(p api.PermissionResponse) bool {
+				return p.PermissionIdentifier == coreconstants.UserinfoPermissionIdentifier
+			})
+		}
+
+		selectedPermissionStr := chi.URLParam(r, "permissionId")
+		if len(selectedPermissionStr) == 0 {
+			if len(permissions) > 0 {
+				selectedPermissionStr = strconv.FormatInt(permissions[0].Id, 10)
+			} else {
+				selectedPermissionStr = "0"
+			}
+		}
+		selectedPermission, err := strconv.ParseInt(selectedPermissionStr, 10, 64)
+		if err != nil {
+			httpHelper.NotFound(w, r)
+			return
+		}
+
+		// check if permission belongs to resource
+		selectedPermissionIdentifier := ""
+		var found bool
+		for _, permission := range permissions {
+			if permission.Id == selectedPermission {
+				found = true
+				selectedPermissionIdentifier = permission.PermissionIdentifier
+				break
+			}
+		}
+		if !found {
+			httpHelper.NotFound(w, r)
+			return
+		}
+
+		// Only carried forward, into the link back to the list; the same parse as
+		// the list's, so an unparseable page does not answer 500 on one page and
+		// render on the other (#305).
+		pageInt := pagination.ParsePage(r.URL.Query().Get("page"))
+
+		bind := map[string]interface{}{
+			"resourceId":                   resource.Id,
+			"resourceIdentifier":           resource.ResourceIdentifier,
+			"description":                  resource.Description,
+			"isSystemLevelResource":        resource.IsSystemLevelResource,
+			"permissions":                  permissions,
+			"selectedPermission":           selectedPermission,
+			"selectedPermissionIdentifier": selectedPermissionIdentifier,
+			"page":                         pageInt,
+		}
+
+		err = httpHelper.RenderTemplate(w, r, "/layouts/menu_layout.html", "/admin_resources_users_with_permission_add.html", bind)
+		if err != nil {
+			httpHelper.InternalServerError(w, r, err)
+			return
+		}
+	}
+}
+
+func HandleAdminResourceUsersWithPermissionSearchGet(
+	httpHelper handlers.HttpHelper,
+	apiClient resourceUsersWithPermissionAPI,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		result := SearchResult{}
+
+		idStr := chi.URLParam(r, "resourceId")
+		if len(idStr) == 0 {
+			handlers.JsonNotFound(httpHelper, w, r)
+			return
+		}
+		id, err := strconv.ParseInt(idStr, 10, 64)
+		if err != nil {
+			handlers.JsonNotFound(httpHelper, w, r)
+			return
+		}
+
+		jwtInfo, ok := r.Context().Value(constants.ContextKeyJwtInfo).(oauthclient.JwtInfo)
+		if !ok {
+			httpHelper.JsonError(w, r, errs.New("no JWT info found in context"))
+			return
+		}
+		accessToken := jwtInfo.TokenResponse.AccessToken
+
+		resource, err := apiClient.GetResourceById(r.Context(), accessToken, id)
+		if err != nil {
+			handlers.HandleAPIErrorJson(httpHelper, w, r, err)
+			return
+		}
+		if resource == nil {
+			handlers.JsonNotFound(httpHelper, w, r)
+			return
+		}
+
+		permissions, err := apiClient.GetPermissionsByResource(r.Context(), accessToken, resource.Id)
+		if err != nil {
+			handlers.HandleAPIErrorJson(httpHelper, w, r, err)
+			return
+		}
+		// filter out the userinfo permission if the resource is authserver
+		if resource.ResourceIdentifier == coreconstants.AuthServerResourceIdentifier {
+			permissions = slices.DeleteFunc(permissions, func(p api.PermissionResponse) bool {
+				return p.PermissionIdentifier == coreconstants.UserinfoPermissionIdentifier
+			})
+		}
+
+		selectedPermissionStr := chi.URLParam(r, "permissionId")
+		if len(selectedPermissionStr) == 0 {
+			if len(permissions) > 0 {
+				selectedPermissionStr = strconv.FormatInt(permissions[0].Id, 10)
+			} else {
+				selectedPermissionStr = "0"
+			}
+		}
+		selectedPermission, err := strconv.ParseInt(selectedPermissionStr, 10, 64)
+		if err != nil {
+			handlers.JsonNotFound(httpHelper, w, r)
+			return
+		}
+		// check if permission belongs to resource
+		var found bool
+		for _, permission := range permissions {
+			if permission.Id == selectedPermission {
+				found = true
+				break
+			}
+		}
+		if !found {
+			handlers.JsonNotFound(httpHelper, w, r)
+			return
+		}
+
+		query := strings.TrimSpace(r.URL.Query().Get("query"))
+		if len(query) == 0 {
+			httpHelper.EncodeJson(w, r, result)
+			return
+		}
+
+		annotatedUsers, _, err := apiClient.SearchUsersWithPermissionAnnotation(r.Context(), accessToken, selectedPermission, query, 1, 15)
+		if err != nil {
+			handlers.HandleAPIErrorJson(httpHelper, w, r, err)
+			return
+		}
+		usersResult := make([]UserResult, 0, len(annotatedUsers))
+		for _, u := range annotatedUsers {
+			usersResult = append(usersResult, UserResult{
+				Id:            u.Id,
+				Subject:       u.Subject,
+				Username:      u.Username,
+				Email:         u.Email,
+				GivenName:     u.GivenName,
+				MiddleName:    u.MiddleName,
+				FamilyName:    u.FamilyName,
+				HasPermission: u.HasPermission,
+			})
+		}
+		result.Users = usersResult
+		httpHelper.EncodeJson(w, r, result)
+	}
+}
+
+func HandleAdminResourceUsersWithPermissionAddPermissionPost(
+	httpHelper handlers.HttpHelper,
+	apiClient resourceUsersWithPermissionAPI,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		idStr := chi.URLParam(r, "resourceId")
+		if len(idStr) == 0 {
+			handlers.JsonNotFound(httpHelper, w, r)
+			return
+		}
+		id, err := strconv.ParseInt(idStr, 10, 64)
+		if err != nil {
+			handlers.JsonNotFound(httpHelper, w, r)
+			return
+		}
+
+		jwtInfo, ok := r.Context().Value(constants.ContextKeyJwtInfo).(oauthclient.JwtInfo)
+		if !ok {
+			httpHelper.JsonError(w, r, errs.New("no JWT info found in context"))
+			return
+		}
+		accessToken := jwtInfo.TokenResponse.AccessToken
+
+		resource, err := apiClient.GetResourceById(r.Context(), accessToken, id)
+		if err != nil {
+			handlers.HandleAPIErrorJson(httpHelper, w, r, err)
+			return
+		}
+		if resource == nil {
+			handlers.JsonNotFound(httpHelper, w, r)
+			return
+		}
+
+		userIdStr := chi.URLParam(r, "userId")
+		if len(userIdStr) == 0 {
+			handlers.JsonNotFound(httpHelper, w, r)
+			return
+		}
+		userId, err := strconv.ParseInt(userIdStr, 10, 64)
+		if err != nil {
+			handlers.JsonNotFound(httpHelper, w, r)
+			return
+		}
+
+		user, currentPerms, err := apiClient.GetUserPermissions(r.Context(), accessToken, userId)
+		if err != nil {
+			handlers.HandleAPIErrorJson(httpHelper, w, r, err)
+			return
+		}
+		if user == nil {
+			handlers.JsonNotFound(httpHelper, w, r)
+			return
+		}
+
+		permissionIdStr := chi.URLParam(r, "permissionId")
+		if len(permissionIdStr) == 0 {
+			handlers.JsonNotFound(httpHelper, w, r)
+			return
+		}
+		permissionId, err := strconv.ParseInt(permissionIdStr, 10, 64)
+		if err != nil {
+			handlers.JsonNotFound(httpHelper, w, r)
+			return
+		}
+
+		permissions, err := apiClient.GetPermissionsByResource(r.Context(), accessToken, resource.Id)
+		if err != nil {
+			handlers.HandleAPIErrorJson(httpHelper, w, r, err)
+			return
+		}
+		// filter out the userinfo permission if the resource is authserver
+		if resource.ResourceIdentifier == coreconstants.AuthServerResourceIdentifier {
+			// build filtered list similar to groups handler to be safe
+			filtered := []api.PermissionResponse{}
+			for _, p := range permissions {
+				if p.Resource.ResourceIdentifier == coreconstants.AuthServerResourceIdentifier {
+					if p.PermissionIdentifier != coreconstants.UserinfoPermissionIdentifier {
+						filtered = append(filtered, p)
+					}
+				} else {
+					filtered = append(filtered, p)
+				}
+			}
+			permissions = filtered
+		}
+
+		found := false
+		for _, permission := range permissions {
+			if permission.Id == permissionId {
+				found = true
+				break
+			}
+		}
+		if !found {
+			httpHelper.JsonError(w, r, errs.Errorf("permission %v does not belong to resource %v", permissionId, resource.Id))
+			return
+		}
+
+		for _, permission := range currentPerms {
+			if permission.Id == permissionId {
+				httpHelper.JsonError(w, r, errs.Errorf("user %v already has permission %v", user.Id, permissionId))
+				return
+			}
+		}
+
+		newIds := make([]int64, 0, len(currentPerms)+1)
+		for _, p := range currentPerms {
+			newIds = append(newIds, p.Id)
+		}
+		newIds = append(newIds, permissionId)
+		apiReq := &api.UpdateUserPermissionsRequest{PermissionIds: newIds}
+		if err := apiClient.UpdateUserPermissions(r.Context(), accessToken, user.Id, apiReq); err != nil {
+			handlers.HandleAPIErrorJson(httpHelper, w, r, err)
+			return
+		}
+
+		result := struct{ Success bool }{Success: true}
+		httpHelper.EncodeJson(w, r, result)
+	}
+}

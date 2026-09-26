@@ -1,0 +1,97 @@
+{{define "title"}}{{ .appName }} - {{ T $.ctx "adminconsole.admin_users.delete.page_title_prefix" }}{{.user.Email}}{{end}}
+{{define "pageTitle"}}{{ T $.ctx "adminconsole.admin_users.delete.page_title_prefix" }}<span class="text-accent">{{.user.Email}}</span>{{end}}
+{{define "subTitle"}}{{end}}
+{{define "menu"}}
+    {{template "admin_menu" . }}
+{{end}}
+
+{{define "head"}}
+
+
+{{end}}
+
+{{define "body"}}
+
+<form method="post">
+
+    <div class="grid grid-cols-1 gap-6 lg:grid-cols-2">
+
+        <div class="w-full">
+            <p>{{ T $.ctx "adminconsole.admin_users.delete.are_you_sure" }}</p>
+            <p class="mt-6">{{ T $.ctx "adminconsole.admin_users.delete.warning_prefix" }}<span class='text-accent'>{{ T $.ctx "adminconsole.admin_users.delete.warning_em" }}</span>{{ T $.ctx "adminconsole.admin_users.delete.warning_suffix" }}</p>
+        </div>
+
+    </div>
+
+
+    <div class="grid grid-cols-1 gap-6 mt-6 lg:grid-cols-2">
+
+        <table class="table">
+            <tbody>
+                <tr>
+                    <td class="w-52">{{ T $.ctx "adminconsole.admin_users.delete.field.subject" }}</td>
+                    <td>{{.user.Subject}}</td>
+                </tr>
+                <tr>
+                    <td class="w-52">{{ T $.ctx "adminconsole.admin_users.delete.field.full_name" }}</td>
+                    <td>{{.userFullName}}</td>
+                </tr>
+                <tr>
+                    <td class="w-52">{{ T $.ctx "adminconsole.admin_users.delete.field.email" }}</td>
+                    <td>{{.user.Email}}</td>
+                </tr>
+                <tr>
+                    <td class="w-52">{{ T $.ctx "adminconsole.admin_users.delete.field.username" }}</td>
+                    <td>{{.user.Username}}</td>
+                </tr>
+                <tr>
+                    <td class="w-52">{{ T $.ctx "adminconsole.admin_users.delete.field.created_at" }}</td>
+                    <td>{{ DateTime $.ctx .user.CreatedAt }}</td>
+                </tr>
+                <tr>
+                    <td class="w-52">{{ T $.ctx "adminconsole.admin_users.delete.field.member_of_groups" }}</td>
+                    <td>
+                        <ul>
+                            {{if .groups}}
+                                {{range .groups}}
+                                    <li>
+                                        <span class="font-mono">{{.GroupIdentifier}}</span>
+                                    </li>
+                                {{end}}
+                            {{else}}
+                                <li>{{ T $.ctx "adminconsole.admin_users.delete.none" }}</li>
+                            {{end}}
+                        </ul>
+                    </td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+
+    <div class="grid grid-cols-1 gap-6 mt-8 lg:grid-cols-2">
+        <div>
+            {{if .error}}
+                <div class="mb-4 text-right text-error">
+                    <p>{{.error}}</p>
+                </div>
+            {{end}}
+            <div class="float-left p-3">
+                <a class="link-secondary" href="/admin/users{{if .query}}?query={{.query}}&page={{.page}}{{else}}?page={{.page}}{{end}}">
+                    <svg class="inline-block w-6 h-6 align-middle" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" d="M10.5 19.5L3 12m0 0l7.5-7.5M3 12h18" />
+                    </svg>
+                    <span class="ml-1 align-middle">{{ T $.ctx "adminconsole.admin_users.common.back_to_list" }}</span>
+                </a>
+            </div>
+            {{if .savedSuccessfully}}
+                <div class="mb-4 text-right text-success">
+                    <p>&#10004; {{ T $.ctx "adminconsole.admin_users.common.saved_successfully" }}</p>
+                </div>
+            {{end}}
+            <button id="btnDelete" class="float-right btn btn-primary">{{ T $.ctx "adminconsole.admin_users.delete.delete_button" }}</button>
+        </div>
+    </div>
+
+</form>
+
+{{end}}

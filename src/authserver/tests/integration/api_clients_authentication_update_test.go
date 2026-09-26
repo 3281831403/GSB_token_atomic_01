@@ -1,0 +1,263 @@
+package integrationtests
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"testing"
+
+	"github.com/leodip/goiabada/authserver/internal/config"
+	"github.com/leodip/goiabada/authserver/internal/encryption"
+	"github.com/leodip/goiabada/authserver/internal/models"
+	"github.com/leodip/goiabada/authserver/internal/testutil/fake"
+	"github.com/leodip/goiabada/core/api"
+	"github.com/leodip/goiabada/core/constants"
+	"github.com/leodip/goiabada/core/stringutil"
+	"github.com/stretchr/testify/assert"
+)
+
+func TestAPIClientAuthenticationPut_ConfidentialToPublic_Success(t *testing.T) {
+	accessToken, _ := createAdminClientWithToken(t)
+
+	// inline createConfidentialClient
+	clientSecret := stringutil.GenerateSecurityRandomString(60)
+	enc, err := encryption.EncryptData(clientSecret)
+	assert.NoError(t, err)
+	client := &models.Client{
+		ClientIdentifier:      "auth-client-" + strings.ToLower(fake.LetterN(10)),
+		Enabled:               true,
+		ConsentRequired:       false,
+		IsPublic:              false,
+		ClientSecretEncrypted: enc,
+		// Make client credentials enabled to verify it gets disabled when switching to public
+		ClientCredentialsEnabled: true,
+	}
+	err = database.CreateClient(context.Background(), nil, client)
+	assert.NoError(t, err)
+	defer func() { _ = database.DeleteClient(context.Background(), nil, client.Id) }()
+
+	reqBody := api.UpdateClientAuthenticationRequest{IsPublic: true}
+	url := config.GetAuthServer().BaseURL + "/api/v1/admin/clients/" + strconv.FormatInt(client.Id, 10) + "/authentication"
+	resp := makeAPIRequest(t, "PUT", url, accessToken, reqBody)
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+	// Verify DB updates
+	refreshed, err := database.GetClientById(context.Background(), nil, client.Id)
+	assert.NoError(t, err)
+	assert.NotNil(t, refreshed)
+	assert.True(t, refreshed.IsPublic)
+	assert.Nil(t, refreshed.ClientSecretEncrypted)
+	assert.False(t, refreshed.ClientCredentialsEnabled)
+}
+
+func TestAPIClientAuthenticationPut_PublicToConfidential_Success(t *testing.T) {
+	accessToken, _ := createAdminClientWithToken(t)
+
+	client := createPublicClient(t)
+	defer func() { _ = database.DeleteClient(context.Background(), nil, client.Id) }()
+
+	newSecret := stringutil.GenerateSecurityRandomString(60)
+	reqBody := api.UpdateClientAuthenticationRequest{IsPublic: false, ClientSecret: newSecret}
+	url := config.GetAuthServer().BaseURL + "/api/v1/admin/clients/" + strconv.FormatInt(client.Id, 10) + "/authentication"
+	resp := makeAPIRequest(t, "PUT", url, accessToken, reqBody)
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+	// Verify DB updates
+	refreshed, err := database.GetClientById(context.Background(), nil, client.Id)
+	assert.NoError(t, err)
+	assert.NotNil(t, refreshed)
+	assert.False(t, refreshed.IsPublic)
+	assert.NotNil(t, refreshed.ClientSecretEncrypted)
+
+	// Detail GET should include decrypted secret matching newSecret
+	detailURL := config.GetAuthServer().BaseURL + "/api/v1/admin/clients/" + strconv.FormatInt(client.Id, 10)
+	resp2 := makeAPIRequest(t, "GET", detailURL, accessToken, nil)
+	defer func() { _ = resp2.Body.Close() }()
+	assert.Equal(t, http.StatusOK, resp2.StatusCode)
+	var getResp api.GetClientResponse
+	err = json.NewDecoder(resp2.Body).Decode(&getResp)
+	assert.NoError(t, err)
+	assert.Equal(t, newSecret, getResp.Client.ClientSecret)
+}
+
+func TestAPIClientAuthenticationPut_InvalidSecret_TooShort(t *testing.T) {
+	accessToken, _ := createAdminClientWithToken(t)
+
+	client := createPublicClient(t)
+	defer func() { _ = database.DeleteClient(context.Background(), nil, client.Id) }()
+
+	// Too short secret
+	reqBody := api.UpdateClientAuthenticationRequest{IsPublic: false, ClientSecret: "abc123"}
+	url := config.GetAuthServer().BaseURL + "/api/v1/admin/clients/" + strconv.FormatInt(client.Id, 10) + "/authentication"
+	resp := makeAPIRequest(t, "PUT", url, accessToken, reqBody)
+	defer func() { _ = resp.Body.Close() }()
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	var body map[string]interface{}
+	_ = json.NewDecoder(resp.Body).Decode(&body)
+	if body["error_description"] != nil {
+		msg := body["error_description"].(string)
+		assert.Equal(t, "Invalid client secret. Please generate a new one.", msg)
+	}
+}
+
+func TestAPIClientAuthenticationPut_InvalidSecret_BadChars(t *testing.T) {
+	accessToken, _ := createAdminClientWithToken(t)
+
+	client := createPublicClient(t)
+	defer func() { _ = database.DeleteClient(context.Background(), nil, client.Id) }()
+
+	// 60 chars but includes an invalid '!'
+	bad := strings.Repeat("A", 59) + "!"
+	reqBody := api.UpdateClientAuthenticationRequest{IsPublic: false, ClientSecret: bad}
+	url := config.GetAuthServer().BaseURL + "/api/v1/admin/clients/" + strconv.FormatInt(client.Id, 10) + "/authentication"
+	resp := makeAPIRequest(t, "PUT", url, accessToken, reqBody)
+	defer func() { _ = resp.Body.Close() }()
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	var body map[string]interface{}
+	_ = json.NewDecoder(resp.Body).Decode(&body)
+	if body["error_description"] != nil {
+		msg := body["error_description"].(string)
+		assert.Equal(t, "Invalid client secret. Please generate a new one.", msg)
+	}
+}
+
+func TestAPIClientAuthenticationPut_NotFoundAndInvalidId(t *testing.T) {
+	accessToken, _ := createAdminClientWithToken(t)
+
+	// Not found
+	url := config.GetAuthServer().BaseURL + "/api/v1/admin/clients/999999/authentication"
+	resp := makeAPIRequest(t, "PUT", url, accessToken, api.UpdateClientAuthenticationRequest{IsPublic: true})
+	defer func() { _ = resp.Body.Close() }()
+	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
+	var nf map[string]interface{}
+	_ = json.NewDecoder(resp.Body).Decode(&nf)
+	if nf["error_description"] != nil {
+		msg := nf["error_description"].(string)
+		assert.Contains(t, msg, "Client not found")
+	}
+
+	// Invalid id
+	url2 := config.GetAuthServer().BaseURL + "/api/v1/admin/clients/abc/authentication"
+	resp2 := makeAPIRequest(t, "PUT", url2, accessToken, api.UpdateClientAuthenticationRequest{IsPublic: true})
+	defer func() { _ = resp2.Body.Close() }()
+	assert.Equal(t, http.StatusBadRequest, resp2.StatusCode)
+	var body map[string]interface{}
+	_ = json.NewDecoder(resp2.Body).Decode(&body)
+	if body["error_description"] != nil {
+		msg := body["error_description"].(string)
+		assert.Contains(t, msg, "Invalid client ID")
+	}
+}
+
+func TestAPIClientAuthenticationPut_SystemLevelClientAllowed(t *testing.T) {
+	accessToken, _ := createAdminClientWithToken(t)
+
+	// Get system-level client from DB so we can save/restore state
+	sysClient, err := database.GetClientByClientIdentifier(context.Background(), nil, constants.AdminConsoleClientIdentifier)
+	assert.NoError(t, err)
+	if sysClient == nil {
+		t.Skip("system-level client not found")
+	}
+
+	// Save original state for restore
+	origIsPublic := sysClient.IsPublic
+	origSecretEncrypted := sysClient.ClientSecretEncrypted
+	origCCEnabled := sysClient.ClientCredentialsEnabled
+	defer func() {
+		// Re-fetch to get current DB state, then restore original fields
+		c, _ := database.GetClientByClientIdentifier(context.Background(), nil, constants.AdminConsoleClientIdentifier)
+		if c != nil {
+			c.IsPublic = origIsPublic
+			c.ClientSecretEncrypted = origSecretEncrypted
+			c.ClientCredentialsEnabled = origCCEnabled
+			_ = database.UpdateClient(context.Background(), nil, c)
+		}
+	}()
+
+	// Update authentication settings (should succeed for system-level client)
+	apiURL := config.GetAuthServer().BaseURL + "/api/v1/admin/clients/" + strconv.FormatInt(sysClient.Id, 10) + "/authentication"
+	reqBody := api.UpdateClientAuthenticationRequest{IsPublic: false, ClientSecret: stringutil.GenerateSecurityRandomString(60)}
+	resp := makeAPIRequest(t, "PUT", apiURL, accessToken, reqBody)
+	defer func() { _ = resp.Body.Close() }()
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+}
+
+func TestAPIClientAuthenticationPut_InsufficientScope(t *testing.T) {
+	// Create a token with only auth-server:userinfo scope
+	clientSecret := stringutil.GenerateSecurityRandomString(60)
+	enc, err := encryption.EncryptData(clientSecret)
+	assert.NoError(t, err)
+
+	client := &models.Client{
+		ClientIdentifier:         "inscope-auth-" + strings.ToLower(fake.LetterN(8)),
+		Enabled:                  true,
+		ClientCredentialsEnabled: true,
+		IsPublic:                 false,
+		ClientSecretEncrypted:    enc,
+	}
+	err = database.CreateClient(context.Background(), nil, client)
+	assert.NoError(t, err)
+	defer func() { _ = database.DeleteClient(context.Background(), nil, client.Id) }()
+
+	// Grant auth-server:userinfo permission
+	authRes, err := database.GetResourceByResourceIdentifier(context.Background(), nil, constants.AuthServerResourceIdentifier)
+	assert.NoError(t, err)
+	perms, err := database.GetPermissionsByResourceId(context.Background(), nil, authRes.Id)
+	assert.NoError(t, err)
+	var userinfoPerm *models.Permission
+	for i := range perms {
+		if perms[i].PermissionIdentifier == constants.UserinfoPermissionIdentifier {
+			userinfoPerm = &perms[i]
+			break
+		}
+	}
+	assert.NotNil(t, userinfoPerm)
+	err = database.CreateClientPermission(context.Background(), nil, &models.ClientPermission{ClientId: client.Id, PermissionId: userinfoPerm.Id})
+	assert.NoError(t, err)
+
+	// Get token with only auth-server:userinfo scope
+	httpClient := createHttpClient(t)
+	destUrl := config.GetAuthServer().BaseURL + "/auth/token/"
+	formData := url.Values{
+		"grant_type":    {"client_credentials"},
+		"client_id":     {client.ClientIdentifier},
+		"client_secret": {clientSecret},
+		"scope":         {constants.AuthServerResourceIdentifier + ":" + constants.UserinfoPermissionIdentifier},
+	}
+	data := postToTokenEndpoint(t, httpClient, destUrl, formData)
+	accessToken, ok := data["access_token"].(string)
+	assert.True(t, ok)
+	assert.NotEmpty(t, accessToken)
+
+	// Create a target client to attempt updating
+	target := createPublicClient(t)
+	defer func() { _ = database.DeleteClient(context.Background(), nil, target.Id) }()
+
+	url := config.GetAuthServer().BaseURL + "/api/v1/admin/clients/" + strconv.FormatInt(target.Id, 10) + "/authentication"
+	reqBody := api.UpdateClientAuthenticationRequest{IsPublic: false, ClientSecret: stringutil.GenerateSecurityRandomString(60)}
+	resp := makeAPIRequest(t, "PUT", url, accessToken, reqBody)
+	defer func() { _ = resp.Body.Close() }()
+	assert.Equal(t, http.StatusForbidden, resp.StatusCode)
+}
+
+// helper to create a public client directly in DB
+func createPublicClient(t *testing.T) *models.Client {
+	t.Helper()
+	client := &models.Client{
+		ClientIdentifier:         "pub-client-" + strings.ToLower(fake.LetterN(10)),
+		Enabled:                  true,
+		ConsentRequired:          false,
+		IsPublic:                 true,
+		AuthorizationCodeEnabled: true,
+	}
+	err := database.CreateClient(context.Background(), nil, client)
+	assert.NoError(t, err)
+	return client
+}

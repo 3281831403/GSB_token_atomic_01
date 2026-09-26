@@ -1,0 +1,799 @@
+package integrationtests
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"net/http"
+	"strconv"
+	"strings"
+	"testing"
+
+	"github.com/leodip/goiabada/authserver/internal/config"
+	"github.com/leodip/goiabada/authserver/internal/encryption"
+	"github.com/leodip/goiabada/authserver/internal/models"
+	"github.com/leodip/goiabada/authserver/internal/oidc"
+	"github.com/leodip/goiabada/core/api"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// TestDCR_Disabled_Returns403 verifies that DCR returns 403 when feature is disabled (RFC 7591 §3)
+func TestDCR_Disabled_Returns403(t *testing.T) {
+	// Ensure DCR is disabled
+	settings, err := database.GetSettingsById(context.Background(), nil, 1)
+	assert.NoError(t, err)
+	originalDCREnabled := settings.DynamicClientRegistrationEnabled
+	settings.DynamicClientRegistrationEnabled = false
+	err = database.UpdateSettings(context.Background(), nil, settings)
+	assert.NoError(t, err)
+	defer func() {
+		// Restore original setting
+		settings.DynamicClientRegistrationEnabled = originalDCREnabled
+		_ = database.UpdateSettings(context.Background(), nil, settings)
+	}()
+
+	// Attempt to register a client
+	reqBody := oidc.DynamicClientRegistrationRequest{
+		RedirectURIs: []string{"http://localhost:3000/callback"},
+		ClientName:   "Test Client",
+	}
+
+	resp := makeDCRRequest(t, reqBody)
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusForbidden, resp.StatusCode)
+
+	var errorResp oidc.DynamicClientRegistrationError
+	err = json.NewDecoder(resp.Body).Decode(&errorResp)
+	assert.NoError(t, err)
+	assert.Equal(t, "access_denied", errorResp.Error)
+	assert.Contains(t, errorResp.ErrorDescription, "not enabled")
+}
+
+// TestDCR_PublicClient_MCP_UseCase_Success tests the happy path for MCP public clients (RFC 7591 §3)
+func TestDCR_PublicClient_MCP_UseCase_Success(t *testing.T) {
+	enableDCR(t)
+	defer disableDCR(t)
+
+	// MCP client registration request
+	reqBody := oidc.DynamicClientRegistrationRequest{
+		RedirectURIs:            []string{"http://localhost:8080/callback"},
+		TokenEndpointAuthMethod: "none", // Public client
+		GrantTypes:              []string{"authorization_code", "refresh_token"},
+		ClientName:              "MCP Remote Client",
+	}
+
+	resp := makeDCRRequest(t, reqBody)
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusCreated, resp.StatusCode)
+	assert.Equal(t, "application/json", resp.Header.Get("Content-Type"))
+	assert.Equal(t, "no-store", resp.Header.Get("Cache-Control"))
+	assert.Equal(t, "no-cache", resp.Header.Get("Pragma"))
+
+	var response oidc.DynamicClientRegistrationResponse
+	err := json.NewDecoder(resp.Body).Decode(&response)
+	assert.NoError(t, err)
+
+	// Verify response (RFC 7591 §3.2.1)
+	assert.NotEmpty(t, response.ClientID)
+	assert.True(t, strings.HasPrefix(response.ClientID, "dcr_"))
+	assert.Empty(t, response.ClientSecret, "Public clients should not receive a client_secret")
+	assert.Greater(t, response.ClientIDIssuedAt, int64(0))
+	assert.Equal(t, int64(0), response.ClientSecretExpiresAt, "Secret never expires")
+	assert.Equal(t, reqBody.RedirectURIs, response.RedirectURIs)
+	assert.Equal(t, "none", response.TokenEndpointAuthMethod)
+	assert.Equal(t, reqBody.GrantTypes, response.GrantTypes)
+	assert.Equal(t, "MCP Remote Client", response.ClientName)
+
+	// Verify database state
+	client, err := database.GetClientByClientIdentifier(context.Background(), nil, response.ClientID)
+	assert.NoError(t, err)
+	assert.NotNil(t, client)
+	assert.Equal(t, "MCP Remote Client", client.Description)
+	assert.True(t, client.IsPublic)
+	assert.True(t, client.Enabled)
+	assert.True(t, client.ConsentRequired, "A self-registered client asks the user before it receives their authority (#108)")
+	assert.True(t, client.CreatedViaDCR, "Registration is the only thing that sets this column (#108)")
+	assert.True(t, client.AuthorizationCodeEnabled)
+	assert.False(t, client.ClientCredentialsEnabled)
+	assert.Nil(t, client.ClientSecretEncrypted)
+
+	// Verify redirect URIs saved
+	redirectURIs, err := database.GetRedirectURIsByClientId(context.Background(), nil, client.Id)
+	assert.NoError(t, err)
+	assert.Len(t, redirectURIs, 1)
+	assert.Equal(t, "http://localhost:8080/callback", redirectURIs[0].URI)
+}
+
+// TestDCR_ConfidentialClient_Success tests confidential client registration with client_secret
+func TestDCR_ConfidentialClient_Success(t *testing.T) {
+	enableDCR(t)
+	defer disableDCR(t)
+
+	reqBody := oidc.DynamicClientRegistrationRequest{
+		RedirectURIs:            []string{"https://app.example.com/callback"},
+		TokenEndpointAuthMethod: "client_secret_post",
+		GrantTypes:              []string{"authorization_code", "client_credentials", "refresh_token"},
+		ClientName:              "Confidential App",
+	}
+
+	resp := makeDCRRequest(t, reqBody)
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusCreated, resp.StatusCode)
+
+	var response oidc.DynamicClientRegistrationResponse
+	err := json.NewDecoder(resp.Body).Decode(&response)
+	assert.NoError(t, err)
+
+	// Confidential clients MUST receive a client_secret (RFC 7591 §3.2.1)
+	assert.NotEmpty(t, response.ClientSecret)
+	assert.Greater(t, len(response.ClientSecret), 30, "Secret should be sufficiently long")
+	assert.Equal(t, "client_secret_post", response.TokenEndpointAuthMethod)
+
+	// Verify database state
+	client, err := database.GetClientByClientIdentifier(context.Background(), nil, response.ClientID)
+	assert.NoError(t, err)
+	assert.False(t, client.IsPublic)
+	assert.True(t, client.AuthorizationCodeEnabled)
+	assert.True(t, client.ClientCredentialsEnabled)
+	assert.NotNil(t, client.ClientSecretEncrypted)
+
+	// Verify secret can be decrypted and matches
+	decryptedSecret, err := encryption.DecryptData(client.ClientSecretEncrypted)
+	assert.NoError(t, err)
+	assert.Equal(t, response.ClientSecret, decryptedSecret)
+}
+
+// TestDCR_DefaultValues_Applied tests RFC 7591 §2 default values
+func TestDCR_DefaultValues_Applied(t *testing.T) {
+	enableDCR(t)
+	defer disableDCR(t)
+
+	// Minimal request - no token_endpoint_auth_method, no grant_types
+	reqBody := oidc.DynamicClientRegistrationRequest{
+		RedirectURIs: []string{"https://app.example.com/callback"},
+		ClientName:   "Minimal Client",
+	}
+
+	resp := makeDCRRequest(t, reqBody)
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusCreated, resp.StatusCode)
+
+	var response oidc.DynamicClientRegistrationResponse
+	err := json.NewDecoder(resp.Body).Decode(&response)
+	assert.NoError(t, err)
+
+	// Verify defaults (RFC 7591 §2)
+	assert.Equal(t, "client_secret_basic", response.TokenEndpointAuthMethod, "Default auth method")
+	assert.Equal(t, []string{"authorization_code"}, response.GrantTypes, "Default grant type")
+	assert.NotEmpty(t, response.ClientSecret, "Confidential client receives secret")
+
+	// Verify database
+	client, err := database.GetClientByClientIdentifier(context.Background(), nil, response.ClientID)
+	assert.NoError(t, err)
+	assert.False(t, client.IsPublic)
+	assert.True(t, client.AuthorizationCodeEnabled)
+	assert.False(t, client.ClientCredentialsEnabled)
+
+	// Registration stamps both columns, and it is the only thing that does. Consent on means
+	// the client reaches /auth/consent rather than /auth/issue, and created_via_dcr is what the
+	// consent screen's unverified marking and the refusal interstitial read (#108).
+	assert.True(t, client.ConsentRequired, "Self-registered clients require consent by default")
+	assert.True(t, client.CreatedViaDCR, "Self-registration is recorded in a column, not in the identifier prefix")
+}
+
+// TestDCR_RedirectURI_Validation tests RFC 7591 §5 redirect URI validation
+func TestDCR_RedirectURI_Validation(t *testing.T) {
+	enableDCR(t)
+	defer disableDCR(t)
+
+	testCases := []struct {
+		name           string
+		authMethod     string
+		redirectURIs   []string
+		grantTypes     []string
+		expectedStatus int
+		expectedError  string
+	}{
+		{
+			name:           "Public client - localhost HTTP allowed",
+			authMethod:     "none",
+			redirectURIs:   []string{"http://localhost:3000/callback"},
+			grantTypes:     []string{"authorization_code"},
+			expectedStatus: http.StatusCreated,
+		},
+		{
+			name:           "Public client - 127.0.0.1 HTTP allowed",
+			authMethod:     "none",
+			redirectURIs:   []string{"http://127.0.0.1:8080/callback"},
+			grantTypes:     []string{"authorization_code"},
+			expectedStatus: http.StatusCreated,
+		},
+		{
+			name:           "Public client - IPv6 localhost allowed",
+			authMethod:     "none",
+			redirectURIs:   []string{"http://[::1]:9000/callback"},
+			grantTypes:     []string{"authorization_code"},
+			expectedStatus: http.StatusCreated,
+		},
+		{
+			name:           "Public client - custom scheme allowed",
+			authMethod:     "none",
+			redirectURIs:   []string{"myapp://callback"},
+			grantTypes:     []string{"authorization_code"},
+			expectedStatus: http.StatusCreated,
+		},
+		{
+			name:           "Public client - HTTPS rejected (security)",
+			authMethod:     "none",
+			redirectURIs:   []string{"https://app.example.com/callback"},
+			grantTypes:     []string{"authorization_code"},
+			expectedStatus: http.StatusBadRequest,
+			expectedError:  oidc.DCRErrorInvalidRedirectURI,
+		},
+		{
+			name:           "Public client - non-localhost HTTP rejected",
+			authMethod:     "none",
+			redirectURIs:   []string{"http://example.com/callback"},
+			grantTypes:     []string{"authorization_code"},
+			expectedStatus: http.StatusBadRequest,
+			expectedError:  oidc.DCRErrorInvalidRedirectURI,
+		},
+		{
+			name:           "Confidential client - HTTPS allowed",
+			authMethod:     "client_secret_post",
+			redirectURIs:   []string{"https://app.example.com/callback"},
+			grantTypes:     []string{"authorization_code"},
+			expectedStatus: http.StatusCreated,
+		},
+		{
+			name:           "Confidential client - localhost HTTP allowed",
+			authMethod:     "client_secret_post",
+			redirectURIs:   []string{"http://localhost:3000/callback"},
+			grantTypes:     []string{"authorization_code"},
+			expectedStatus: http.StatusCreated,
+		},
+		{
+			name:           "Confidential client - non-localhost HTTP rejected",
+			authMethod:     "client_secret_post",
+			redirectURIs:   []string{"http://example.com/callback"},
+			grantTypes:     []string{"authorization_code"},
+			expectedStatus: http.StatusBadRequest,
+			expectedError:  oidc.DCRErrorInvalidRedirectURI,
+		},
+		// Issue #105: the loopback host check was a prefix match, so any host merely
+		// starting with a loopback name was accepted. Both client types are covered here
+		// because the defect was duplicated across the two branches.
+		//
+		// Deliberately thin: the exhaustive table lives with the function itself, in
+		// internal/handlers/handler_dynamic_client_registration_test.go. These two rows
+		// prove only that the HTTP endpoint reaches it.
+		{
+			name:           "Public client - host with a loopback prefix rejected",
+			authMethod:     "none",
+			redirectURIs:   []string{"http://localhost.attacker.com/callback"},
+			grantTypes:     []string{"authorization_code"},
+			expectedStatus: http.StatusBadRequest,
+			expectedError:  oidc.DCRErrorInvalidRedirectURI,
+		},
+		{
+			name:           "Confidential client - host with a loopback prefix rejected",
+			authMethod:     "client_secret_post",
+			redirectURIs:   []string{"http://localhost.attacker.com/callback"},
+			grantTypes:     []string{"authorization_code"},
+			expectedStatus: http.StatusBadRequest,
+			expectedError:  oidc.DCRErrorInvalidRedirectURI,
+		},
+		{
+			name:           "Missing redirect_uris for authorization_code",
+			authMethod:     "client_secret_post",
+			redirectURIs:   []string{},
+			grantTypes:     []string{"authorization_code"},
+			expectedStatus: http.StatusBadRequest,
+			expectedError:  oidc.DCRErrorInvalidRedirectURI,
+		},
+		{
+			name:           "Client credentials - no redirect_uris required",
+			authMethod:     "client_secret_post",
+			redirectURIs:   []string{},
+			grantTypes:     []string{"client_credentials"},
+			expectedStatus: http.StatusCreated,
+		},
+		{
+			name:           "Invalid URI format",
+			authMethod:     "client_secret_post",
+			redirectURIs:   []string{"not a valid uri"},
+			grantTypes:     []string{"authorization_code"},
+			expectedStatus: http.StatusBadRequest,
+			expectedError:  oidc.DCRErrorInvalidRedirectURI,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			reqBody := oidc.DynamicClientRegistrationRequest{
+				RedirectURIs:            tc.redirectURIs,
+				TokenEndpointAuthMethod: tc.authMethod,
+				GrantTypes:              tc.grantTypes,
+				ClientName:              tc.name,
+			}
+
+			resp := makeDCRRequest(t, reqBody)
+			defer func() { _ = resp.Body.Close() }()
+
+			assert.Equal(t, tc.expectedStatus, resp.StatusCode)
+
+			if tc.expectedStatus == http.StatusBadRequest {
+				var errorResp oidc.DynamicClientRegistrationError
+				err := json.NewDecoder(resp.Body).Decode(&errorResp)
+				assert.NoError(t, err)
+				assert.Equal(t, tc.expectedError, errorResp.Error)
+			}
+		})
+	}
+}
+
+// TestDCR_GrantType_Validation tests grant type validation
+func TestDCR_GrantType_Validation(t *testing.T) {
+	enableDCR(t)
+	defer disableDCR(t)
+
+	testCases := []struct {
+		name           string
+		grantTypes     []string
+		expectedStatus int
+		expectedError  string
+	}{
+		{
+			name:           "Valid grant types",
+			grantTypes:     []string{"authorization_code", "client_credentials", "refresh_token"},
+			expectedStatus: http.StatusCreated,
+		},
+		{
+			name:           "Unsupported grant type",
+			grantTypes:     []string{"password"},
+			expectedStatus: http.StatusBadRequest,
+			expectedError:  oidc.DCRErrorInvalidClientMetadata,
+		},
+		{
+			name:           "Unsupported implicit grant",
+			grantTypes:     []string{"implicit"},
+			expectedStatus: http.StatusBadRequest,
+			expectedError:  oidc.DCRErrorInvalidClientMetadata,
+		},
+		{
+			name:           "Mixed valid and invalid",
+			grantTypes:     []string{"authorization_code", "password"},
+			expectedStatus: http.StatusBadRequest,
+			expectedError:  oidc.DCRErrorInvalidClientMetadata,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			reqBody := oidc.DynamicClientRegistrationRequest{
+				RedirectURIs:            []string{"https://app.example.com/callback"},
+				TokenEndpointAuthMethod: "client_secret_post",
+				GrantTypes:              tc.grantTypes,
+				ClientName:              tc.name,
+			}
+
+			resp := makeDCRRequest(t, reqBody)
+			defer func() { _ = resp.Body.Close() }()
+
+			assert.Equal(t, tc.expectedStatus, resp.StatusCode)
+
+			if tc.expectedStatus == http.StatusBadRequest {
+				var errorResp oidc.DynamicClientRegistrationError
+				err := json.NewDecoder(resp.Body).Decode(&errorResp)
+				assert.NoError(t, err)
+				assert.Equal(t, tc.expectedError, errorResp.Error)
+			}
+		})
+	}
+}
+
+// TestDCR_TokenEndpointAuthMethod_Validation tests auth method validation
+func TestDCR_TokenEndpointAuthMethod_Validation(t *testing.T) {
+	enableDCR(t)
+	defer disableDCR(t)
+
+	testCases := []struct {
+		name           string
+		authMethod     string
+		expectedStatus int
+	}{
+		{
+			name:           "none - public client",
+			authMethod:     "none",
+			expectedStatus: http.StatusCreated,
+		},
+		{
+			name:           "client_secret_basic",
+			authMethod:     "client_secret_basic",
+			expectedStatus: http.StatusCreated,
+		},
+		{
+			name:           "client_secret_post",
+			authMethod:     "client_secret_post",
+			expectedStatus: http.StatusCreated,
+		},
+		{
+			name:           "Unsupported method",
+			authMethod:     "client_secret_jwt",
+			expectedStatus: http.StatusBadRequest,
+		},
+		{
+			name:           "Unsupported private_key_jwt",
+			authMethod:     "private_key_jwt",
+			expectedStatus: http.StatusBadRequest,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			reqBody := oidc.DynamicClientRegistrationRequest{
+				RedirectURIs:            []string{"http://localhost:3000/callback"},
+				TokenEndpointAuthMethod: tc.authMethod,
+				GrantTypes:              []string{"authorization_code"},
+				ClientName:              tc.name,
+			}
+
+			resp := makeDCRRequest(t, reqBody)
+			defer func() { _ = resp.Body.Close() }()
+
+			assert.Equal(t, tc.expectedStatus, resp.StatusCode)
+		})
+	}
+}
+
+// TestDCR_ClientName_Validation tests client name validation
+func TestDCR_ClientName_Validation(t *testing.T) {
+	enableDCR(t)
+	defer disableDCR(t)
+
+	testCases := []struct {
+		name           string
+		clientName     string
+		expectedStatus int
+		expectedError  string
+	}{
+		{
+			name:           "Normal name",
+			clientName:     "My Application",
+			expectedStatus: http.StatusCreated,
+		},
+		{
+			name:           "Empty name allowed",
+			clientName:     "",
+			expectedStatus: http.StatusCreated,
+		},
+		{
+			name:           "Max length (128 chars)",
+			clientName:     strings.Repeat("a", 128),
+			expectedStatus: http.StatusCreated,
+		},
+		{
+			name:           "Too long (129 chars)",
+			clientName:     strings.Repeat("a", 129),
+			expectedStatus: http.StatusBadRequest,
+			expectedError:  oidc.DCRErrorInvalidClientMetadata,
+		},
+		// client_name lands in clients.description, which the admin API refuses angle
+		// brackets in, so this path refuses them too (#275).
+		{
+			name:           "Markup is refused",
+			clientName:     "<script>alert(1)</script>",
+			expectedStatus: http.StatusBadRequest,
+			expectedError:  oidc.DCRErrorInvalidClientMetadata,
+		},
+		{
+			name:           "A bare closing bracket is refused",
+			clientName:     "Acme > Corp",
+			expectedStatus: http.StatusBadRequest,
+			expectedError:  oidc.DCRErrorInvalidClientMetadata,
+		},
+		// The accepted twin: ampersands and quotes are ordinary text and stay accepted.
+		{
+			name:           "Ampersands and quotes are accepted",
+			clientName:     `Acme & "Sons"`,
+			expectedStatus: http.StatusCreated,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			reqBody := oidc.DynamicClientRegistrationRequest{
+				RedirectURIs:            []string{"http://localhost:3000/callback"},
+				TokenEndpointAuthMethod: "none",
+				GrantTypes:              []string{"authorization_code"},
+				ClientName:              tc.clientName,
+			}
+
+			resp := makeDCRRequest(t, reqBody)
+			defer func() { _ = resp.Body.Close() }()
+
+			assert.Equal(t, tc.expectedStatus, resp.StatusCode)
+
+			if tc.expectedStatus == http.StatusBadRequest {
+				var errorResp oidc.DynamicClientRegistrationError
+				err := json.NewDecoder(resp.Body).Decode(&errorResp)
+				assert.NoError(t, err)
+				assert.Equal(t, tc.expectedError, errorResp.Error)
+			}
+		})
+	}
+}
+
+// TestDCR_WellKnown_Metadata tests that registration endpoint appears in discovery when enabled
+func TestDCR_WellKnown_Metadata(t *testing.T) {
+	settings, err := database.GetSettingsById(context.Background(), nil, 1)
+	assert.NoError(t, err)
+	originalDCREnabled := settings.DynamicClientRegistrationEnabled
+
+	t.Run("DCR enabled - registration_endpoint present", func(t *testing.T) {
+		settings.DynamicClientRegistrationEnabled = true
+		err = database.UpdateSettings(context.Background(), nil, settings)
+		assert.NoError(t, err)
+
+		httpClient := createHttpClient(t)
+		wellKnownURL := config.GetAuthServer().BaseURL + "/.well-known/openid-configuration"
+
+		resp, fetchErr := httpClient.Get(wellKnownURL)
+		assert.NoError(t, fetchErr)
+		defer func() { _ = resp.Body.Close() }()
+
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+		var metadata map[string]interface{}
+		fetchErr = json.NewDecoder(resp.Body).Decode(&metadata)
+		assert.NoError(t, fetchErr)
+
+		registrationEndpoint, ok := metadata["registration_endpoint"].(string)
+		assert.True(t, ok, "registration_endpoint should be present")
+		assert.Equal(t, config.GetAuthServer().BaseURL+"/connect/register", registrationEndpoint)
+	})
+
+	t.Run("DCR disabled - registration_endpoint absent", func(t *testing.T) {
+		settings.DynamicClientRegistrationEnabled = false
+		err = database.UpdateSettings(context.Background(), nil, settings)
+		assert.NoError(t, err)
+
+		httpClient := createHttpClient(t)
+		wellKnownURL := config.GetAuthServer().BaseURL + "/.well-known/openid-configuration"
+
+		resp, err := httpClient.Get(wellKnownURL)
+		assert.NoError(t, err)
+		defer func() { _ = resp.Body.Close() }()
+
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+		var metadata map[string]interface{}
+		err = json.NewDecoder(resp.Body).Decode(&metadata)
+		assert.NoError(t, err)
+
+		_, ok := metadata["registration_endpoint"]
+		assert.False(t, ok, "registration_endpoint should be absent when DCR disabled")
+	})
+
+	// Restore original setting
+	settings.DynamicClientRegistrationEnabled = originalDCREnabled
+	_ = database.UpdateSettings(context.Background(), nil, settings)
+}
+
+// TestDCR_MultipleRedirectURIs tests registering multiple redirect URIs
+func TestDCR_MultipleRedirectURIs(t *testing.T) {
+	enableDCR(t)
+	defer disableDCR(t)
+
+	reqBody := oidc.DynamicClientRegistrationRequest{
+		RedirectURIs: []string{
+			"http://localhost:3000/callback",
+			"http://localhost:3001/callback",
+			"http://127.0.0.1:8080/auth",
+		},
+		TokenEndpointAuthMethod: "none",
+		GrantTypes:              []string{"authorization_code"},
+		ClientName:              "Multi-URI Client",
+	}
+
+	resp := makeDCRRequest(t, reqBody)
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusCreated, resp.StatusCode)
+
+	var response oidc.DynamicClientRegistrationResponse
+	err := json.NewDecoder(resp.Body).Decode(&response)
+	assert.NoError(t, err)
+
+	assert.Len(t, response.RedirectURIs, 3)
+
+	// Verify all URIs saved in database
+	client, err := database.GetClientByClientIdentifier(context.Background(), nil, response.ClientID)
+	assert.NoError(t, err)
+
+	redirectURIs, err := database.GetRedirectURIsByClientId(context.Background(), nil, client.Id)
+	assert.NoError(t, err)
+	assert.Len(t, redirectURIs, 3)
+
+	uris := make([]string, len(redirectURIs))
+	for i, uri := range redirectURIs {
+		uris[i] = uri.URI
+	}
+	assert.ElementsMatch(t, reqBody.RedirectURIs, uris)
+}
+
+// TestDCR_ConfidentialClient_DefaultAcrLevel tests that DCR clients get sensible defaults
+func TestDCR_ConfidentialClient_DefaultAcrLevel(t *testing.T) {
+	enableDCR(t)
+	defer disableDCR(t)
+
+	reqBody := oidc.DynamicClientRegistrationRequest{
+		RedirectURIs:            []string{"https://app.example.com/callback"},
+		TokenEndpointAuthMethod: "client_secret_post",
+		GrantTypes:              []string{"authorization_code"},
+		ClientName:              "Default ACR Test",
+	}
+
+	resp := makeDCRRequest(t, reqBody)
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusCreated, resp.StatusCode)
+
+	var response oidc.DynamicClientRegistrationResponse
+	err := json.NewDecoder(resp.Body).Decode(&response)
+	assert.NoError(t, err)
+
+	// Verify database defaults
+	client, err := database.GetClientByClientIdentifier(context.Background(), nil, response.ClientID)
+	assert.NoError(t, err)
+
+	assert.Equal(t, models.AcrLevel2Optional, client.DefaultAcrLevel, "Should default to level 2 optional")
+
+	// Verify token expiration uses global settings
+	settings, err := database.GetSettingsById(context.Background(), nil, 1)
+	assert.NoError(t, err)
+	assert.Equal(t, settings.TokenExpirationInSeconds, client.TokenExpirationInSeconds)
+	assert.Equal(t, settings.RefreshTokenOfflineIdleTimeoutInSeconds, client.RefreshTokenOfflineIdleTimeoutInSeconds)
+	assert.Equal(t, settings.RefreshTokenOfflineMaxLifetimeInSeconds, client.RefreshTokenOfflineMaxLifetimeInSeconds)
+}
+
+// Helper functions
+
+// makeDCRRequest makes a DCR POST request without authentication (open registration)
+// require, not assert: returning a nil response here would surface as a SIGSEGV
+// in the caller instead of the real connectivity error.
+func makeDCRRequest(t *testing.T, body oidc.DynamicClientRegistrationRequest) *http.Response {
+	jsonBody, err := json.Marshal(body)
+	require.NoError(t, err)
+
+	url := config.GetAuthServer().BaseURL + "/connect/register"
+	req, err := http.NewRequest("POST", url, bytes.NewReader(jsonBody))
+	require.NoError(t, err)
+
+	req.Header.Set("Content-Type", "application/json")
+
+	httpClient := createHttpClient(t)
+	resp, err := httpClient.Do(req)
+	require.NoError(t, err)
+
+	return resp
+}
+
+// registerDCRClient registers a client through POST /connect/register and returns the persisted
+// row. Going through the endpoint rather than calling database.CreateClient is the point: a test
+// about how a self-registered client behaves has to get its defaults from the registration
+// handler, or it is asserting against defaults the test itself chose (#108).
+//
+// The caller owns the setting: call enableDCR before, and defer disableDCR.
+func registerDCRClient(t *testing.T, clientName string, redirectURI string) *models.Client {
+	resp := makeDCRRequest(t, oidc.DynamicClientRegistrationRequest{
+		RedirectURIs: []string{redirectURI},
+		ClientName:   clientName,
+	})
+	defer func() { _ = resp.Body.Close() }()
+
+	require.Equal(t, http.StatusCreated, resp.StatusCode)
+
+	var response oidc.DynamicClientRegistrationResponse
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&response))
+
+	client, err := database.GetClientByClientIdentifier(context.Background(), nil, response.ClientID)
+	require.NoError(t, err)
+	require.NotNil(t, client)
+
+	return client
+}
+
+// enableDCR enables Dynamic Client Registration for a test
+func enableDCR(t *testing.T) {
+	settings, err := database.GetSettingsById(context.Background(), nil, 1)
+	assert.NoError(t, err)
+	settings.DynamicClientRegistrationEnabled = true
+	err = database.UpdateSettings(context.Background(), nil, settings)
+	assert.NoError(t, err)
+}
+
+// disableDCR disables Dynamic Client Registration after a test
+func disableDCR(t *testing.T) {
+	settings, err := database.GetSettingsById(context.Background(), nil, 1)
+	assert.NoError(t, err)
+	settings.DynamicClientRegistrationEnabled = false
+	err = database.UpdateSettings(context.Background(), nil, settings)
+	assert.NoError(t, err)
+}
+
+// TestDCR_PublicClient_PKCERequiredIsWrittenExplicitly covers the one creation path that makes a
+// client public FROM INCEPTION (#245). Migration 000033 repairs rows that already exist and cannot
+// reach one registered afterwards, so without this write a self-registered public client keeps a
+// NULL column.
+//
+// The server enforces PKCE for it either way, so nothing here is about enforcement. What a NULL
+// costs is truthfulness: the admin API hands the raw pointer back in ClientResponse and the admin
+// console hands it raw to the template, where it renders as "inherit from the global setting", so
+// under a global-off deployment both would report the opposite of what the server does.
+//
+// Read back through the ADMIN RESPONSE rather than off the row, because the response is the
+// surface that would tell the lie, and a column assertion would pass with ToClientResponse
+// dropping the field entirely.
+func TestDCR_PublicClient_PKCERequiredIsWrittenExplicitly(t *testing.T) {
+	enableDCR(t)
+	defer disableDCR(t)
+
+	adminToken, _ := createAdminClientWithToken(t)
+
+	register := func(t *testing.T, authMethod string, redirectURI string) *api.ClientResponse {
+		t.Helper()
+
+		resp := makeDCRRequest(t, oidc.DynamicClientRegistrationRequest{
+			RedirectURIs:            []string{redirectURI},
+			TokenEndpointAuthMethod: authMethod,
+			GrantTypes:              []string{"authorization_code"},
+			ClientName:              "PKCE column " + authMethod,
+		})
+		defer func() { _ = resp.Body.Close() }()
+		require.Equal(t, http.StatusCreated, resp.StatusCode)
+
+		var registered oidc.DynamicClientRegistrationResponse
+		require.NoError(t, json.NewDecoder(resp.Body).Decode(&registered))
+
+		client, err := database.GetClientByClientIdentifier(context.Background(), nil, registered.ClientID)
+		require.NoError(t, err)
+		require.NotNil(t, client)
+		t.Cleanup(func() { _ = database.DeleteClient(context.Background(), nil, client.Id) })
+
+		detailURL := config.GetAuthServer().BaseURL + "/api/v1/admin/clients/" +
+			strconv.FormatInt(client.Id, 10)
+		detail := makeAPIRequest(t, "GET", detailURL, adminToken, nil)
+		defer func() { _ = detail.Body.Close() }()
+		require.Equal(t, http.StatusOK, detail.StatusCode)
+
+		var body api.GetClientResponse
+		require.NoError(t, json.NewDecoder(detail.Body).Decode(&body))
+		return &body.Client
+	}
+
+	t.Run("public", func(t *testing.T) {
+		// Loopback http, because that is the only redirect a public client may register
+		// (#105) and the MCP case this path exists for.
+		client := register(t, "none", "http://localhost:8080/callback")
+		require.True(t, client.IsPublic)
+		require.NotNil(t, client.PKCERequired,
+			"a self-registered public client must not be left inheriting the global setting")
+		assert.True(t, *client.PKCERequired)
+	})
+
+	t.Run("confidential", func(t *testing.T) {
+		// The negative control, and the reason the write is on the public path only: a
+		// confidential client inheriting the global is what the global setting is for, and
+		// pinning it here would quietly remove that.
+		client := register(t, "client_secret_post", "https://app.example.com/callback")
+		require.False(t, client.IsPublic)
+		assert.Nil(t, client.PKCERequired,
+			"a confidential client must keep inheriting the global setting")
+	})
+}

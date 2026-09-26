@@ -1,0 +1,321 @@
+package integrationtests
+
+import (
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"strconv"
+	"testing"
+	"time"
+
+	"github.com/leodip/goiabada/authserver/internal/config"
+	"github.com/leodip/goiabada/authserver/internal/models"
+	"github.com/leodip/goiabada/authserver/internal/testutil/fake"
+	"github.com/leodip/goiabada/core/api"
+	"github.com/leodip/goiabada/core/constants"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// GET /api/v1/account/sessions — happy path, includes isCurrent
+func TestAPIAccountSessionsGet_Success_IncludesIsCurrent(t *testing.T) {
+	accessToken, user := getUserAccessTokenWithAccountScope(t)
+
+	// Create an extra client and a couple of sessions linked to it for richer output
+	testClient := &models.Client{
+		ClientIdentifier:         "acct-sess-client-" + fake.UUID()[:8],
+		ClientSecretEncrypted:    []byte("encrypted-secret"),
+		Description:              "Account Sessions Client",
+		Enabled:                  true,
+		ConsentRequired:          false,
+		IsPublic:                 false,
+		AuthorizationCodeEnabled: true,
+		ClientCredentialsEnabled: false,
+	}
+	err := database.CreateClient(context.Background(), nil, testClient)
+	assert.NoError(t, err)
+	defer func() { _ = database.DeleteClient(context.Background(), nil, testClient.Id) }()
+
+	s1 := createTestUserSession(t, user.Id, fake.UUID())
+	s2 := createTestUserSession(t, user.Id, fake.UUID())
+	defer func() {
+		_ = database.DeleteUserSession(context.Background(), nil, s1.Id)
+		_ = database.DeleteUserSession(context.Background(), nil, s2.Id)
+	}()
+
+	now := time.Now().UTC()
+	_ = database.CreateUserSessionClient(context.Background(), nil, &models.UserSessionClient{UserSessionId: s1.Id, ClientId: testClient.Id, Started: now.Add(-time.Hour), LastAccessed: now.Add(-5 * time.Minute)})
+	_ = database.CreateUserSessionClient(context.Background(), nil, &models.UserSessionClient{UserSessionId: s2.Id, ClientId: testClient.Id, Started: now.Add(-time.Hour), LastAccessed: now.Add(-5 * time.Minute)})
+
+	url := config.GetAuthServer().BaseURL + "/api/v1/account/sessions"
+	resp := makeAPIRequest(t, "GET", url, accessToken, nil)
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, "application/json", resp.Header.Get("Content-Type"))
+
+	var out api.GetUserSessionsResponse
+	err = json.NewDecoder(resp.Body).Decode(&out)
+	assert.NoError(t, err)
+	assert.GreaterOrEqual(t, len(out.Sessions), 1)
+
+	foundCurrent := false
+	for _, s := range out.Sessions {
+		assert.Greater(t, s.Id, int64(0))
+		assert.NotEmpty(t, s.SessionIdentifier)
+		require.NotNil(t, s.Started)
+		require.NotNil(t, s.LastAccessed)
+		// isCurrent must be present; true for the session associated to the access token (sid)
+		if s.IsCurrent {
+			foundCurrent = true
+		}
+	}
+	assert.True(t, foundCurrent, "expected at least one session with isCurrent=true")
+
+	// The raw header, byte for byte, on the two fixture sessions. This endpoint also returns
+	// the live login session, whose header is whatever the test client sent, so the claim is
+	// made against the rows this test wrote rather than over the whole list (#281 decision 6).
+	byIdentifier := map[string]string{}
+	for _, s := range out.Sessions {
+		byIdentifier[s.SessionIdentifier] = s.UserAgent
+	}
+	for _, fixture := range []*models.UserSession{s1, s2} {
+		agent, present := byIdentifier[fixture.SessionIdentifier]
+		require.True(t, present, "fixture session %s missing from the response", fixture.SessionIdentifier)
+		assert.Equal(t, testSessionUserAgent, agent)
+	}
+}
+
+// Ensure invalid/expired sessions are filtered out
+func TestAPIAccountSessionsGet_OnlyValidSessions(t *testing.T) {
+	accessToken, user := getUserAccessTokenWithAccountScope(t)
+
+	valid := &models.UserSession{
+		SessionIdentifier: fake.UUID(),
+		Started:           time.Now().UTC().Add(-30 * time.Minute),
+		LastAccessed:      time.Now().UTC().Add(-5 * time.Minute),
+		AuthMethods:       "pwd",
+		AcrLevel:          "urn:goiabada:pwd",
+		AuthTime:          time.Now().UTC().Add(-30 * time.Minute),
+		IpAddress:         "192.168.1.100",
+		DeviceName:        "Valid Account Session",
+		DeviceType:        "computer",
+		DeviceOS:          "linux",
+		UserId:            user.Id,
+	}
+	err := database.CreateUserSession(context.Background(), nil, valid)
+	assert.NoError(t, err)
+	defer func() { _ = database.DeleteUserSession(context.Background(), nil, valid.Id) }()
+
+	expired := &models.UserSession{
+		SessionIdentifier: fake.UUID(),
+		Started:           time.Now().UTC().Add(-25 * time.Hour),
+		LastAccessed:      time.Now().UTC().Add(-24 * time.Hour),
+		AuthMethods:       "pwd",
+		AcrLevel:          "urn:goiabada:pwd",
+		AuthTime:          time.Now().UTC().Add(-25 * time.Hour),
+		IpAddress:         "192.168.1.100",
+		DeviceName:        "Expired Account Session",
+		DeviceType:        "computer",
+		DeviceOS:          "linux",
+		UserId:            user.Id,
+	}
+	err = database.CreateUserSession(context.Background(), nil, expired)
+	assert.NoError(t, err)
+	defer func() { _ = database.DeleteUserSession(context.Background(), nil, expired.Id) }()
+
+	url := config.GetAuthServer().BaseURL + "/api/v1/account/sessions"
+	resp := makeAPIRequest(t, "GET", url, accessToken, nil)
+	defer func() { _ = resp.Body.Close() }()
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+	var out api.GetUserSessionsResponse
+	err = json.NewDecoder(resp.Body).Decode(&out)
+	assert.NoError(t, err)
+
+	// Should not include the expired session identifier
+	for _, s := range out.Sessions {
+		assert.NotEqual(t, expired.SessionIdentifier, s.SessionIdentifier)
+	}
+}
+
+// DELETE /api/v1/account/sessions/{id} — success and ownership enforced
+func TestAPIAccountSessionDelete_Success(t *testing.T) {
+	accessToken, user := getUserAccessTokenWithAccountScope(t)
+
+	session := createTestUserSession(t, user.Id, fake.UUID())
+
+	url := config.GetAuthServer().BaseURL + "/api/v1/account/sessions/" + strconv.FormatInt(session.Id, 10)
+	resp := makeAPIRequest(t, "DELETE", url, accessToken, nil)
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, "application/json", resp.Header.Get("Content-Type"))
+
+	var out api.SuccessResponse
+	err := json.NewDecoder(resp.Body).Decode(&out)
+	assert.NoError(t, err)
+	assert.True(t, out.Success)
+
+	// ensure deleted
+	s, err := database.GetUserSessionById(context.Background(), nil, session.Id)
+	assert.NoError(t, err)
+	assert.Nil(t, s)
+}
+
+func TestAPIAccountSessionDelete_ForbiddenOnOtherUsersSession(t *testing.T) {
+	accessToken, _ := getUserAccessTokenWithAccountScope(t)
+
+	// Create another user and a session for them
+	other := &models.User{Subject: fake.UUID(), Enabled: true, Email: "other-" + fake.UUID()[:8] + "@acctsess.test"}
+	err := database.CreateUser(context.Background(), nil, other)
+	assert.NoError(t, err)
+	defer func() { _ = database.DeleteUser(context.Background(), nil, other.Id) }()
+
+	otherSession := createTestUserSession(t, other.Id, fake.UUID())
+	defer func() { _ = database.DeleteUserSession(context.Background(), nil, otherSession.Id) }()
+
+	url := config.GetAuthServer().BaseURL + "/api/v1/account/sessions/" + strconv.FormatInt(otherSession.Id, 10)
+	resp := makeAPIRequest(t, "DELETE", url, accessToken, nil)
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusForbidden, resp.StatusCode)
+	assert.Equal(t, "application/json", resp.Header.Get("Content-Type"))
+
+	var errResp api.ErrorResponse
+	_ = json.NewDecoder(resp.Body).Decode(&errResp)
+	assert.Equal(t, "Forbidden", errResp.ErrorDescription)
+}
+
+// TestAPIAccountSessionDelete_TerminatesTheOfflineGrantsOfThatSession is the self-service half of
+// #129's headline claim, end to end. The bearer is the offline grant's own access token, which
+// carries authserver:manage-account and no `sid`: the account API accepts that, because
+// RequireValidSession only looks a session up for a token that carries one.
+func TestAPIAccountSessionDelete_TerminatesTheOfflineGrantsOfThatSession(t *testing.T) {
+	grant := createOfflineGrant(t)
+
+	// Refreshing works to begin with, so a later failure is attributable to the termination.
+	first := grant.refresh(t)
+	require.NotEmpty(t, first["access_token"], "the grant should refresh before termination: %v", first)
+	grant.refreshToken = first["refresh_token"].(string)
+
+	session, err := database.GetUserSessionBySessionIdentifier(context.Background(), nil, grant.sessionIdentifier)
+	require.NoError(t, err)
+	require.NotNil(t, session)
+
+	deleteURL := config.GetAuthServer().BaseURL + "/api/v1/account/sessions/" + strconv.FormatInt(session.Id, 10)
+	resp := makeAPIRequest(t, "DELETE", deleteURL, grant.accessToken, nil)
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	after := grant.refresh(t)
+	assert.Equal(t, "invalid_grant", after["error"],
+		"ending your own session must stop its offline refresh token working: %v", after)
+	assert.Empty(t, after["access_token"])
+}
+
+// TestAPIAccountSessionDelete_ForbiddenDoesNotTerminate pairs the ownership check with the new
+// consequence. KEEP THIS. TestAPIAccountSessionDelete_ForbiddenOnOtherUsersSession above asserts only
+// the status code, which a handler that terminated first and refused afterwards would still satisfy,
+// and after #129 that mistake revokes a stranger's grants.
+func TestAPIAccountSessionDelete_ForbiddenDoesNotTerminate(t *testing.T) {
+	callerToken, _ := getUserAccessTokenWithAccountScope(t)
+
+	victim := createOfflineGrant(t)
+	first := victim.refresh(t)
+	require.NotEmpty(t, first["access_token"], "the victim's grant should refresh to begin with: %v", first)
+	victim.refreshToken = first["refresh_token"].(string)
+
+	session, err := database.GetUserSessionBySessionIdentifier(context.Background(), nil, victim.sessionIdentifier)
+	require.NoError(t, err)
+	require.NotNil(t, session)
+
+	deleteURL := config.GetAuthServer().BaseURL + "/api/v1/account/sessions/" + strconv.FormatInt(session.Id, 10)
+	resp := makeAPIRequest(t, "DELETE", deleteURL, callerToken, nil)
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusForbidden, resp.StatusCode)
+
+	stillThere, err := database.GetUserSessionById(context.Background(), nil, session.Id)
+	require.NoError(t, err)
+	assert.NotNil(t, stillThere, "a refused request must not delete the session")
+
+	stillWorks := victim.refresh(t)
+	assert.NotEmpty(t, stillWorks["access_token"],
+		"a refused request must not revoke anything: %v", stillWorks)
+}
+
+func TestAPIAccountSessions_UnauthorizedAndScope(t *testing.T) {
+	url := config.GetAuthServer().BaseURL + "/api/v1/account/sessions"
+
+	// No token
+	req, err := http.NewRequest("GET", url, nil)
+	assert.NoError(t, err)
+	httpClient := createHttpClient(t)
+	resp, err := httpClient.Do(req)
+	assert.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+	body1, _ := io.ReadAll(resp.Body)
+	assert.Equal(t, "application/json", resp.Header.Get("Content-Type"))
+	assert.Contains(t, string(body1), "Access token required.")
+
+	// Invalid token
+	resp2 := makeAPIRequest(t, "GET", url, "invalid-token", nil)
+	defer func() { _ = resp2.Body.Close() }()
+	assert.Equal(t, http.StatusUnauthorized, resp2.StatusCode)
+	body2, _ := io.ReadAll(resp2.Body)
+	assert.Contains(t, string(body2), "Access token required.")
+
+	// Insufficient scope
+	tok := createClientCredentialsTokenWithScope(t, constants.AuthServerResourceIdentifier, constants.UserinfoPermissionIdentifier)
+	resp3 := makeAPIRequest(t, "GET", url, tok, nil)
+	defer func() { _ = resp3.Body.Close() }()
+	assert.Equal(t, http.StatusForbidden, resp3.StatusCode)
+	body3, _ := io.ReadAll(resp3.Body)
+	assert.Contains(t, string(body3), "Insufficient scope.")
+}
+
+func TestAPIAccountSessionDelete_UnauthorizedAndInvalidId(t *testing.T) {
+	// No token
+	url := config.GetAuthServer().BaseURL + "/api/v1/account/sessions/123"
+	req, err := http.NewRequest("DELETE", url, nil)
+	assert.NoError(t, err)
+	httpClient := createHttpClient(t)
+	resp, err := httpClient.Do(req)
+	assert.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+
+	// With token but invalid id formats
+	accessToken, _ := getUserAccessTokenWithAccountScope(t)
+
+	// non-numeric
+	url2 := config.GetAuthServer().BaseURL + "/api/v1/account/sessions/abc"
+	resp2 := makeAPIRequest(t, "DELETE", url2, accessToken, nil)
+	defer func() { _ = resp2.Body.Close() }()
+	assert.Equal(t, http.StatusBadRequest, resp2.StatusCode)
+	var errResp2 api.ErrorResponse
+	_ = json.NewDecoder(resp2.Body).Decode(&errResp2)
+	assert.Equal(t, "User session ID is required", errResp2.ErrorDescription)
+
+	// negative
+	url3 := config.GetAuthServer().BaseURL + "/api/v1/account/sessions/-1"
+	resp3 := makeAPIRequest(t, "DELETE", url3, accessToken, nil)
+	defer func() { _ = resp3.Body.Close() }()
+	assert.Equal(t, http.StatusBadRequest, resp3.StatusCode)
+	var errResp3 api.ErrorResponse
+	_ = json.NewDecoder(resp3.Body).Decode(&errResp3)
+	assert.Equal(t, "User session ID is required", errResp3.ErrorDescription)
+}
+
+func TestAPIAccountSessionDelete_NotFound(t *testing.T) {
+	accessToken, _ := getUserAccessTokenWithAccountScope(t)
+	url := config.GetAuthServer().BaseURL + "/api/v1/account/sessions/99999999"
+	resp := makeAPIRequest(t, "DELETE", url, accessToken, nil)
+	defer func() { _ = resp.Body.Close() }()
+	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
+	var errResp api.ErrorResponse
+	_ = json.NewDecoder(resp.Body).Decode(&errResp)
+	assert.Equal(t, "User session not found", errResp.ErrorDescription)
+}

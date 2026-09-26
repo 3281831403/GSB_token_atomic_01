@@ -1,0 +1,102 @@
+{{define "title"}}{{ .appName }} - {{ T $.ctx "adminconsole.admin_resources.delete.page_title_prefix" }}{{.resource.ResourceIdentifier}}{{end}}
+{{define "pageTitle"}}{{ T $.ctx "adminconsole.admin_resources.delete.page_title_prefix" }}<span class="text-accent">{{.resource.ResourceIdentifier}}</span>{{end}}
+{{define "subTitle"}}{{end}}
+{{define "menu"}}
+    {{template "admin_menu" . }}
+{{end}}
+
+{{define "head"}}
+
+
+
+{{end}}
+
+{{define "body"}}
+
+<form method="post">
+
+    {{if .isSystemLevelResource}}
+    <div class="grid grid-cols-1 gap-6 mt-2 lg:grid-cols-2">
+        <div class="mt-2 w-fit form-control">
+            <p class="px-2 ml-1 rounded text-warning-content bg-warning">{{ T $.ctx "adminconsole.admin_resources.delete.system_level_warning" }}</p>
+        </div>
+    </div>
+    {{end}}
+
+    <div class="grid grid-cols-1 gap-6 mt-2 lg:grid-cols-2">
+
+        <div class="w-full h-full pb-6 bg-base-100">
+
+            <div class="w-full">
+                <p class="">{{ T $.ctx "adminconsole.admin_resources.delete.are_you_sure" }}</p>
+                <p class="mt-2">{{ T $.ctx "adminconsole.admin_resources.delete.warning_prefix" }}<span class='text-accent'>{{ T $.ctx "adminconsole.admin_resources.delete.warning_em" }}</span>{{ T $.ctx "adminconsole.admin_resources.delete.warning_suffix" }}</p>
+            </div>
+
+            <div class="w-full mt-6">
+                <table class="table">
+                    <tbody>
+                        <tr>
+                            <td>{{ T $.ctx "adminconsole.admin_resources.delete.field.identifier" }}</td>
+                            <td class="font-mono">{{.resource.ResourceIdentifier}}</td>
+                        </tr>
+                        {{if .resource.Description}}
+                        <tr>
+                            <td>{{ T $.ctx "adminconsole.admin_resources.delete.field.description" }}</td>
+                            <td class="">{{.resource.Description}}</td>
+                        </tr>
+                        {{end}}
+                        <tr>
+                            <td>{{ T $.ctx "adminconsole.admin_resources.delete.field.permissions" }}</td>
+                            <td class="">
+                                <ul class="list-disc list-inside">
+                                    {{range .permissions}}
+                                    <li>{{.PermissionIdentifier}}</li>
+                                    {{end}}
+                                </ul>
+                            </td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <div class="w-full mt-6">
+                <p>{{ T $.ctx "adminconsole.admin_resources.delete.confirm_instruction_prefix" }}<span class="text-accent">{{ T $.ctx "adminconsole.admin_resources.delete.confirm_instruction_em" }}</span>{{ T $.ctx "adminconsole.admin_resources.delete.confirm_instruction_suffix" }}</p>
+            </div>
+
+            <div class="w-full mt-6 form-control">
+                <label class="label">
+                    <span class="label-text text-base-content">
+                        {{ T $.ctx "adminconsole.admin_resources.delete.confirm_field_label" }}
+                    </span>
+                </label>
+                <input id="resourceIdentifier" type="text" name="resourceIdentifier" value=""
+                    class="w-full input input-bordered " autocomplete="off" autofocus {{if .isSystemLevelResource}}readonly{{end}} />
+            </div>
+        </div>
+
+    </div>
+
+    <div class="grid grid-cols-1 gap-6 mt-8 lg:grid-cols-2">
+        <div>
+            {{if .error}}
+            <div class="mb-4 text-right text-error">
+                <p>{{.error}}</p>
+            </div>
+            {{end}}
+            <div class="float-left p-3">
+                <a class="link-secondary" href="/admin/resources">
+                    <svg class="inline-block w-6 h-6 align-middle" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" d="M10.5 19.5L3 12m0 0l7.5-7.5M3 12h18" />
+                    </svg>
+                    <span class="ml-1 align-middle">{{ T $.ctx "adminconsole.admin_resources.common.back_to_list" }}</span>
+                </a>
+            </div>
+            {{if not .isSystemLevelResource}}
+                <button id="btnDelete" class="float-right btn btn-primary">{{ T $.ctx "adminconsole.admin_resources.delete.delete_button" }}</button>
+            {{end}}
+        </div>
+    </div>
+
+</form>
+
+{{end}}

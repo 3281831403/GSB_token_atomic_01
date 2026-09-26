@@ -1,0 +1,144 @@
+{{define "title"}}{{ .appName }} - {{ T $.ctx "adminconsole.admin_users.sessions.page_title_prefix" }}{{.user.Email}}{{end}}
+{{define "pageTitle"}}{{ T $.ctx "adminconsole.admin_users.sessions.page_title_prefix" }}<span class="text-accent">{{.user.Email}}</span>{{end}}
+{{define "subTitle"}}{{end}}
+{{define "menu"}}
+    {{template "admin_menu" . }}
+{{end}}
+
+{{define "head"}}
+
+<script>
+
+    function endSessionClick(elem, evt, userSessionId, device, isCurrent) {
+
+        // escapeHtml, because showModalDialog assigns its message to innerHTML and the device
+        // label is attacker-chosen text: it is derived from Sec-CH-UA and Sec-CH-UA-Platform,
+        // which UA-CH requires a server to accept with arbitrary values, so any user can store
+        // markup in their own session's label by logging in with hand-written headers. The
+        // onclick attribute it arrives in is escaped for the JavaScript string context and no
+        // further, so dropping this call runs that markup in the origin of whoever opens the
+        // list -- an administrator's, on the page where they review someone else's sessions
+        // (#281).
+        let msg = "{{ T $.ctx "adminconsole.admin_users.sessions.modal_confirm_body_prefix" }}" + escapeHtml(device) + "{{ T $.ctx "adminconsole.admin_users.sessions.modal_confirm_body_suffix" }}";
+        msg += "{{ T $.ctx "adminconsole.admin_users.sessions.modal_revocation_note" }}";
+        if (isCurrent) {
+            msg += "{{ T $.ctx "adminconsole.admin_users.sessions.modal_confirm_current_warning" }}";
+        }
+        showModalDialog("modal1", "{{ T $.ctx "adminconsole.admin_users.sessions.modal_confirm_title" }}", msg,
+            function () {
+                // no button
+            },
+            function () {
+                // yes button
+
+                const loadingIcon = document.getElementById("loadingIcon" + userSessionId);
+
+                sendAjaxRequest({
+                    "url": "/admin/users/{{.user.Id}}/sessions",
+                    "method": "POST",
+                    "bodyData": JSON.stringify({
+                        "userSessionId": userSessionId
+                    }),
+                    "loadingElement": loadingIcon,
+                    "loadingClasses": ["loading", "loading-xs"],
+                    "modalId": "modal0",
+                    "callback": function (result) {
+
+                        if (result.Success) {
+                            if(result.IsCurrentSession) {
+                                // Redirect to logout endpoint for proper logout flow
+                                window.location.href = "/auth/logout";
+                            } else {
+                                window.location.href = "/admin/users/{{.user.Id}}/sessions?page={{.page}}&query={{.query}}";
+                            }
+                        }
+                    }
+                });
+            });
+    }
+
+
+</script>
+
+
+{{end}}
+
+{{define "body"}}
+
+{{template "manage_users_tabs" (args "sessions" .user.Id .page .query $.ctx) }}
+
+
+{{ if gt (len .sessions) 0 }}
+
+<div class="w-full mt-6 overflow-x-auto">
+    <table class="table w-full">
+        <thead>
+        <tr>
+            <th>{{ T $.ctx "adminconsole.admin_users.sessions.col_device" }}</th>
+            <th>{{ T $.ctx "adminconsole.admin_users.sessions.col_clients" }}</th>
+            <th>{{ T $.ctx "adminconsole.admin_users.sessions.col_ip" }}</th>
+            <th>{{ T $.ctx "adminconsole.admin_users.sessions.col_started_at" }}</th>
+            <th>{{ T $.ctx "adminconsole.admin_users.sessions.col_last_accessed_at" }}</th>
+            <th class="w-48"></th>
+        </tr>
+        </thead>
+        <tbody>
+            {{ range .sessions }}
+                <tr>
+                    <td title="{{.UserAgent}}">{{.DeviceName}} {{.DeviceType}} {{.DeviceOS}}
+                        {{ if .IsCurrent }}
+                            <br /><span class="text-accent">{{ T $.ctx "adminconsole.admin_users.sessions.current_label" }}</span>
+                        {{end}}
+                    </td>
+                    <td>
+                        <ul class="font-mono">
+                        {{range .Clients}}
+                            <li>{{.}}</li>
+                        {{end}}
+                        </ul>
+                    </td>
+                    <td>{{.IpAddress}}</td>
+                    <td>{{ DateTime $.ctx .Started }}<br />{{ Since $.ctx .Started }}</td>
+                    <td>{{ DateTime $.ctx .LastAccessed }}<br />{{ Since $.ctx .LastAccessed }}</td>
+                    <td>
+                        <div class="text-right">
+                            <span id="loadingIcon{{.UserSessionId}}" class="hidden w-5 h-5 mr-2 align-middle text-primary">&nbsp;</span>
+                            <button class="inline-block align-middle btn btn-sm btn-primary"
+                                onclick="endSessionClick(this, event, {{.UserSessionId}}, '{{.DeviceName}} {{.DeviceType}} {{.DeviceOS}}', {{.IsCurrent}});">{{ T $.ctx "adminconsole.admin_users.sessions.end_button" }}</button>
+                        </div>
+                    </td>
+                </tr>
+            {{end}}
+        </tbody>
+    </table>
+</div>
+
+{{else}}
+    <p class="pl-1 mt-6">{{ T $.ctx "adminconsole.admin_users.sessions.empty" }}</p>
+{{end}}
+
+
+<div class="grid grid-cols-1 gap-6 mt-8">
+    <div>
+        {{if .error}}
+            <div class="mb-4 text-right text-error">
+                <p>{{.error}}</p>
+            </div>
+        {{end}}
+        <div class="float-left p-3">
+            <a class="link-secondary" href="/admin/users{{if .query}}?query={{.query}}&page={{.page}}{{else}}?page={{.page}}{{end}}">
+                <svg class="inline-block w-6 h-6 align-middle" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M10.5 19.5L3 12m0 0l7.5-7.5M3 12h18" />
+                </svg>
+                <span class="ml-1 align-middle">{{ T $.ctx "adminconsole.admin_users.common.back_to_list" }}</span>
+            </a>
+        </div>
+    </div>
+</div>
+
+
+
+{{template "modal_dialog" (args "modal0" "close" $.ctx ) }}
+{{template "modal_dialog" (args "modal1" "yes_no" $.ctx ) }}
+
+{{end}}

@@ -1,0 +1,1514 @@
+package integrationtests
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/PuerkitoBio/goquery"
+	"github.com/leodip/goiabada/authserver/internal/config"
+	"github.com/leodip/goiabada/authserver/internal/encryption"
+	"github.com/leodip/goiabada/authserver/internal/models"
+	"github.com/leodip/goiabada/authserver/internal/testutil/fake"
+	"github.com/leodip/goiabada/core/api"
+	"github.com/leodip/goiabada/core/constants"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// Helper to get a user access token with account scope and also the auth code details (client, redirect, sid)
+// Returns (httpClientWithCookies, accessToken, code)
+func getUserAccessTokenAndCodeForAccountScope(t *testing.T) (*http.Client, string, *models.Code) {
+	scope := "openid profile email " + constants.AuthServerResourceIdentifier + ":" + constants.ManageAccountPermissionIdentifier
+	clientSecret := fake.LetterN(32)
+	httpClient, code := createAuthCodeEnsuringUserScope(t, clientSecret, scope)
+
+	// Exchange code for tokens using the same client to preserve cookies for session
+	tokenEndpoint := config.GetAuthServer().BaseURL + "/auth/token/"
+	form := url.Values{
+		"grant_type":    {"authorization_code"},
+		"client_id":     {code.Client.ClientIdentifier},
+		"client_secret": {clientSecret},
+		"code":          {code.Code},
+		"redirect_uri":  {code.RedirectURI},
+		"code_verifier": {"code-verifier"},
+	}
+	data := postToTokenEndpoint(t, httpClient, tokenEndpoint, form)
+	accessToken, ok := data["access_token"].(string)
+	assert.True(t, ok)
+	assert.NotEmpty(t, accessToken)
+	return httpClient, accessToken, code
+}
+
+func TestAPIAccountLogoutRequest_Success_And_LogoutFlow_WithAndWithoutCookie(t *testing.T) {
+	// Arrange: create session and token with account scope
+	httpClientWithCookies, accessToken, code := getUserAccessTokenAndCodeForAccountScope(t)
+
+	// Request logout URL
+	reqBody := api.AccountLogoutRequest{
+		PostLogoutRedirectUri: code.RedirectURI,
+		State:                 fake.LetterN(12),
+		ResponseMode:          "redirect",
+	}
+	urlLogoutReq := config.GetAuthServer().BaseURL + "/api/v1/account/logout-request"
+	resp := makeAPIRequest(t, "POST", urlLogoutReq, accessToken, reqBody)
+	defer func() { _ = resp.Body.Close() }()
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+	var out api.AccountLogoutRedirectResponse
+	err := json.NewDecoder(resp.Body).Decode(&out)
+	assert.NoError(t, err)
+	assert.NotEmpty(t, out.LogoutUrl)
+
+	// Parse returned logout URL and verify parameters
+	u, err := url.Parse(out.LogoutUrl)
+	assert.NoError(t, err)
+	assert.Equal(t, "/auth/logout", u.Path)
+	q := u.Query()
+	assert.NotEmpty(t, q.Get("id_token_hint"))
+	assert.Equal(t, code.RedirectURI, q.Get("post_logout_redirect_uri"))
+	assert.Equal(t, reqBody.State, q.Get("state"))
+
+	// 1) Call /auth/logout with cookies: expect 302 to post_logout_redirect, carrying state and
+	// nothing else this specification does not define
+	req1, _ := http.NewRequest("GET", out.LogoutUrl, nil)
+	resp1, err := httpClientWithCookies.Do(req1)
+	assert.NoError(t, err)
+	defer func() { _ = resp1.Body.Close() }()
+	assert.Equal(t, http.StatusFound, resp1.StatusCode)
+	loc1, err := url.Parse(resp1.Header.Get("Location"))
+	assert.NoError(t, err)
+	assert.Equal(t, code.RedirectURI, loc1.Scheme+"://"+loc1.Host+loc1.Path)
+	assert.Equal(t, reqBody.State, loc1.Query().Get("state"))
+	// RP-Initiated Logout 1.0 defines exactly one parameter on the way back to the RP. sid belongs to
+	// Front-Channel Logout, a different endpoint travelling the other direction, and no RP is told to
+	// read it here, so sending it only leaked the identifier into the RP's URL bar, history and access
+	// logs (#109 decision 5).
+	assert.NotContains(t, loc1.RawQuery, "sid=", "sid is not a parameter RP-initiated logout defines")
+
+	// 2) Call /auth/logout without cookies (new client): the hint's own sid names the session, which
+	// is what makes RP-initiated logout work from a relying party that cannot reach the browser session
+	httpClientNoCookies := createHttpClient(t)
+	req2, _ := http.NewRequest("GET", out.LogoutUrl, nil)
+	resp2, err := httpClientNoCookies.Do(req2)
+	assert.NoError(t, err)
+	defer func() { _ = resp2.Body.Close() }()
+	assert.Equal(t, http.StatusFound, resp2.StatusCode)
+	loc2, err := url.Parse(resp2.Header.Get("Location"))
+	assert.NoError(t, err)
+	assert.Equal(t, code.RedirectURI, loc2.Scheme+"://"+loc2.Host+loc2.Path)
+	assert.Equal(t, reqBody.State, loc2.Query().Get("state"))
+	assert.NotContains(t, loc2.RawQuery, "sid=", "sid is not a parameter RP-initiated logout defines")
+}
+
+// TestLogout_WithIdTokenHint_NoRedirectTarget_LogsTheUserOut is #109 item 1, the defect the issue is
+// named for, at the tier where it is observable end to end.
+//
+// post_logout_redirect_uri is OPTIONAL in RP-Initiated Logout 1.0 and this endpoint treated it as
+// required. The check returned before both the database teardown and the cookie wipe, so the most
+// ordinary conforming request in the specification, a valid hint and nothing else, rendered an error
+// page and left the End-User signed in believing they had signed out.
+//
+// The session row going is the assertion that matters. The page is the visible half; the row is the
+// half a user could not have checked.
+func TestLogout_WithIdTokenHint_NoRedirectTarget_LogsTheUserOut(t *testing.T) {
+	grant := createOfflineGrant(t)
+	idToken, _ := sessionBoundGrantOnSameSession(t, grant)
+
+	before, err := database.GetUserSessionBySessionIdentifier(context.Background(), nil, grant.sessionIdentifier)
+	require.NoError(t, err)
+	require.NotNil(t, before, "the ceremony should have left a session row to tear down")
+
+	resp, err := grant.httpClient.Get(config.GetAuthServer().BaseURL +
+		"/auth/logout?id_token_hint=" + url.QueryEscape(idToken))
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Empty(t, resp.Header.Get("Location"), "no target was asked for, so there is nothing to redirect to")
+	// No note, because the RP asked for no return: being told that a return failed would be worse than
+	// saying nothing.
+	assertSignedOutPage(t, resp, signedOutEnglish, false)
+
+	after, err := database.GetUserSessionBySessionIdentifier(context.Background(), nil, grant.sessionIdentifier)
+	require.NoError(t, err)
+	assert.Nil(t, after, "a hinted logout with no redirect target must still tear the session down")
+}
+
+// The two cases below are the only place an ENCRYPTED id_token_hint is driven through the real
+// stack. Every other hinted case on this endpoint sends the plain signed ID Token, so until these
+// landed the whole JWE path -- five segments, the key derived from the client's stored secret, the
+// dir + A256GCM parse -- was exercised at the unit tier only, against a mocked database (#277).
+//
+// What the mocks cannot reach is the key itself. The unit tier hands decryptIDTokenHint a client
+// row it built, so it proves the handler consults the parser and nothing about where the secret
+// came from. Here the secret is the one the client was registered with, stored encrypted under the
+// data cipher and decrypted by the handler, and the assertion is that the key derived from it is
+// the key the RP encrypted under. Get that wrong anywhere along the chain and both tests still
+// compile and one of them still passes, which is why the pair is a pair.
+
+// TestLogout_WithEncryptedIdTokenHint_LogsTheUserOut is the confirmed half: the same request as
+// TestLogout_WithIdTokenHint_NoRedirectTarget_LogsTheUserOut above, with the hint encrypted and
+// client_id added, since an encrypted hint is the one shape that needs client_id to say whose
+// secret derives the key.
+func TestLogout_WithEncryptedIdTokenHint_LogsTheUserOut(t *testing.T) {
+	grant := createOfflineGrant(t)
+	idToken, _ := sessionBoundGrantOnSameSession(t, grant)
+
+	hint, err := encryption.EncryptIDTokenHintJWE(idToken, grant.clientSecret)
+	require.NoError(t, err)
+	require.Equal(t, 5, len(strings.Split(hint, ".")),
+		"the hint must reach the endpoint as a compact JWE, or it takes the plain-token path instead")
+
+	before, err := database.GetUserSessionBySessionIdentifier(context.Background(), nil, grant.sessionIdentifier)
+	require.NoError(t, err)
+	require.NotNil(t, before, "the ceremony should have left a session row to tear down")
+
+	resp, err := grant.httpClient.Get(config.GetAuthServer().BaseURL + "/auth/logout?" + url.Values{
+		"id_token_hint": {hint},
+		"client_id":     {grant.client.ClientIdentifier},
+	}.Encode())
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Empty(t, resp.Header.Get("Location"), "no target was asked for, so there is nothing to redirect to")
+	assertSignedOutPage(t, resp, signedOutEnglish, false)
+
+	after, err := database.GetUserSessionBySessionIdentifier(context.Background(), nil, grant.sessionIdentifier)
+	require.NoError(t, err)
+	assert.Nil(t, after, "a confirmed encrypted hint must tear the session down like any other")
+}
+
+// TestLogout_EncryptedIdTokenHint_WrongSecret_AsksTheEndUserAndRefusesTheRedirect is the refused
+// half, in the shape of TestLogout_RejectedHint_AsksTheEndUserAndRefusesTheRedirect below: a
+// well-formed JWE carrying the right ID Token, encrypted under a secret that is not this client's.
+//
+// Only the key is wrong, so nothing but the GCM tag check can be refusing it. The redirect
+// parameters are the ones that redirect without a hint, and they must not redirect here: a hint the
+// OP cannot confirm costs the RP its return and costs the End-User nothing.
+func TestLogout_EncryptedIdTokenHint_WrongSecret_AsksTheEndUserAndRefusesTheRedirect(t *testing.T) {
+	grant := createOfflineGrant(t)
+	idToken, _ := sessionBoundGrantOnSameSession(t, grant)
+
+	hint, err := encryption.EncryptIDTokenHintJWE(idToken, fake.LetterN(32))
+	require.NoError(t, err)
+
+	resp := logoutThroughConsentPage(t, grant.httpClient, url.Values{
+		"id_token_hint":            {hint},
+		"post_logout_redirect_uri": {grant.redirectURI},
+		"client_id":                {grant.client.ClientIdentifier},
+		"state":                    {fake.LetterN(8)},
+	})
+	defer func() { _ = resp.Body.Close() }()
+
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Empty(t, resp.Header.Get("Location"),
+		"a hint encrypted under the wrong secret earns no redirect, however good the client_id beside it looks")
+	assertSignedOutPage(t, resp, signedOutEnglish, true)
+
+	gone, err := database.GetUserSessionBySessionIdentifier(context.Background(), nil, grant.sessionIdentifier)
+	require.NoError(t, err)
+	assert.Nil(t, gone, "the consent page precedes the teardown, it does not replace it")
+}
+
+// TestLogout_RejectedHint_AsksTheEndUserAndRefusesTheRedirect is decision 15 driven through the real
+// stack, and it is deliberately the same request as TestLogout_Hintless_ClientIdAuthorizesTheRedirect
+// with one parameter added: an id_token_hint that cannot be confirmed.
+//
+// Without the hint those parameters redirect. With it they must not, because RP-Initiated Logout 1.0
+// section 4 forbids using information that failed to validate and forbids redirecting once an error is
+// detected. The mechanism is that the consent page a rejected hint renders drops client_id, so the
+// confirming POST has nothing left to authorize a target with, and the note appears instead.
+//
+// The teardown still happens, which is the property the whole change turns on: a hint the OP cannot
+// confirm costs the RP its redirect and costs the End-User nothing.
+func TestLogout_RejectedHint_AsksTheEndUserAndRefusesTheRedirect(t *testing.T) {
+	grant := createOfflineGrant(t)
+
+	// Rejected at the parse gate. Seam 2's unit table owns every other way a hint fails; what this tier
+	// adds is that a rejected hint reaches a consent page a browser can actually submit.
+	resp := logoutThroughConsentPage(t, grant.httpClient, url.Values{
+		"id_token_hint":            {"not.a.token"},
+		"post_logout_redirect_uri": {grant.redirectURI},
+		"client_id":                {grant.client.ClientIdentifier},
+		"state":                    {fake.LetterN(8)},
+	})
+	defer func() { _ = resp.Body.Close() }()
+
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Empty(t, resp.Header.Get("Location"),
+		"a rejected hint earns no redirect, however good the client_id beside it looks")
+	assertSignedOutPage(t, resp, signedOutEnglish, true)
+
+	gone, err := database.GetUserSessionBySessionIdentifier(context.Background(), nil, grant.sessionIdentifier)
+	require.NoError(t, err)
+	assert.Nil(t, gone, "the consent page precedes the teardown, it does not replace it")
+}
+
+// The two cases below pin that #129 changed NOTHING about RP-initiated logout (decision 3). The
+// dividing line is intent: "end this session" is a security action aimed at a device, logout is
+// navigation, and the fact that logout happens to delete the session row when the departing client
+// was the only one on it is bookkeeping rather than a revocation decision.
+//
+// THEY ARE DRIVEN THROUGH REQUEST SHAPES #109 IS NOT REWRITING, per decision 13. Both supply
+// id_token_hint AND post_logout_redirect_uri, because #109's first item is that the second is wrongly
+// treated as required and its check returns before the teardown. They assert only what #129 cares
+// about, that no grant was revoked, and nothing about whether that parameter should be required, how
+// the redirect was built, or whether the session row survives, which is #109 divergence B's business.
+//
+// The hint comes from the token exchange's own id_token rather than from /api/v1/account/logout-request,
+// so these cases do not depend on that endpoint's client resolution, which is also #109's surface.
+
+// logoutWithHint performs the RP-initiated logout for a grant's client and returns nothing but a
+// completed teardown: it fails the test unless the server redirected to the post-logout URI, which is
+// what stops a "nothing was revoked" assertion passing because logout did nothing at all.
+func logoutWithHint(t *testing.T, grant *offlineGrant, idToken string) {
+	t.Helper()
+
+	state := fake.LetterN(10)
+	logoutURL := config.GetAuthServer().BaseURL + "/auth/logout?id_token_hint=" + url.QueryEscape(idToken) +
+		"&post_logout_redirect_uri=" + url.QueryEscape(grant.redirectURI) +
+		"&state=" + state
+
+	resp, err := grant.httpClient.Get(logoutURL)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusFound, resp.StatusCode, "logout should redirect")
+
+	location, err := url.Parse(resp.Header.Get("Location"))
+	require.NoError(t, err)
+	require.Equal(t, grant.redirectURI, location.Scheme+"://"+location.Host+location.Path,
+		"the teardown must have run to completion, not stopped at an error page")
+	require.Equal(t, state, location.Query().Get("state"))
+}
+
+// sessionBoundGrantOnSameSession runs a second authorization on the grant's live session WITHOUT
+// offline_access and returns its id_token and refresh token. The id_token is what logout matches
+// against the session, and the refresh token is session bound, so it is the one whose survival
+// decision 3's second claim is about.
+func sessionBoundGrantOnSameSession(t *testing.T, grant *offlineGrant) (string, string) {
+	t.Helper()
+
+	const codeVerifier = "code-verifier-logout"
+	scope := "openid " + constants.AuthServerResourceIdentifier + ":" + constants.ManageAccountPermissionIdentifier
+	exchanged := grant.exchange(t, grant.codeFromSameSession(t, scope, codeVerifier), codeVerifier)
+
+	idToken, ok := exchanged["id_token"].(string)
+	require.True(t, ok, "expected an id_token to use as the logout hint: %v", exchanged)
+	require.Equal(t, grant.sessionIdentifier, claimString(t, idToken, "sid"),
+		"the hint must name the session logout is being asked to tear down")
+
+	refreshToken, ok := exchanged["refresh_token"].(string)
+	require.True(t, ok, "a session-bound auth code grant must yield a refresh token: %v", exchanged)
+	return idToken, refreshToken
+}
+
+// TestLogout_WithIdTokenHint_RevokesNoGrants is decision 3's first claim: an offline grant survives
+// logout in every case, including the one where logout deletes the session row because the departing
+// client was the only one on it.
+func TestLogout_WithIdTokenHint_RevokesNoGrants(t *testing.T) {
+	grant := createOfflineGrant(t)
+
+	first := grant.refresh(t)
+	require.NotEmpty(t, first["access_token"], "the grant should refresh before logout: %v", first)
+	grant.refreshToken = first["refresh_token"].(string)
+
+	idToken, _ := sessionBoundGrantOnSameSession(t, grant)
+	logoutWithHint(t, grant, idToken)
+
+	after := grant.refresh(t)
+	assert.NotEmpty(t, after["access_token"],
+		"logout must revoke nothing, decision 3: %v", after)
+}
+
+// TestLogout_WithIdTokenHint_OtherClientOnSession_KeepsSessionBoundTokensWorking is decision 3's
+// second claim, which is the more surprising one and the reason it is pinned: the client that just
+// logged out keeps a working session-bound refresh token, because the session row survives while
+// another client remains on it and nothing in refresh validation reads the client-session link.
+//
+// Pinned so #135, "disconnect this application", has to change it deliberately rather than by
+// accident.
+func TestLogout_WithIdTokenHint_OtherClientOnSession_KeepsSessionBoundTokensWorking(t *testing.T) {
+	grant := createOfflineGrant(t)
+	idToken, sessionBoundRefresh := sessionBoundGrantOnSameSession(t, grant)
+
+	session, err := database.GetUserSessionBySessionIdentifier(context.Background(), nil, grant.sessionIdentifier)
+	require.NoError(t, err)
+	require.NotNil(t, session)
+
+	// A second client on the same session, created directly as this suite already does for its
+	// session listings. What handleExistingSessionOnLogout reads is the NUMBER of clients on the
+	// session, not how each got there.
+	otherClient := &models.Client{
+		ClientIdentifier:         "logout-other-" + fake.LetterN(8),
+		ClientSecretEncrypted:    []byte("encrypted-secret"),
+		Description:              "Second client sharing the session",
+		Enabled:                  true,
+		AuthorizationCodeEnabled: true,
+	}
+	require.NoError(t, database.CreateClient(context.Background(), nil, otherClient))
+	defer func() { _ = database.DeleteClient(context.Background(), nil, otherClient.Id) }()
+
+	now := time.Now().UTC()
+	require.NoError(t, database.CreateUserSessionClient(context.Background(), nil, &models.UserSessionClient{
+		UserSessionId: session.Id,
+		ClientId:      otherClient.Id,
+		Started:       now.Add(-time.Hour),
+		LastAccessed:  now.Add(-5 * time.Minute),
+	}))
+
+	logoutWithHint(t, grant, idToken)
+
+	data := postToTokenEndpoint(t, createHttpClient(t), config.GetAuthServer().BaseURL+"/auth/token/", url.Values{
+		"grant_type":    {"refresh_token"},
+		"client_id":     {grant.client.ClientIdentifier},
+		"client_secret": {grant.clientSecret},
+		"refresh_token": {sessionBoundRefresh},
+	})
+	assert.NotEmpty(t, data["access_token"],
+		"the logged-out client's session-bound refresh token must keep working while another client shares the session: %v", data)
+}
+
+func TestAPIAccountLogoutRequest_ValidationErrors_And_Scope(t *testing.T) {
+	_, accessToken, _ := getUserAccessTokenAndCodeForAccountScope(t)
+	urlLogoutReq := config.GetAuthServer().BaseURL + "/api/v1/account/logout-request"
+
+	// Missing postLogoutRedirectUri
+	resp1 := makeAPIRequest(t, "POST", urlLogoutReq, accessToken, map[string]string{})
+	defer func() { _ = resp1.Body.Close() }()
+	assert.Equal(t, http.StatusBadRequest, resp1.StatusCode)
+	var err1 api.ErrorResponse
+	_ = json.NewDecoder(resp1.Body).Decode(&err1)
+	assert.Equal(t, "postLogoutRedirectUri is required", err1.ErrorDescription)
+
+	// Unresolvable postLogoutRedirectUri (no client matches)
+	badReq := api.AccountLogoutRequest{PostLogoutRedirectUri: "https://invalid.example/"}
+	resp2 := makeAPIRequest(t, "POST", urlLogoutReq, accessToken, badReq)
+	defer func() { _ = resp2.Body.Close() }()
+	assert.Equal(t, http.StatusBadRequest, resp2.StatusCode)
+	var err2 api.ErrorResponse
+	_ = json.NewDecoder(resp2.Body).Decode(&err2)
+	assert.Equal(t, "Unable to resolve client from postLogoutRedirectUri; supply clientIdentifier.", err2.ErrorDescription)
+
+	// Scope and auth checks
+	// No token
+	reqNoTok, _ := http.NewRequest("POST", urlLogoutReq, nil)
+	httpClient := createHttpClient(t)
+	resp3, err := httpClient.Do(reqNoTok)
+	assert.NoError(t, err)
+	defer func() { _ = resp3.Body.Close() }()
+	assert.Equal(t, http.StatusUnauthorized, resp3.StatusCode)
+
+	// Insufficient scope
+	tok := createClientCredentialsTokenWithScope(t, constants.AuthServerResourceIdentifier, constants.UserinfoPermissionIdentifier)
+	resp4 := makeAPIRequest(t, "POST", urlLogoutReq, tok, api.AccountLogoutRequest{PostLogoutRedirectUri: "https://example.com/"})
+	defer func() { _ = resp4.Body.Close() }()
+	assert.Equal(t, http.StatusForbidden, resp4.StatusCode)
+}
+
+// What logoutThroughConsentPage models while it reproduces the browser's submission of the consent
+// form, and, because the refusals below are easy to mistake for more than they are, what it does not.
+// Anything outside these sets fails the test rather than being skipped: a browser acts on every
+// element, every attribute and every class the form's subtree carries, so a helper that silently
+// ignores the ones nobody taught it lets a page no browser can submit keep the cases below green.
+//
+// What it establishes is the payload a browser would submit from this form, and that nothing the
+// document declares sends that payload elsewhere or forbids it outright. Four dimensions, because a
+// page can be spoiled along each independently and closing one leaves the others open. An earlier
+// version closed only the second, and three mutations walked straight through it: a <fieldset
+// disabled> wrapped round the Yes button, which is an element nobody had declared; "hidden" added to
+// that button's class, which is a hostile value of a permitted attribute; and the Yes and No labels
+// swapped, which changes nothing structural at all.
+//
+//  1. consentFormTags: the element types allowed anywhere inside the form. A <fieldset> disables
+//     every control it wraps, a <select> or <textarea> goes out in a browser's payload and not in
+//     this one, and a <script> cancels the submission outright. None of them is a tag below.
+//  2. The attribute sets: what each of those elements may carry. Deliberately absent, each honoured
+//     by a browser: disabled makes a control unsubmittable, so a disabled Yes button leaves the page
+//     dead and a disabled hidden field drops a parameter; formaction, formmethod, formenctype and
+//     formnovalidate let the submitter override where, how and whether the form goes; form reassigns
+//     which form a control belongs to; required blocks submission until a field is filled; hidden
+//     removes the control from the page.
+//  3. consentClassTokens: every class token logout_consent.html actually uses inside its form. A
+//     class is styling until it is "hidden", and then it is a control the End-User cannot reach, so
+//     an allowlist of keys that never looks at values is not a boundary. Restyling the page means
+//     adding the new tokens here.
+//  4. The document around the form, which decides where the submission goes and whether it happens at
+//     all, and none of which is anywhere near the form: no <base> element, since that is the one thing
+//     that moves what a relative action resolves against; no <style> block, which is the only CSS a
+//     parsed document carries; consentAncestorTags for the element types the form may sit inside;
+//     consentMetaEquivs for what the head may instruct the browser to do, a refresh being enough to
+//     navigate the page away before the End-User could confirm; and consentCSPDirectives for the
+//     policy the response header and that head may carry.
+//
+// Adding an element, an attribute or a class to logout_consent.html means teaching this helper what
+// a browser does with it (#109).
+//
+// What it does not establish is that a browser can use this page. Three inputs to that are outside a
+// parsed document altogether and no refusal here reaches them:
+//
+//   - Style from an external stylesheet. The layout links /static/main.css and two CDN stylesheets,
+//     any of which can hide a control this helper has just read and approved. What the document
+//     declares itself is refused, the style attribute above the form and inside it and a <style>
+//     block anywhere in it; what another file declares needs a CSS engine.
+//   - Script. A handler registered from /static/utils.js, the one script this server serves, can
+//     cancel the submit event. The sets below refuse an inline handler on the form and on the
+//     affirmative control, and refuse a <script> inside the form, which is the part the template
+//     declares; the rest needs a JavaScript engine.
+//   - An ancestor attribute outside consentHidingAttrs, which is a denylist for the reason recorded
+//     on it, so its tail is open by construction where every other set here is closed.
+//
+// Closing those three means running the page in a browser, which is a decision about this
+// repository's test dependencies rather than something this file can settle (#109).
+var (
+	consentFormAttrs   = map[string]bool{"action": true, "method": true, "class": true}
+	consentInputAttrs  = map[string]bool{"type": true, "name": true, "value": true, "class": true}
+	consentButtonAttrs = map[string]bool{"type": true, "name": true, "value": true, "class": true, "onclick": true}
+	consentLayoutAttrs = map[string]bool{"class": true}
+
+	consentFormTags = map[string]map[string]bool{
+		"input":  consentInputAttrs,
+		"button": consentButtonAttrs,
+		"div":    consentLayoutAttrs,
+		"p":      consentLayoutAttrs,
+	}
+
+	consentClassTokens = map[string]bool{
+		"mt-2": true, "mt-5": true, "mt-6": true, "mt-8": true,
+		"text-center": true, "text-error": true,
+		"grid": true, "grid-cols-2": true, "gap-3": true,
+		"w-full": true, "btn": true, "btn-primary": true, "btn-secondary": true,
+	}
+
+	// The element types the form may sit inside, which is the auth layout's own structure. An
+	// allowlist works here where it does not for the layout's attributes, because a wrapper element
+	// is exactly the kind of thing that decides whether the controls inside it can be reached at all:
+	// a closed <details> collapses its contents to the summary alone, a <dialog> without open is not
+	// rendered, a <template>'s contents are inert markup a browser never lays out, and a <fieldset>
+	// disables every control it wraps. Naming the four the layout uses refuses all of them, and the
+	// next wrapper nobody has thought of with them.
+	consentAncestorTags = map[string]bool{"html": true, "body": true, "main": true, "div": true}
+
+	// Applied to the form's ancestors, and the one denylist here rather than an allowlist: the auth
+	// layout is shared by every page in the app and its styling is none of this test's business, so
+	// refusing an attribute it has not declared would fail this test for edits that cannot affect
+	// logout. The cost of that choice is that this set alone has an open tail, which the comment on
+	// the helper records as a residual rather than leaving implied.
+	//
+	// Each entry stops the End-User reaching the controls below it. hidden and inert are honoured on
+	// any element, inert additionally making everything inside it unclickable while still visible;
+	// popover renders its element hidden until something shows it; disabled is honoured only on
+	// form-associated elements, and is refused anyway because it costs nothing to refuse. style is
+	// refused whatever it contains, because reading a declaration properly means implementing CSS and
+	// the layout carries no inline style today, so the strict form is also the cheap one.
+	// A slice rather than a set, so a page carrying two of these always fails on the same one and the
+	// message a run reports is reproducible.
+	consentHidingAttrs = []string{"hidden", "inert", "popover", "disabled", "style"}
+
+	// Tailwind's screen-reader-only utility is deliberately absent: it positions a container
+	// off-screen without disabling it, so the form still submits and assistive technology still
+	// reaches it, which makes it the one candidate that does not render the page unusable.
+	//
+	// A second reason used to stand beside that one, and no longer does. Naming the token here once
+	// shipped a stylesheet rule for it, because the CSS build harvested class-name candidates from
+	// this whole module rather than only from web/template as tailwind.config.js said (#109). The
+	// config was dead: Tailwind v4 does not auto-detect a JS config, so the scanner had been running
+	// unscoped. web/tailwindcss/input.css now pins it with source(none) and explicit @source rules,
+	// and prose in this file no longer reaches the generated CSS.
+	consentHidingClasses = map[string]bool{"hidden": true, "invisible": true, "collapse": true}
+
+	// The Content-Security-Policy directives this helper has been taught, checked against both places
+	// a policy can arrive: the response header, which MiddlewareSecurityHeaders sets on every
+	// response, and a meta http-equiv in the document head. Those two are the whole of it, so an
+	// allowlist over the directives closes the question rather than sampling it.
+	//
+	// frame-ancestors is what the deployment sends today and it governs framing, not submission. The
+	// two that would refuse this POST outright are form-action, which names where a form may submit,
+	// and sandbox, which forbids submission entirely unless it carries allow-forms. Both would leave
+	// every case below green while no browser could log out, because this helper builds the POST
+	// itself and no policy applies to a Go http.Client. Hardening the deployment means deciding here
+	// whether the new directive permits this form's submission.
+	consentCSPDirectives = map[string]bool{"frame-ancestors": true}
+
+	// The http-equiv values the document head may carry, an allowlist for the same reason
+	// consentCSPDirectives is one: a meta http-equiv is an instruction to the browser and the set of
+	// them that does anything is not this test's to enumerate. The one that would leave every case
+	// below green while no End-User could ever confirm is "refresh", which navigates the document away
+	// on a timer this helper never waits for.
+	//
+	// x-ua-compatible is what both layouts carry today and it does nothing to submission.
+	// content-security-policy is admitted here and then read against consentCSPDirectives, because the
+	// deployment sends a policy and refusing the channel outright would fail on a header it already
+	// sets (#109).
+	consentMetaEquivs = map[string]bool{"x-ua-compatible": true, "content-security-policy": true}
+)
+
+// consentLabels is what the two answer buttons must read in one locale, which is what ties each
+// button to the answer it gives. Without it the affirmative control is identified structurally, by
+// being the one with no cancelling script, and swapping the two translation references leaves the
+// page submitting on visible No and cancelling on visible Yes with every case still green.
+type consentLabels struct{ yes, no string }
+
+// Keyed by the ui_locales the case asks for, empty meaning the default locale, so a case that drives
+// the page in a language nobody recorded labels for fails rather than skipping the check.
+var consentLabelsByLocale = map[string]consentLabels{
+	"":      {yes: "Yes", no: "No"},
+	"pt-BR": {yes: "Sim", no: "Não"},
+}
+
+// unmodelledAttrs names every attribute across the selection that the given set does not cover, each
+// tagged with the element carrying it so a failure says which control to go and look at.
+func unmodelledAttrs(sel *goquery.Selection, modelled map[string]bool) []string {
+	found := []string{}
+	for _, node := range sel.Nodes {
+		for _, attr := range node.Attr {
+			if !modelled[strings.ToLower(attr.Key)] {
+				found = append(found, node.Data+"["+attr.Key+"]")
+			}
+		}
+	}
+	return found
+}
+
+// unmodelledClasses names every class token across the selection that consentClassTokens does not
+// cover. Same contract as unmodelledAttrs, one level down: the attribute is permitted, its value is
+// what has to be read.
+func unmodelledClasses(sel *goquery.Selection) []string {
+	found := []string{}
+	for _, node := range sel.Nodes {
+		for _, attr := range node.Attr {
+			if strings.ToLower(attr.Key) != "class" {
+				continue
+			}
+			for _, token := range strings.Fields(attr.Val) {
+				if !consentClassTokens[token] {
+					found = append(found, node.Data+"."+token)
+				}
+			}
+		}
+	}
+	return found
+}
+
+// unmodelledCSPDirectives names every Content-Security-Policy directive in the given policy that
+// consentCSPDirectives does not cover. An empty policy yields nothing, which is also the answer when
+// that delivery channel carried no policy at all.
+func unmodelledCSPDirectives(policy string) []string {
+	found := []string{}
+	for _, directive := range strings.Split(policy, ";") {
+		fields := strings.Fields(directive)
+		if len(fields) == 0 {
+			continue
+		}
+		if name := strings.ToLower(fields[0]); !consentCSPDirectives[name] {
+			found = append(found, name)
+		}
+	}
+	return found
+}
+
+// logoutThroughConsentPage drives a hintless logout the way a browser does: GET /auth/logout, read
+// the consent page, then submit exactly the fields that page carries. It returns the raw response to
+// the confirming POST, because what the End-User lands on is what the cases below are about.
+//
+// Submitting the page's own fields rather than a hand-built form is the point. The hidden fields are
+// how post_logout_redirect_uri, client_id, state and ui_locales survive a form action that
+// deliberately drops the query string it was served with, and the id_token_hint's absence from that
+// set is the invariant the POST binding's CSRF exemption rests on: a hintless POST had to pass CSRF,
+// so it came from this page (#109).
+//
+// It submits the page the way the page says to submit it, and refuses to submit a page whose rules it
+// does not know. The method and action come off the form, the payload is the successful controls only,
+// the affirmative control has to be one a browser would submit with and has to be the one the
+// End-User reads as Yes, and every element, attribute and class token outside the sets above is a
+// failure rather than an omission. A helper that builds its own POST regardless is precisely what
+// lets a form drifted to GET, an inert Yes button, a Yes button no browser would show, or a submitter
+// overriding the form's destination keep every case below green while no browser can log out.
+//
+// It still builds the POST itself, so what it establishes is bounded by what a parsed document shows.
+// The three inputs outside that boundary are listed above consentFormAttrs, and stylesheets are the
+// one to keep in mind when reading a green run: this helper reads the class tokens the markup carries
+// and cannot know what a stylesheet does with them.
+func logoutThroughConsentPage(t *testing.T, httpClient *http.Client, query url.Values) *http.Response {
+	t.Helper()
+
+	logoutURL := config.GetAuthServer().BaseURL + "/auth/logout"
+	if len(query) > 0 {
+		logoutURL += "?" + query.Encode()
+	}
+	resp, err := httpClient.Get(logoutURL)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode,
+		"a request with no id_token_hint must render the consent page, which the spec makes a MUST")
+
+	return confirmLogoutConsentPage(t, httpClient, resp, query.Get("ui_locales"))
+}
+
+// confirmLogoutConsentPage is the second half of the helper above, split out because the consent
+// page is reached two ways and both have to be driven the same. A GET renders it directly; a POST
+// whose id_token_hint could not be confirmed is answered with a 303 to the GET binding, and only
+// then does the page appear. That second route is the one the CSRF exemption creates, and the whole
+// point of decision 18 is that the page it lands on is submittable, so it has to be submitted by
+// the helper that refuses every way a page can fail to be (#109).
+//
+// uiLocales is what the request asked for, which decides which Yes and No this helper reads.
+func confirmLogoutConsentPage(t *testing.T, httpClient *http.Client, resp *http.Response, uiLocales string) *http.Response {
+	t.Helper()
+
+	labels, labelled := consentLabelsByLocale[uiLocales]
+	require.True(t, labelled,
+		"no Yes/No labels recorded for ui_locales=%q, so which button means which answer is unknown",
+		uiLocales)
+
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	_ = resp.Body.Close()
+
+	doc, err := goquery.NewDocumentFromReader(bytes.NewReader(body))
+	require.NoError(t, err)
+
+	// Where the form's action resolves to, which is its real destination however local the attribute
+	// reads. A <base href> moves the document's base URL, so "/auth/logout" would resolve against
+	// whatever origin that names and a browser would deliver this form's payload to that origin
+	// while the action assertion below still passed. HTML gives a document exactly one
+	// way to move its base URL, so refusing the element settles this rather than sampling it: with no
+	// <base>, the base URL is the response's own URL, which is what the POST below is built against
+	// (#109).
+	require.Equal(t, 0, doc.Find("base").Length(),
+		"a <base> moves what the form's relative action resolves against, so a browser would submit this page to an origin this helper does not")
+
+	// The one CSS this helper can see. A declaration can hide the form or any control inside it, and
+	// reading one properly means implementing CSS, so the element is refused whatever it contains,
+	// exactly as the style attribute is: no template in either app carries one, which makes the strict
+	// form the cheap one too. A linked stylesheet stays outside this boundary and is recorded above as a
+	// residual, because that one needs a fetch and an engine rather than a parse (#109).
+	require.Equal(t, 0, doc.Find("style").Length(),
+		"a <style> block can hide the form or its controls, and this helper does not implement CSS")
+
+	// And what the head instructs the browser to do, including whether the submission is permitted at
+	// all. Both CSP delivery channels, because a policy from either applies in a browser and neither
+	// applies to the Go client below: see consentCSPDirectives and consentMetaEquivs.
+	require.Empty(t, unmodelledCSPDirectives(resp.Header.Get("Content-Security-Policy")),
+		"the response carries a Content-Security-Policy directive this helper does not model, and a browser may refuse this form's submission because of it")
+	doc.Find("meta[http-equiv]").Each(func(_ int, meta *goquery.Selection) {
+		equiv := strings.ToLower(strings.TrimSpace(meta.AttrOr("http-equiv", "")))
+		require.True(t, consentMetaEquivs[equiv],
+			"the document head carries <meta http-equiv=%q>, whose effect on this page this helper does not model", equiv)
+		if equiv != "content-security-policy" {
+			return
+		}
+		require.Empty(t, unmodelledCSPDirectives(meta.AttrOr("content", "")),
+			"the document head carries a Content-Security-Policy directive this helper does not model, and a browser may refuse this form's submission because of it")
+	})
+
+	// One form, so which form owns a control is never ambiguous, and nothing anywhere on the page
+	// names a form owner of its own, which is how a browser would be told to submit a control this
+	// helper cannot see or to leave out one it reads.
+	require.Equal(t, 1, doc.Find("form").Length(), "the consent page carries exactly one form")
+	require.Equal(t, 0, doc.Find("[form]").Length(),
+		"no control may name a form owner, which would change what a browser submits")
+	formSel := doc.Find("form")
+
+	require.Empty(t, unmodelledAttrs(formSel, consentFormAttrs),
+		"the form carries an attribute this helper does not model, so a browser and these cases would disagree about how the page submits")
+	require.Empty(t, unmodelledClasses(formSel), "the form carries a class token this helper does not model")
+
+	// The whole subtree, not just the controls. A browser reads every element between the form and
+	// its buttons, so an element type nobody declared is an unknown rule rather than decoration:
+	// <fieldset disabled> is the shortest way to render the affirmative control unusable without
+	// touching it, and it is invisible to any check that starts from Find("input, button").
+	formSel.Find("*").Each(func(_ int, el *goquery.Selection) {
+		tag := goquery.NodeName(el)
+		modelled, known := consentFormTags[tag]
+		require.True(t, known,
+			"the consent form contains a <%s>, whose effect on submission this helper does not model", tag)
+		require.Empty(t, unmodelledAttrs(el, modelled),
+			"an element inside the form carries an attribute this helper does not model, and a browser would act on it")
+		require.Empty(t, unmodelledClasses(el),
+			"an element inside the form carries a class token this helper does not model; a class that hides or disables it would leave the page unusable with these cases green")
+	})
+
+	// Above the form, where a container can still hide or disable everything inside it without the form
+	// itself changing at all. An allowlist on the element types, per consentAncestorTags, and a
+	// denylist on the attributes and class tokens, per consentHidingAttrs and consentHidingClasses,
+	// which is where this helper's one open tail is.
+	formSel.Parents().Each(func(_ int, ancestor *goquery.Selection) {
+		tag := goquery.NodeName(ancestor)
+		require.True(t, consentAncestorTags[tag],
+			"the form sits inside a <%s>, whose effect on reaching the controls this helper does not model", tag)
+		for _, attr := range consentHidingAttrs {
+			_, present := ancestor.Attr(attr)
+			require.False(t, present,
+				"a container above the form carries %q, which stops the End-User reaching every control inside it", attr)
+		}
+		for _, token := range strings.Fields(ancestor.AttrOr("class", "")) {
+			require.False(t, consentHidingClasses[token],
+				"a container above the form carries %q, which hides every control inside it", token)
+		}
+	})
+
+	action, ok := formSel.Attr("action")
+	require.True(t, ok)
+	require.Equal(t, "/auth/logout", action,
+		`an explicit action, because action="" would carry the query string and with it the hint`)
+
+	// A GET form would defeat this path twice over, which is why the method is asserted here and then
+	// used below rather than assumed: the GET binding renders the consent page again instead of
+	// tearing anything down, so no End-User could ever confirm a logout, and a GET is a safe method
+	// the origin check never applies to. Only the POST binding has its origin checked, and that is
+	// the only thing that makes a hintless teardown trustworthy without a confirmable hint. An
+	// absent method attribute means GET, so it fails here too (#109).
+	method := formSel.AttrOr("method", "")
+	require.True(t, strings.EqualFold("post", method),
+		"the confirming request must be a POST, got method=%q", method)
+
+	form := url.Values{}
+	formSel.Find("input").Each(func(_ int, input *goquery.Selection) {
+		require.Equal(t, "hidden", strings.ToLower(input.AttrOr("type", "")),
+			"every input on this form is hidden; any other type brings submission rules of its own")
+		name, hasName := input.Attr("name")
+		require.True(t, hasName, "a nameless control is never submitted, so one here would be a mistake")
+		require.False(t, form.Has(name),
+			"two controls named %q would both reach the handler from a browser and only one from here", name)
+		form.Set(name, input.AttrOr("value", ""))
+	})
+	// This used to also require a gorilla.csrf.Token control on the form. There is no token any
+	// more (#155): the confirming POST is protected because it is same-origin, which the browser
+	// reports in Sec-Fetch-Site and MiddlewareCsrf enforces, and no hidden field carries that.
+	// The loop above still pins the form's shape, which is what the rest of this helper needs.
+
+	// Which button gives which answer, read the way the End-User reads it. Identifying the affirmative
+	// control structurally is not enough on its own: swap the two translation references and the
+	// unscripted submit button is the one labelled No, so visible No logs the user out, visible Yes
+	// cancels, and every case below still passes.
+	buttons := formSel.Find("button")
+	require.Equal(t, 2, buttons.Length(),
+		"the consent form asks one question and carries one button per answer")
+	affirmative := buttons.FilterFunction(func(_ int, button *goquery.Selection) bool {
+		return strings.TrimSpace(button.Text()) == labels.yes
+	})
+	declining := buttons.FilterFunction(func(_ int, button *goquery.Selection) bool {
+		return strings.TrimSpace(button.Text()) == labels.no
+	})
+	require.Equal(t, 1, affirmative.Length(), "exactly one button must read %q", labels.yes)
+	require.Equal(t, 1, declining.Length(), "exactly one button must read %q", labels.no)
+
+	// The affirmative control must be one a browser would submit with, or the page is unusable however
+	// correct the handler is: no cancelling handler of its own, and a type that submits, which a button
+	// carrying no type attribute already is per HTML's missing-value default. That it is enabled, shown
+	// and overrides none of the form's action, method or encoding follows from the sets above rather
+	// than from checks of its own (#109).
+	require.Empty(t, affirmative.AttrOr("onclick", ""),
+		"the button labelled %q must not be the one wired to cancel the submission", labels.yes)
+	require.True(t, strings.EqualFold("submit", affirmative.AttrOr("type", "submit")),
+		"the affirmative control must be able to submit the form, got type=%q", affirmative.AttrOr("type", ""))
+
+	// And the declining control must not be able to submit it. Today an inline handler calls
+	// preventDefault(), since a button with no type attribute is a submit control; an explicit
+	// type="button" would do the same without script, and either satisfies this.
+	require.True(t,
+		!strings.EqualFold("submit", declining.AttrOr("type", "submit")) || declining.AttrOr("onclick", "") != "",
+		`the button labelled %q must not submit the form: give it type="button" or keep its cancelling handler`,
+		labels.no)
+
+	// A named submitter is itself a successful control, so a browser would send it too.
+	if name, hasName := affirmative.Attr("name"); hasName {
+		require.False(t, form.Has(name),
+			"the submitter is named %q, which a hidden field already carries; a browser would send both", name)
+		form.Set(name, affirmative.AttrOr("value", ""))
+	}
+
+	// Read off the finished payload rather than off the markup, because the invariant is about what
+	// reaches the handler and any control can carry a parameter: a submit button named id_token_hint
+	// puts one in the body just as a hidden input does. A hintless POST is what the CSRF exemption for
+	// the POST binding rests on, so this is decision 13's invariant and not a tidiness check (#109).
+	require.False(t, form.Has("id_token_hint"),
+		"the confirming POST must not carry an id_token_hint back, whichever control would have carried it")
+
+	// The default encoding, which is what the absent enctype leaves in force: it is modelled on
+	// neither the form nor the submitter, so any attempt to change it fails above rather than here.
+	destURL := config.GetAuthServer().BaseURL + action
+	req, err := http.NewRequest(strings.ToUpper(method), destURL, strings.NewReader(form.Encode()))
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Referer", destURL)
+	req.Header.Set("Origin", config.GetAuthServer().BaseURL)
+	resp, err = httpClient.Do(req)
+	require.NoError(t, err)
+	return resp
+}
+
+// signedOutTexts is what the terminal page must render in one locale. It is a struct rather than a
+// bare string per assertion because every field is a separate translation reference in
+// logged_out.html, and i18n.T renders a missing key as the key itself, so a reference that goes stale
+// is visible only to an assertion that looks where it belongs. page_title and title carry the same
+// string in both locales, which is exactly why a substring search over the body cannot tell a broken
+// page_title from a broken title: one lives in <title> and the other in the page heading (#109).
+type signedOutTexts struct {
+	pageTitle string
+	heading   string
+	message   string
+	declined  string
+}
+
+var (
+	signedOutEnglish = signedOutTexts{
+		pageTitle: "Logged out",
+		heading:   "Logged out",
+		message:   "You have been logged out.",
+		declined:  "We could not return you to the application that logged you out.",
+	}
+	signedOutPortuguese = signedOutTexts{
+		pageTitle: "Sessão encerrada",
+		heading:   "Sessão encerrada",
+		message:   "Você saiu da sua conta.",
+		declined:  "Não foi possível retornar você ao aplicativo que solicitou a saída.",
+	}
+)
+
+// assertSignedOutPage reads the terminal page through its rendered markup and checks all four of the
+// template's translation references plus both sides of its one conditional.
+//
+// declined says whether a post-logout target was refused. Both directions are asserted because the
+// note is the page's only variable part and each direction fails for its own reason: missing when a
+// target was refused, the RP's user is left with no idea why they are still here; present when none
+// was asked for, they are told a return failed that nobody requested.
+func assertSignedOutPage(t *testing.T, resp *http.Response, texts signedOutTexts, declined bool) {
+	t.Helper()
+
+	doc, err := goquery.NewDocumentFromReader(strings.NewReader(bodyString(t, resp)))
+	require.NoError(t, err)
+
+	assert.Contains(t, doc.Find("title").Text(), texts.pageTitle, "the browser tab title")
+	require.Equal(t, 1, doc.Find("h2").Length(), "the page has one heading, which the next line names")
+	assert.Equal(t, texts.heading, strings.TrimSpace(doc.Find("h2").Text()), "the page heading")
+
+	rendered := doc.Text()
+	assert.Contains(t, rendered, texts.message,
+		"the signed-out page renders, rather than a redirect to the auth server root")
+	if declined {
+		assert.Contains(t, rendered, texts.declined, "a target that was refused must say so")
+	} else {
+		assert.NotContains(t, rendered, texts.declined,
+			"a user who asked for no return must not be told that a return failed")
+	}
+}
+
+// TestLogout_Hintless_DeletesTheSessionRowAndSparesOfflineGrants is what the endpoint used to get
+// wrong on this path: confirming the consent page cleared the browser cookie and wrote nothing to
+// user_sessions, so session-bound refresh tokens kept working and the row was orphaned from a
+// browser that could no longer name it.
+//
+// Both halves are asserted together because each is the other's control. Deleting the row is the fix;
+// the offline grant still refreshing afterwards is decision 2's boundary, and it is why the teardown
+// deletes the row rather than calling the whole-session termination #129 built, which would revoke
+// offline grants too.
+func TestLogout_Hintless_DeletesTheSessionRowAndSparesOfflineGrants(t *testing.T) {
+	grant := createOfflineGrant(t)
+
+	first := grant.refresh(t)
+	require.NotEmpty(t, first["access_token"], "the grant should refresh before logout: %v", first)
+	grant.refreshToken = first["refresh_token"].(string)
+
+	before, err := database.GetUserSessionBySessionIdentifier(context.Background(), nil, grant.sessionIdentifier)
+	require.NoError(t, err)
+	require.NotNil(t, before, "the ceremony should have left a session row to tear down")
+
+	resp := logoutThroughConsentPage(t, grant.httpClient, url.Values{})
+	defer func() { _ = resp.Body.Close() }()
+
+	require.Equal(t, http.StatusOK, resp.StatusCode,
+		"with no post_logout_redirect_uri the confirmation ends on the signed-out page")
+	assertSignedOutPage(t, resp, signedOutEnglish, false)
+
+	after, err := database.GetUserSessionBySessionIdentifier(context.Background(), nil, grant.sessionIdentifier)
+	require.NoError(t, err)
+	assert.Nil(t, after, "confirming the consent page must delete the session row, not just clear the cookie")
+
+	refreshed := grant.refresh(t)
+	assert.NotEmpty(t, refreshed["access_token"],
+		"an offline grant survives logout, decision 2: %v", refreshed)
+}
+
+// TestLogout_Hintless_ClientIdAuthorizesTheRedirect covers the shape that got no redirect at all
+// before: post_logout_redirect_uri and client_id with no id_token_hint. The spec calls that
+// client_id's most common use, and it is the "other means of confirming the legitimacy of the
+// post-logout redirection target" section 3 requires.
+//
+// The state is the one string that broke every part of the concatenation this replaced: "+" arrived
+// as a space, "/" and "=" went out raw, "#" turned the tail into a fragment the RP's server never
+// saw, and "&injected=1" arrived as a real parameter. Asserting it byte-identical through the real
+// stack is the whole point of doing this at the HTTP tier.
+func TestLogout_Hintless_ClientIdAuthorizesTheRedirect(t *testing.T) {
+	grant := createOfflineGrant(t)
+	const state = "aB+cd/efgh==#&injected=1"
+
+	resp := logoutThroughConsentPage(t, grant.httpClient, url.Values{
+		"post_logout_redirect_uri": {grant.redirectURI},
+		"client_id":                {grant.client.ClientIdentifier},
+		"state":                    {state},
+	})
+	defer func() { _ = resp.Body.Close() }()
+
+	require.Equal(t, http.StatusFound, resp.StatusCode)
+	location, err := url.Parse(resp.Header.Get("Location"))
+	require.NoError(t, err)
+	assert.Equal(t, grant.redirectURI, location.Scheme+"://"+location.Host+location.Path)
+	assert.Equal(t, []string{state}, location.Query()["state"],
+		"exactly one state reaches the RP, byte-identical to what it sent")
+	assert.Empty(t, location.Fragment, `the "#" in state must stay in the query, not become a fragment`)
+	assert.Empty(t, location.Query().Get("injected"), "state must not be able to inject parameters")
+	assert.NotContains(t, location.RawQuery, "sid=",
+		"RP-Initiated Logout defines state and nothing else on the way back, decision 5")
+
+	gone, err := database.GetUserSessionBySessionIdentifier(context.Background(), nil, grant.sessionIdentifier)
+	require.NoError(t, err)
+	assert.Nil(t, gone, "the redirect does not replace the teardown, it follows it")
+}
+
+// TestLogout_Hintless_AbsentAndEmptyStateAreDifferentRedirects drives the real consent page twice
+// and reads what reaches the RP, because absent and empty state is a contract no mocked assertion
+// can prove. It lives at this tier for one specific reason: the distinction is carried by the
+// template's {{if .statePresent}} guard, and the handler unit test can only see the flag it binds.
+// Make that hidden field unconditional and the handler is still correct, the bind assertion still
+// passes, and every RP that sent no state starts receiving "state=" it never asked for.
+//
+// The two rows have to be read together. Neither alone catches the mutation: the empty case passes
+// with an unconditional field, and the absent case passes with no field at all.
+func TestLogout_Hintless_AbsentAndEmptyStateAreDifferentRedirects(t *testing.T) {
+
+	t.Run("no state sent means no state key comes back", func(t *testing.T) {
+		grant := createOfflineGrant(t)
+
+		resp := logoutThroughConsentPage(t, grant.httpClient, url.Values{
+			"post_logout_redirect_uri": {grant.redirectURI},
+			"client_id":                {grant.client.ClientIdentifier},
+		})
+		defer func() { _ = resp.Body.Close() }()
+
+		require.Equal(t, http.StatusFound, resp.StatusCode)
+		location, err := url.Parse(resp.Header.Get("Location"))
+		require.NoError(t, err)
+		_, present := location.Query()["state"]
+		assert.False(t, present,
+			"an RP that sent no state must not have one invented for it by the consent form: %q",
+			location.RawQuery)
+	})
+
+	t.Run("state sent empty comes back empty", func(t *testing.T) {
+		grant := createOfflineGrant(t)
+
+		resp := logoutThroughConsentPage(t, grant.httpClient, url.Values{
+			"post_logout_redirect_uri": {grant.redirectURI},
+			"client_id":                {grant.client.ClientIdentifier},
+			"state":                    {""},
+		})
+		defer func() { _ = resp.Body.Close() }()
+
+		require.Equal(t, http.StatusFound, resp.StatusCode)
+		location, err := url.Parse(resp.Header.Get("Location"))
+		require.NoError(t, err)
+		assert.Equal(t, []string{""}, location.Query()["state"],
+			"exactly one state, empty, because the RP asked for one and left it empty: %q",
+			location.RawQuery)
+	})
+}
+
+// TestLogout_Hintless_UnregisteredTargetIsDeclinedButTheLogoutHappens is the property the whole
+// change turns on, at the tier where it is observable: a target the OP may not redirect to costs the
+// RP its redirect and nothing else. The user is signed out either way, which is what the seven error
+// returns this replaced got wrong.
+//
+// It also renders the one extra sentence the signed-out page carries in this case, which the unit
+// tier cannot see because it mocks the template away.
+func TestLogout_Hintless_UnregisteredTargetIsDeclinedButTheLogoutHappens(t *testing.T) {
+	grant := createOfflineGrant(t)
+
+	resp := logoutThroughConsentPage(t, grant.httpClient, url.Values{
+		"post_logout_redirect_uri": {"https://example.com/not-registered"},
+		"client_id":                {grant.client.ClientIdentifier},
+		"state":                    {fake.LetterN(8)},
+	})
+	defer func() { _ = resp.Body.Close() }()
+
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Empty(t, resp.Header.Get("Location"), "a target that fails validation must never be redirected to")
+	assertSignedOutPage(t, resp, signedOutEnglish, true)
+
+	gone, err := database.GetUserSessionBySessionIdentifier(context.Background(), nil, grant.sessionIdentifier)
+	require.NoError(t, err)
+	assert.Nil(t, gone, "the teardown reads nothing the redirect resolution produced")
+}
+
+// TestLogout_Hintless_UILocalesSurvivesTheConsentForm pins decision 17. The global locale middleware
+// reads the query only, deliberately, so it cannot see the confirming POST's body. Without the
+// handler's own refinement the user would read a consent page in one language and a signed-out page
+// in another, which this change would have introduced rather than fixed.
+func TestLogout_Hintless_UILocalesSurvivesTheConsentForm(t *testing.T) {
+	grant := createOfflineGrant(t)
+
+	resp := logoutThroughConsentPage(t, grant.httpClient, url.Values{"ui_locales": {"pt-BR"}})
+	defer func() { _ = resp.Body.Close() }()
+
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	// Every reference on the page, in pt-BR: the whole template has to follow the locale the consent
+	// page was read in, not only the line this case used to check.
+	assertSignedOutPage(t, resp, signedOutPortuguese, false)
+}
+
+// The cases below drive POST /auth/logout the way a relying party's own page would: from a foreign
+// origin, with the End-User's cookies riding along. That request shape is what OpenID Connect
+// RP-Initiated Logout 1.0 section 2 makes mandatory, "OpenID Providers MUST support the use of the
+// HTTP GET and POST methods defined in RFC 7231", and what the CSRF middleware refused outright
+// until this exemption existed (#109 decision 9). The exemption is what still carries it: the
+// origin check refuses a cross-site POST on the browser's own Sec-Fetch-Site report (#155), so
+// without the conditional entry this binding would be as unreachable as it was before.
+//
+// It is also the classic CSRF shape, which is why the exemption is conditional and why every case
+// here asserts what was torn down and not merely which status came back.
+
+// crossOriginLogoutPost posts form to /auth/logout as another origin would: the Origin header names
+// a site whose host is not this deployment's, which is what the origin check compares against Host
+// when no Sec-Fetch-Site header is present.
+//
+// The client is the caller's, so the End-User's session cookie rides along. That is deliberate for
+// the safety cases: without a cookie they would pass for the wrong reason, having proved only that a
+// request with nothing to tear down tears nothing down.
+//
+// It is NOT what a browser does, and the difference is worth stating rather than glossing. The auth
+// server sets its session cookie SameSite=Lax (cmd/goiabada-authserver/main.go), and a browser
+// applying Lax withholds that cookie on a cross-site form POST; Go's cookiejar implements no SameSite
+// rule at all, so it sends it. This helper is therefore the more permissive shape of the two, which
+// is the right way round for the cases asserting that something is refused or torn down.
+// TestLogout_CrossOriginPost_ConfirmedHint_WithoutTheSessionCookie covers the browser's shape, where
+// the cookie is absent and the hint is the only authority the request carries.
+func crossOriginLogoutPost(t *testing.T, httpClient *http.Client, form url.Values) *http.Response {
+	t.Helper()
+
+	const foreignOrigin = "https://relying-party.example"
+
+	req, err := http.NewRequest(http.MethodPost,
+		config.GetAuthServer().BaseURL+"/auth/logout", strings.NewReader(form.Encode()))
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Origin", foreignOrigin)
+	req.Header.Set("Referer", foreignOrigin+"/signed-out")
+
+	resp, err := httpClient.Do(req)
+	require.NoError(t, err)
+	return resp
+}
+
+// followSeeOther performs the GET a browser would perform on a 303, and returns that response. It
+// asserts the status here rather than at the call site because a 302 would be followed by a browser
+// with the original method and body, which is not what any caller below means.
+func followSeeOther(t *testing.T, httpClient *http.Client, resp *http.Response) *http.Response {
+	t.Helper()
+
+	require.Equal(t, http.StatusSeeOther, resp.StatusCode,
+		"only 303 tells the browser to re-request by GET, which is what RFC 7231 section 6.4.4 defines it as")
+	location := resp.Header.Get("Location")
+	_ = resp.Body.Close()
+
+	target, err := url.Parse(config.GetAuthServer().BaseURL)
+	require.NoError(t, err)
+	next, err := target.Parse(location)
+	require.NoError(t, err)
+
+	followed, err := httpClient.Get(next.String())
+	require.NoError(t, err)
+	return followed
+}
+
+// TestLogout_CrossOriginPost_WithHintInTheBody_LogsTheUserOut is decision 9's reason for existing,
+// end to end. Before the exemption this returned 403 with the user still signed in, so the POST
+// binding the spec makes mandatory was reachable only from Goiabada's own pages.
+//
+// The hint travels in the BODY deliberately, which is both the shape that keeps an ID token out of
+// browser history and access logs and the shape that pins the exemption's one hazard: finding the
+// hint means parsing the form in middleware, and a form parse consumes the request body. If the
+// handler could not read that body afterwards it would see a request with no parameters at all.
+//
+// The redirect is what makes this case able to see that, and it is not decoration. A teardown alone
+// proves nothing here: a POST whose hint went missing is a HINTLESS POST, which the handler treats as
+// the consent page's confirmation and tears the session down anyway, so "the row is gone" is true
+// down both paths and an assertion that stops there passes on the broken one. That was not
+// hypothetical, it was this case's first version, and a mutation that consumed the body walked
+// straight through it.
+//
+// A redirect can only come from the hint. It carries no client_id, so with the hint the target is
+// authorized by the aud the hint is signed over and the answer is a 302; without it there is nothing
+// left to authorize any target and the answer is the signed-out page. 302 against 200 is therefore
+// the difference between the two teardowns, which is what this case is really about.
+func TestLogout_CrossOriginPost_WithHintInTheBody_LogsTheUserOut(t *testing.T) {
+	grant := createOfflineGrant(t)
+	idToken, _ := sessionBoundGrantOnSameSession(t, grant)
+	state := fake.LetterN(8)
+
+	before, err := database.GetUserSessionBySessionIdentifier(context.Background(), nil, grant.sessionIdentifier)
+	require.NoError(t, err)
+	require.NotNil(t, before, "the ceremony should have left a session row to tear down")
+
+	resp := crossOriginLogoutPost(t, grant.httpClient, url.Values{
+		"id_token_hint":            {idToken},
+		"post_logout_redirect_uri": {grant.redirectURI},
+		"state":                    {state},
+	})
+	defer func() { _ = resp.Body.Close() }()
+
+	require.NotEqual(t, http.StatusForbidden, resp.StatusCode,
+		"a POST carrying an id_token_hint must not be refused by CSRF, which is the whole of decision 9")
+	require.Equal(t, http.StatusFound, resp.StatusCode,
+		"the hint reached the handler out of the body, so it authorized the target and the RP gets its redirect")
+
+	location, err := url.Parse(resp.Header.Get("Location"))
+	require.NoError(t, err)
+	assert.Equal(t, grant.redirectURI, location.Scheme+"://"+location.Host+location.Path)
+	assert.Equal(t, state, location.Query().Get("state"),
+		"state travelled in the body too, so it is the second reading of the same property")
+
+	after, err := database.GetUserSessionBySessionIdentifier(context.Background(), nil, grant.sessionIdentifier)
+	require.NoError(t, err)
+	assert.Nil(t, after,
+		"a confirmed hint tears the session down on the POST binding exactly as it does on the GET one")
+}
+
+// TestLogout_CrossOriginPost_ConfirmedHint_WithoutTheSessionCookie is the case above in the shape a
+// real browser produces, which is not the shape crossOriginLogoutPost's own client produces.
+//
+// The auth server's session cookie is SameSite=Lax, so a browser withholds it on a cross-site form
+// POST; Go's cookiejar ignores SameSite and sends it. Every other case here therefore runs with a
+// cookie the RP's self-submitting form would not actually carry, and the difference is not cosmetic:
+// it is the whole question of what authorizes this teardown. This case answers it by removing the
+// cookie entirely, so the signed hint is the only authority the request has left.
+//
+// It must still log the user out, because the teardown is scoped to the session the hint's sid names
+// and the client its signed aud names, neither of which is read from the cookie. If this ever starts
+// failing while the cookie-bearing case passes, the endpoint has grown a dependency on the browser's
+// cookie and the POST binding is broken for every relying party using it from their own page, which
+// is the one shape the binding exists for.
+func TestLogout_CrossOriginPost_ConfirmedHint_WithoutTheSessionCookie(t *testing.T) {
+	grant := createOfflineGrant(t)
+	idToken, _ := sessionBoundGrantOnSameSession(t, grant)
+
+	before, err := database.GetUserSessionBySessionIdentifier(context.Background(), nil, grant.sessionIdentifier)
+	require.NoError(t, err)
+	require.NotNil(t, before, "the ceremony should have left a session row to tear down")
+
+	// A second client, never used for the ceremony, so its jar holds nothing for this origin. Same
+	// transport and same no-follow policy as the first, so the cookie is the only difference.
+	cookieless := createHttpClient(t)
+
+	// Asserted rather than assumed. An empty jar is this case's entire premise: if a cookie were
+	// somehow riding along, every assertion below would still pass and would mean nothing.
+	base, err := url.Parse(config.GetAuthServer().BaseURL)
+	require.NoError(t, err)
+	require.Empty(t, cookieless.Jar.Cookies(base),
+		"the point of this case is the absence of the session cookie, so its absence is checked")
+
+	resp := crossOriginLogoutPost(t, cookieless, url.Values{"id_token_hint": {idToken}})
+	defer func() { _ = resp.Body.Close() }()
+
+	require.NotEqual(t, http.StatusForbidden, resp.StatusCode,
+		"the exemption keys on the hint, and no cookie is involved in that decision either")
+	require.Equal(t, http.StatusOK, resp.StatusCode,
+		"no post_logout_redirect_uri was sent, so a confirmed hint ends at the signed-out page")
+	assertSignedOutPage(t, resp, signedOutEnglish, false)
+
+	after, err := database.GetUserSessionBySessionIdentifier(context.Background(), nil, grant.sessionIdentifier)
+	require.NoError(t, err)
+	assert.Nil(t, after,
+		"the hint's signed sid names the session, so the teardown does not need the browser's cookie")
+}
+
+// TestLogout_CrossOriginPost_WithoutHint_IsRefused is the other half of decision 9, and the half that
+// makes the exemption safe to grant: it is conditional on the hint, so the shape an attacker can
+// actually produce is still refused.
+//
+// A hintless POST is how the consent page confirms a logout, and the handler treats it as consent
+// precisely because it had to pass CSRF to arrive. Exempting the path unconditionally, as
+// /auth/authorize is exempted, would let any site force this teardown with no token and no hint,
+// bypassing the consent question the spec makes a MUST.
+func TestLogout_CrossOriginPost_WithoutHint_IsRefused(t *testing.T) {
+	grant := createOfflineGrant(t)
+
+	resp := crossOriginLogoutPost(t, grant.httpClient, url.Values{
+		"post_logout_redirect_uri": {grant.redirectURI},
+		"client_id":                {grant.client.ClientIdentifier},
+		"state":                    {fake.LetterN(8)},
+	})
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusForbidden, resp.StatusCode,
+		"a cross-site POST with no id_token_hint has no claim on the exemption")
+
+	survived, err := database.GetUserSessionBySessionIdentifier(context.Background(), nil, grant.sessionIdentifier)
+	require.NoError(t, err)
+	assert.NotNil(t, survived, "a refused request must tear nothing down")
+}
+
+// TestLogout_CrossOriginPost_RejectedHint_ReachesASubmittableConsentPage is decision 18 end to end,
+// and it is the case stage 4 could name but not run: nothing reached this branch cross-origin until
+// the exemption existed.
+//
+// The problem decision 18 answers, and it is worth recording that the mechanism behind it has since
+// changed. The exemption keys on the hint being PRESENT, because middleware cannot judge whether a
+// hint is genuine. Under gorilla/csrf, the middleware returned on that skip flag before saving the
+// CSRF cookie and before attaching the token, so a consent page rendered on the skipped POST itself
+// carried an empty token field while its own confirming POST is hintless and therefore not exempt:
+// the End-User would be looking at a page they could not submit while still signed in.
+//
+// That specific trap is gone with the token (#155). A page rendered on the skipped POST would be a
+// document at this deployment's own origin, so its confirming POST is same-origin and the origin
+// check allows it. The 303 asserted below is still the behaviour decision 18 landed and still what
+// this test pins, because the shape a relying party observes is part of the contract; it simply no
+// longer rests on where a token gets attached. Both halves are asserted, because the redirect alone
+// proves nothing if the page at the end of it cannot be submitted, and confirmLogoutConsentPage is
+// what refuses a page a browser could not use.
+//
+// Decision 15 rides along and is the reason for the two parameter drops. client_id must not survive
+// the hop: the follow-up GET carries no hint, which is the shape where client_id authorizes a
+// post-logout redirect, so keeping it would hand this request the redirect its rejected hint was
+// specifically denied. id_token_hint must not survive either, for two reasons that are not "it would
+// loop": the follow-up is a GET, and a rejected hint on a GET renders the consent page rather than
+// redirecting again, so there is no loop to prevent. It is dropped because carrying it would put an
+// ID token in the address bar of a top-level navigation, which is the exposure the POST binding
+// exists to avoid, and because it feeds input already judged unusable back into the next request.
+func TestLogout_CrossOriginPost_RejectedHint_ReachesASubmittableConsentPage(t *testing.T) {
+	grant := createOfflineGrant(t)
+	state := fake.LetterN(8)
+
+	// A registered URI and a real client_id, so the redirect below is refused because the hint was
+	// rejected and not because the target failed validation. Without the hint these same parameters
+	// redirect, which is what TestLogout_Hintless_ClientIdAuthorizesTheRedirect establishes.
+	resp := crossOriginLogoutPost(t, grant.httpClient, url.Values{
+		"id_token_hint":            {"not.a.token"},
+		"post_logout_redirect_uri": {grant.redirectURI},
+		"client_id":                {grant.client.ClientIdentifier},
+		"state":                    {state},
+	})
+
+	require.Equal(t, http.StatusSeeOther, resp.StatusCode,
+		"a POST whose hint cannot be confirmed is sent to the GET binding, which is where a usable consent page comes from")
+
+	location, err := url.Parse(resp.Header.Get("Location"))
+	require.NoError(t, err)
+	assert.Equal(t, "/auth/logout", location.Path)
+	assert.Equal(t, grant.redirectURI, location.Query().Get("post_logout_redirect_uri"),
+		"the target survives the hop, so the declined note can be shown for the right reason")
+	assert.Equal(t, state, location.Query().Get("state"))
+	assert.NotContains(t, location.RawQuery, "id_token_hint",
+		"a hint judged unusable must not be put in the address bar of the follow-up navigation")
+	assert.NotContains(t, location.RawQuery, "client_id",
+		"client_id authorizes the redirect on a hintless request, which is what a rejected hint must not earn")
+
+	stillThere, err := database.GetUserSessionBySessionIdentifier(context.Background(), nil, grant.sessionIdentifier)
+	require.NoError(t, err)
+	require.NotNil(t, stillThere,
+		"the consent page precedes the teardown: an unconfirmable hint must not tear anything down before the End-User is asked")
+
+	// And the page at the end of the hop is one a browser can actually submit. The helper pins the
+	// form's shape and its Yes/No control, so a page that renders unsubmittable fails here rather
+	// than at the confirming POST.
+	consent := followSeeOther(t, grant.httpClient, resp)
+	require.Equal(t, http.StatusOK, consent.StatusCode)
+	confirmed := confirmLogoutConsentPage(t, grant.httpClient, consent, "")
+	defer func() { _ = confirmed.Body.Close() }()
+
+	require.Equal(t, http.StatusOK, confirmed.StatusCode,
+		"the confirming POST is hintless, so it earns no exemption and passed the origin check on its own merits")
+	assert.Empty(t, confirmed.Header.Get("Location"),
+		"a rejected hint earns no redirect, and dropping client_id is what enforces that here")
+	assertSignedOutPage(t, confirmed, signedOutEnglish, true)
+
+	gone, err := database.GetUserSessionBySessionIdentifier(context.Background(), nil, grant.sessionIdentifier)
+	require.NoError(t, err)
+	assert.Nil(t, gone, "once the End-User confirms, the logout happens")
+}
+
+// TestLogout_CrossOriginPost_EmptyHint_ExemptsAndIsStillRejected is the two halves of the exemption
+// read against each other, which is the pair that turns it into a hole if they ever disagree.
+//
+// "id_token_hint=" is a parameter the request carried with no value. The middleware must read that as
+// a hint being PRESENT, or a relying party's empty parameter is a 403; the handler must read the same
+// parameter as a hint that cannot be confirmed, or the exempted POST takes the hintless branch, which
+// is the confirmation of the consent page and tears the whole session down without asking anybody
+// (#109 decision 13). Present here and Rejected there is the only pairing that is both usable and
+// safe, and it is why both halves call one extractor rather than each reading the parameter its own
+// way.
+//
+// Both arrival routes, because the middleware finds the parameter in the query without touching the
+// body and in the body only by parsing it, and those are two different pieces of code.
+func TestLogout_CrossOriginPost_EmptyHint_ExemptsAndIsStillRejected(t *testing.T) {
+	for _, route := range []struct {
+		name  string
+		query url.Values
+		form  url.Values
+	}{
+		{"in the query", url.Values{"id_token_hint": {""}}, url.Values{}},
+		{"in the body", url.Values{}, url.Values{"id_token_hint": {""}}},
+	} {
+		t.Run(route.name, func(t *testing.T) {
+			grant := createOfflineGrant(t)
+
+			req, err := http.NewRequest(http.MethodPost,
+				config.GetAuthServer().BaseURL+"/auth/logout?"+route.query.Encode(),
+				strings.NewReader(route.form.Encode()))
+			require.NoError(t, err)
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			req.Header.Set("Origin", "https://relying-party.example")
+
+			resp, err := grant.httpClient.Do(req)
+			require.NoError(t, err)
+			defer func() { _ = resp.Body.Close() }()
+
+			assert.NotEqual(t, http.StatusForbidden, resp.StatusCode,
+				"the exemption keys on the parameter being present, not on it having a value")
+			assert.Equal(t, http.StatusSeeOther, resp.StatusCode,
+				"and the handler reads that same empty parameter as a hint it cannot confirm, so it asks the End-User")
+
+			survived, err := database.GetUserSessionBySessionIdentifier(context.Background(), nil, grant.sessionIdentifier)
+			require.NoError(t, err)
+			assert.NotNil(t, survived,
+				"an exempted POST whose hint cannot be confirmed must tear nothing down before the End-User is asked")
+		})
+	}
+}
+
+// Seam 5 for decision 2 (#350): the endpoint answers the form binding when the request asks for it.
+//
+// The mode was accepted and discarded for a year: 8a9c49c3 added the field, the response type and
+// the console's request in one commit and wrote "We only support redirect mode now; ignore
+// responseMode input" in the same diff, while its message claimed both modes worked. The server half
+// of the POST binding was then built, tested and published by 8b69223f (#109) for exactly this use.
+// These cases are what makes the claim true.
+func TestAPIAccountLogoutRequest_FormPostMode_AnswersAFormInstruction(t *testing.T) {
+	_, accessToken, code := getUserAccessTokenAndCodeForAccountScope(t)
+
+	state := fake.LetterN(12)
+	urlLogoutReq := config.GetAuthServer().BaseURL + "/api/v1/account/logout-request"
+	resp := makeAPIRequest(t, "POST", urlLogoutReq, accessToken, api.AccountLogoutRequest{
+		PostLogoutRedirectUri: code.RedirectURI,
+		State:                 state,
+		ResponseMode:          api.AccountLogoutResponseModeFormPost,
+	})
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	var out api.AccountLogoutFormPostResponse
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&out))
+
+	assert.Equal(t, "POST", out.Method)
+
+	// The endpoint carries no query string. A hint appended here would be the leak this mode
+	// exists to close, arriving through the mode that is meant to prevent it.
+	assert.Equal(t, config.GetAuthServer().BaseURL+"/auth/logout", out.Endpoint)
+	assert.NotContains(t, out.Endpoint, "?")
+	assert.NotContains(t, out.Endpoint, "id_token_hint")
+
+	assert.NotEmpty(t, out.Params["id_token_hint"])
+	assert.Equal(t, code.RedirectURI, out.Params["post_logout_redirect_uri"])
+	assert.Equal(t, state, out.Params["state"])
+}
+
+// The two arms have to stay one parameter set. They are built separately, so the only way a second
+// arm drifts from the first is silently: a parameter the redirect URL carries and the form does not
+// reaches /auth/logout in one mode and not the other, and the endpoint answers differently for each.
+//
+// The state is the sharpest case, and it is asserted through the absent request rather than only the
+// present one: /auth/logout treats an absent state and an empty one as different requests
+// (TestLogout_Hintless_AbsentAndEmptyStateAreDifferentRedirects), and the redirect arm has never been
+// able to send an empty one, so neither may the form.
+func TestAPIAccountLogoutRequest_BothModesCarryTheSameParameters(t *testing.T) {
+	_, accessToken, code := getUserAccessTokenAndCodeForAccountScope(t)
+	urlLogoutReq := config.GetAuthServer().BaseURL + "/api/v1/account/logout-request"
+
+	for _, state := range []string{fake.LetterN(12), ""} {
+		name := "with a state"
+		if state == "" {
+			name = "with no state"
+		}
+		t.Run(name, func(t *testing.T) {
+			formReq := api.AccountLogoutRequest{
+				PostLogoutRedirectUri: code.RedirectURI,
+				State:                 state,
+				ResponseMode:          api.AccountLogoutResponseModeFormPost,
+			}
+			formResp := makeAPIRequest(t, "POST", urlLogoutReq, accessToken, formReq)
+			defer func() { _ = formResp.Body.Close() }()
+			require.Equal(t, http.StatusOK, formResp.StatusCode)
+			var form api.AccountLogoutFormPostResponse
+			require.NoError(t, json.NewDecoder(formResp.Body).Decode(&form))
+
+			redirectReq := formReq
+			redirectReq.ResponseMode = "redirect"
+			redirectResp := makeAPIRequest(t, "POST", urlLogoutReq, accessToken, redirectReq)
+			defer func() { _ = redirectResp.Body.Close() }()
+			require.Equal(t, http.StatusOK, redirectResp.StatusCode)
+			var redirect api.AccountLogoutRedirectResponse
+			require.NoError(t, json.NewDecoder(redirectResp.Body).Decode(&redirect))
+
+			u, err := url.Parse(redirect.LogoutUrl)
+			require.NoError(t, err)
+			assert.Equal(t, config.GetAuthServer().BaseURL+u.Path, form.Endpoint,
+				"both modes send the browser to the same endpoint")
+
+			// The hints differ: each response mints its own, with its own iat and signature. The
+			// parameter names, and every value but the hint, must not.
+			query := u.Query()
+			var queryNames, formNames []string
+			for name := range query {
+				queryNames = append(queryNames, name)
+			}
+			for name := range form.Params {
+				formNames = append(formNames, name)
+			}
+			assert.ElementsMatch(t, queryNames, formNames,
+				"a parameter one mode carries and the other does not reaches /auth/logout in one mode only")
+			for name := range form.Params {
+				if name == "id_token_hint" {
+					assert.NotEmpty(t, form.Params[name])
+					continue
+				}
+				assert.Equalf(t, query.Get(name), form.Params[name], "%s must match in both modes", name)
+			}
+			if state == "" {
+				assert.NotContains(t, form.Params, "state",
+					"an empty state is sent as no state, because /auth/logout tells the two apart")
+			}
+		})
+	}
+}
+
+// Every other value of responseMode keeps answering the redirect shape, which is what makes the new
+// mode opt-in: an existing caller that sends nothing, or sends a value this server does not know,
+// gets exactly what it got before rather than a shape it cannot decode.
+func TestAPIAccountLogoutRequest_AbsentAndUnknownResponseModeStillRedirect(t *testing.T) {
+	_, accessToken, code := getUserAccessTokenAndCodeForAccountScope(t)
+	urlLogoutReq := config.GetAuthServer().BaseURL + "/api/v1/account/logout-request"
+
+	for _, mode := range []string{"", "redirect", "form-post", "FORM_POST", "fragment"} {
+		t.Run("responseMode "+strconv.Quote(mode), func(t *testing.T) {
+			resp := makeAPIRequest(t, "POST", urlLogoutReq, accessToken, api.AccountLogoutRequest{
+				PostLogoutRedirectUri: code.RedirectURI,
+				ResponseMode:          mode,
+			})
+			defer func() { _ = resp.Body.Close() }()
+			require.Equal(t, http.StatusOK, resp.StatusCode)
+
+			body, err := io.ReadAll(resp.Body)
+			require.NoError(t, err)
+			assert.Contains(t, string(body), `"logoutUrl"`)
+			assert.NotContains(t, string(body), `"endpoint"`,
+				"only the exact value form_post selects the form binding")
+		})
+	}
+}

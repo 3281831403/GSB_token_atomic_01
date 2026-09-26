@@ -1,0 +1,484 @@
+package handlers
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"io/fs"
+	"log/slog"
+	"net/http"
+
+	"github.com/leodip/goiabada/authserver/internal/audit"
+	"github.com/leodip/goiabada/authserver/internal/ceremony"
+	"github.com/leodip/goiabada/authserver/internal/config"
+	"github.com/leodip/goiabada/authserver/internal/constants"
+	"github.com/leodip/goiabada/authserver/internal/handlerhelpers"
+	"github.com/leodip/goiabada/authserver/internal/models"
+	"github.com/leodip/goiabada/authserver/internal/oidc"
+	"github.com/leodip/goiabada/authserver/internal/revocation"
+	"github.com/leodip/goiabada/authserver/internal/usersession"
+	"github.com/leodip/goiabada/core/errs"
+)
+
+// authCompletedDatabase is what the end of the authentication ceremony needs: the session it
+// bumps or replaces, and the generation it promotes.
+//
+// It embeds the authorize port because a refusal here is answered through redirToClientWithError,
+// and the revocation port because an unusable session is terminated through
+// revocation.TerminateUserSessionTx.
+type authCompletedDatabase interface {
+	authorizeDatabase
+	revocation.Database
+
+	GetClientByClientIdentifier(ctx context.Context, tx *sql.Tx, clientIdentifier string) (*models.Client, error)
+	GetUserById(ctx context.Context, tx *sql.Tx, userId int64) (*models.User, error)
+	GetUserSessionBySessionIdentifier(ctx context.Context, tx *sql.Tx, sessionIdentifier string) (*models.UserSession, error)
+	PromoteUserSessionOtpConfigGeneration(ctx context.Context, tx *sql.Tx, userSessionId int64, generation int64) error
+	UpdateUserSession(ctx context.Context, tx *sql.Tx, userSession *models.UserSession) error
+	UserSessionLoadUser(ctx context.Context, tx *sql.Tx, userSession *models.UserSession) error
+}
+
+func HandleAuthCompletedGet(
+	httpHelper HttpHelper,
+	authHelper AuthHelper,
+	userSessionManager UserSessionManager,
+	database authCompletedDatabase,
+	templateFS fs.FS,
+	auditLogger AuditLogger,
+	permissionChecker PermissionChecker,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+
+		authContext, err := authHelper.GetAuthContext(r)
+		if err != nil {
+			if errors.Is(err, handlerhelpers.ErrNoAuthContext) {
+				var profileUrl = GetProfileURL()
+				slog.WarnContext(r.Context(), "auth context is missing, redirecting", "redirect", profileUrl)
+				http.Redirect(w, r, profileUrl, http.StatusFound)
+			} else {
+				httpHelper.InternalServerError(w, r, err)
+			}
+			return
+		}
+
+		requiredState := ceremony.AuthStateAuthenticationCompleted
+		if authContext.AuthState != requiredState {
+			rejectAuthStateMismatch(httpHelper, w, r, requiredState, authContext.AuthState)
+			return
+		}
+
+		sessionIdentifier := ""
+		if r.Context().Value(constants.ContextKeySessionIdentifier) != nil {
+			sessionIdentifier = r.Context().Value(constants.ContextKeySessionIdentifier).(string)
+		}
+
+		userSession, err := database.GetUserSessionBySessionIdentifier(r.Context(), nil, sessionIdentifier)
+		if err != nil {
+			httpHelper.InternalServerError(w, r, err)
+			return
+		}
+
+		err = database.UserSessionLoadUser(r.Context(), nil, userSession)
+		if err != nil {
+			httpHelper.InternalServerError(w, r, err)
+			return
+		}
+
+		client, err := database.GetClientByClientIdentifier(r.Context(), nil, authContext.ClientId)
+		if err != nil {
+			httpHelper.InternalServerError(w, r, err)
+			return
+		}
+		if client == nil {
+			httpHelper.InternalServerError(w, r, errs.Errorf("client %v not found", authContext.ClientId))
+			return
+		}
+
+		targetAcrLevel := authContext.GetTargetAcrLevel(client.DefaultAcrLevel)
+		hasValidUserSession := userSessionManager.HasValidUserSession(r.Context(), userSession, authContext.ParseRequestedMaxAge())
+		// Validity and ownership are separate questions and both have to be yes before this
+		// ceremony may reuse the session the browser arrived with. The browser can still be
+		// carrying user A's cookie while user B authenticates: prompt=login and an id_token_hint
+		// naming someone else both redirect to the login page without clearing it, and a session
+		// row that has stopped being valid keeps its cookie too. Reusing A's session for B's
+		// ceremony bumps A's row with B's methods and stamps A's session identifier onto B's
+		// authorization code, so B's grant is bound to a session B does not own and A's next
+		// request resumes a session B's ceremony rewrote (#133).
+		sessionBelongsToCeremony := authContext.OwnsSession(userSession)
+		// authContext.AuthenticatedAt is set when the user actually enters credentials in
+		// this ceremony, by the password handler and by the OTP handler. It is nil for SSO
+		// session reuse (existing session flows through level1completed without hitting
+		// either). It decides whether the session's AuthTime is refreshed below and, on both
+		// arms, is the value written: it is the instant the credential was accepted, which is
+		// what auth_time means (#252 decision 8). It is NOT proof of level 1, since OTP alone
+		// sets it (#129 decision 15).
+		userReallyAuthenticated := authContext.AuthenticatedAt != nil && !authContext.AuthenticatedAt.IsZero()
+
+		// The session this ceremony actually bound to, which is what the ACR below is taken
+		// against. It is the bumped row on the reuse arm and the freshly created row on the
+		// create arm, never the ambient one the browser happened to carry (#133).
+		var boundSession *models.UserSession
+
+		if hasValidUserSession && sessionBelongsToCeremony {
+			// Rotate the browser session's identifier before the privilege is committed,
+			// when this bump is going to raise one.
+			//
+			// The order is the whole of it. BumpUserSession opens its own transaction and
+			// commits before it returns, so rotating afterwards leaves a window in which
+			// the identifier the browser arrived with names a user session that is
+			// already at the higher level: an identifier stolen at level 1 would keep
+			// working after the step-up, which is the carryover rotation exists to stop.
+			// Deciding from the pre-bump session and rotating first means a failure
+			// between the two leaves a fresh identifier on a session that has not been
+			// raised, which is the safe direction.
+			//
+			// This arm is not fixation defence: reaching it means the browser already
+			// held a session this ceremony may reuse. Fixation is closed on the create
+			// arm below, inside StartNewUserSession. What this buys is the other half of
+			// OWASP's "regenerate on any privilege level change", and this server's ACR
+			// levels are privilege levels by construction (#266 decision 6).
+			if usersession.WillRaisePrivilege(userSession, authContext.AuthMethods, targetAcrLevel.String()) {
+				if regenerateSessionErr := authHelper.RegenerateSession(w, r); regenerateSessionErr != nil {
+					httpHelper.InternalServerError(w, r, regenerateSessionErr)
+					return
+				}
+			}
+
+			// Bump session with current auth context's methods and target ACR level.
+			// This handles step-up authentication: if the user had a level1 session but just
+			// completed OTP for a level2 client, the session's AuthMethods and AcrLevel
+			// will be upgraded to reflect the stronger authentication that was performed.
+			bumpedSession, sessionErr := userSessionManager.BumpUserSession(r, sessionIdentifier, client.Id,
+				authContext.AuthMethods, targetAcrLevel.String())
+			if sessionErr != nil {
+				httpHelper.InternalServerError(w, r, sessionErr)
+				return
+			}
+
+			if userReallyAuthenticated {
+				// User re-authenticated (prompt=login, step-up, etc.).
+				// BumpUserSession preserves the old AuthTime (correct for SSO reuse
+				// in handler_authorize.go), but here the user actually entered
+				// credentials again, so refresh AuthTime to reflect that.
+				//
+				// The value is the one the credential handler captured, never the clock read
+				// here. auth_time is what max_age is measured against, "the last time the
+				// End-User was actively authenticated by the OP" in OIDC Core 3.1.2.1, and
+				// the browser owns the hop between the credential and this handler: reading
+				// the clock here lets a tab paused after the password was accepted and
+				// resumed hours later mint a token saying the user authenticated just now,
+				// so a relying party that asked for a fresh sign-in is told it got one
+				// (#252 decision 8). userReallyAuthenticated is exactly the guard that makes
+				// the dereference safe: non-nil and non-zero.
+				bumpedSession.AuthTime = authContext.AuthenticatedAt.UTC()
+				sessionErr = database.UpdateUserSession(r.Context(), nil, bumpedSession)
+				if sessionErr != nil {
+					httpHelper.InternalServerError(w, r, sessionErr)
+					return
+				}
+			}
+
+			// Use session's AuthTime as auth_time source of truth. For SSO reuse
+			// this preserves the original value; for re-auth it was just refreshed.
+			// Legacy sessions without AuthTime fall back to Started (consistent with
+			// the prompt=none path in handler_authorize.go).
+			if bumpedSession.AuthTime.IsZero() {
+				authContext.AuthenticatedAt = &bumpedSession.Started
+			} else {
+				authContext.AuthenticatedAt = &bumpedSession.AuthTime
+			}
+
+			// The session has answered this ceremony's level 2 question, so record the OTP
+			// configuration generation it answered against and stop owing a re-prompt for it.
+			//
+			// After the bump and after the AuthTime write above, both of which write the whole
+			// row: otp_config_generation is tagged dont-update so neither carries it, and this
+			// narrow write is the only thing that moves it.
+			//
+			// Two conditions, and both are load-bearing. A missing capture means the ceremony
+			// never reached /auth/level2, which can only happen when the snapshot already
+			// matched, so there is nothing to promote. The ACR gate is needed because the
+			// password handler captures too: without it a prompt=login ceremony at a level 1
+			// client would discharge a level 2 obligation it never addressed. It is the same
+			// predicate /auth/level1completed uses to decide the step-up, so the two agree by
+			// construction (#242 decision 3).
+			if authContext.OtpConfigGeneration != nil && targetAcrLevel.IsHigherThan(models.AcrLevel1) {
+				sessionErr = database.PromoteUserSessionOtpConfigGeneration(r.Context(), nil, bumpedSession.Id,
+					*authContext.OtpConfigGeneration)
+				if sessionErr != nil {
+					httpHelper.InternalServerError(w, r, sessionErr)
+					return
+				}
+				bumpedSession.OtpConfigGeneration = *authContext.OtpConfigGeneration
+			}
+
+			auditLogger.Log(r.Context(), audit.AuditBumpedUserSession, map[string]interface{}{
+				"userId":   authContext.UserId,
+				"clientId": client.Id,
+			})
+
+			boundSession = bumpedSession
+		} else {
+			// No session this ceremony may reuse: there is none, it is no longer valid, or it
+			// belongs to somebody else. Only level 1 authentication performed in THIS ceremony
+			// justifies creating one: without this gate StartNewUserSession below mints a
+			// session from authContext.UserId with no proof anyone authenticated, so a
+			// ceremony whose session was ended mid-flight silently recreates it (#129
+			// decision 6).
+			//
+			// The predicate is deliberately "this ceremony did level 1" rather than "no
+			// valid session". The second shape is legitimate: a session is deleted and the
+			// user then starts a fresh ceremony and really does enter a password, which is
+			// what TestSessionDeletedDuringAuthFlow_LoginSucceeds guards (#46). There is no
+			// loop either, because the second pass through here has Level1AuthCompleted set
+			// by handler_auth_pwd.
+			//
+			// It reads Level1AuthCompleted rather than userReallyAuthenticated above, and
+			// that is the whole point of the field (#129 decision 15): AuthenticatedAt has
+			// two writers, and a ceremony that stepped up to OTP by reusing a session
+			// satisfies it without a password. handlePromptNone sets AuthenticatedAt too,
+			// from the session it reused, and while it goes straight to /auth/issue and
+			// never arrives here, it would be stopped rather than let through if it ever did.
+			if !authContext.Level1AuthCompleted {
+				authContext.AuthState = ceremony.AuthStateRequiresLevel1
+				err = authHelper.SaveAuthContext(w, r, authContext)
+				if err != nil {
+					httpHelper.InternalServerError(w, r, err)
+					return
+				}
+				http.Redirect(w, r, config.GetAuthServer().BaseURL+"/auth/level1", http.StatusFound)
+				return
+			}
+
+			// The browser changed hands, so the session it was carrying is ended rather than
+			// left behind. StartNewUserSession below does not do this: it sweeps sibling
+			// sessions of the NEW user, so the previous user's row is never a candidate and
+			// would survive orphaned, its refresh tokens still working and still bumping it
+			// while nobody can reach it through this browser. Termination is the #129 path, so
+			// the codes and refresh tokens that session authorized are revoked with it: they are
+			// grants this browser holds, and this browser now belongs to someone else. Only
+			// grants originating from this session are touched, since both sweeps key on the
+			// session identifier, so the previous user's other devices are unaffected (#133).
+			//
+			// This runs for an invalid foreign session as well as a valid one. The browser
+			// carries the cookie either way, and leaving a row that can never be resumed
+			// achieves nothing while its offline grants keep working.
+			//
+			// It sits AFTER the level 1 gate above, deliberately: destroying somebody's session
+			// must follow a real authentication in this ceremony, never a ceremony that merely
+			// arrived here. A failure returns 500 with the browser still cookied to the old
+			// session and no new session and no code minted, which is the fail-closed direction.
+			if userSession != nil && !sessionBelongsToCeremony {
+				terminationResult, terminateErr := revocation.TerminateUserSessionTx(r.Context(), database, userSession)
+				if terminateErr != nil {
+					httpHelper.InternalServerError(w, r, terminateErr)
+					return
+				}
+
+				// Three events, all of them after the commit and none before it, so nothing here
+				// can attest to a termination that rolled back.
+				//
+				// This one comes first because it is the reason the other two happened. It
+				// attests the handover and the ending, and deliberately not that a replacement
+				// now exists: StartNewUserSession below can still fail and return a 500, and
+				// started_new_user_session is what attests the replacement. Its absence after
+				// this event is how an operator sees a handover that did not complete. Emitting
+				// this one after the creation instead would leave that failure recorded as a
+				// termination with no actor and no reason, which is the worse trade (#133).
+				//
+				// Neither event below carries loggedInUser: this is a browser ceremony with
+				// no bearer token, and the only identity in scope is the cookie's, which at
+				// this instant still names the user being terminated -- recording it would
+				// name the party losing the session as the actor who ended it. The actor is
+				// this event's userId, which is where an auditor reads it.
+				auditLogger.Log(r.Context(), audit.AuditCrossUserSessionReplaced, map[string]interface{}{
+					"userId":                    authContext.UserId,
+					"previousUserId":            userSession.UserId,
+					"previousSessionIdentifier": userSession.SessionIdentifier,
+					"clientId":                  client.Id,
+				})
+
+				// deleted_user_session beside terminated_user_session, the pairing every caller of
+				// revocation.TerminateUserSessionTx writes (#129 decision 9): the lifecycle record that a
+				// session row is gone, next to the security record of what its grants authorized.
+				// Emitting one without the other would make a browser handover the only
+				// termination that never reaches a consumer watching the lifecycle stream, and it
+				// would falsify the promise that ending a session always writes both.
+				auditLogger.Log(r.Context(), audit.AuditDeletedUserSession, map[string]interface{}{
+					"userSessionId": userSession.Id,
+					"loggedInUser":  "",
+				})
+				revocation.LogTerminatedUserSession(r.Context(), auditLogger, userSession, "", terminationResult)
+			}
+
+			// start new session
+			// AuthenticatedAt is the credential's instant, and it is what the new row's
+			// AuthTime is stamped with rather than the clock inside StartNewUserSession, for
+			// the reason the reuse arm above gives (#252 decision 8). It is always set here:
+			// the gate above refuses to mint a session without Level1AuthCompleted, and the
+			// password handler is the only writer of that field, setting AuthenticatedAt
+			// beside it. StartNewUserSession refuses a nil or zero instant rather than
+			// inventing one, so if that invariant ever breaks this arm answers 500 instead of
+			// minting a session that claims a sign-in happened just now.
+			newSession, startNewUserSessionErr := userSessionManager.StartNewUserSession(
+				w, r, authContext.UserId, client.Id, authContext.AuthMethods, targetAcrLevel.String(),
+				authContext.AuthStateGeneration, authContext.OtpConfigGeneration,
+				authContext.AuthenticatedAt)
+			if startNewUserSessionErr != nil {
+				httpHelper.InternalServerError(w, r, startNewUserSessionErr)
+				return
+			}
+
+			// Use session's AuthTime so auth_time is consistent across SSO requests.
+			// For legacy sessions with zero AuthTime, fall back to Started (consistent
+			// with the prompt=none path in handler_authorize.go).
+			if newSession.AuthTime.IsZero() {
+				authContext.AuthenticatedAt = &newSession.Started
+			} else {
+				authContext.AuthenticatedAt = &newSession.AuthTime
+			}
+
+			auditLogger.Log(r.Context(), audit.AuditStartedNewUserSesson, map[string]interface{}{
+				"userId":   authContext.UserId,
+				"clientId": client.Id,
+			})
+
+			boundSession = newSession
+		}
+
+		// set the acr level in the auth context
+		//
+		// Against the session this ceremony bound to, not the one the browser arrived with. The
+		// two differ whenever the create arm ran with an ambient session present, and the ACR is
+		// the maximum of the two arguments, so feeding the ambient row lets a session this
+		// ceremony did not bind to raise the acr claim of a token bound to a different session:
+		// another user's completed second factor, or this user's own expired one, would satisfy
+		// a level 2 client that this ceremony only ever answered with a password (#133).
+		err = authContext.SetAcrLevel(targetAcrLevel, boundSession)
+		if err != nil {
+			httpHelper.InternalServerError(w, r, err)
+			return
+		}
+
+		user, err := database.GetUserById(r.Context(), nil, authContext.UserId)
+		if err != nil {
+			httpHelper.InternalServerError(w, r, err)
+			return
+		}
+		if user == nil {
+			httpHelper.InternalServerError(w, r, errs.New("user not found"))
+			return
+		}
+
+		if !user.Enabled {
+			auditLogger.Log(r.Context(), audit.AuditUserDisabled, map[string]interface{}{
+				"userId": user.Id,
+			})
+			// The clear goes FIRST. ClearAuthContext persists the deletion through a Set-Cookie
+			// on w, and redirToClientWithError commits the response in every response mode, so
+			// clearing afterwards leaves the header on a response already written and the
+			// browser keeps an auth context it can replay (#141).
+			refusalErr := authHelper.ClearAuthContext(w, r)
+			if refusalErr != nil {
+				// The clear failed, so Save wrote no cookie and the browser still holds the
+				// auth context. The client is owed an error response regardless: its redirect
+				// URI was validated upstream, so OIDC Core 1.0 3.1.2.2 with 3.1.2.6 applies,
+				// and RFC 6749 4.1.2.1 mints server_error for exactly this condition (#141).
+				slog.ErrorContext(r.Context(), "unable to clear the auth context, answering the client with server_error",
+					"error", refusalErr)
+				refusalErr = redirToClientWithError(w, r, database, httpHelper, templateFS,
+					redirectErrorFromAuthContext(authContext, client, "server_error", "Internal server error"))
+				if refusalErr != nil {
+					// Nowhere left to send the client, so the 500 is the last resort here.
+					httpHelper.InternalServerError(w, r, refusalErr)
+				}
+				return
+			}
+
+			refusalErr = redirToClientWithError(w, r, database, httpHelper, templateFS,
+				redirectErrorFromAuthContext(authContext, client, "access_denied", "The user account is disabled."))
+			if refusalErr != nil {
+				httpHelper.InternalServerError(w, r, refusalErr)
+				return
+			}
+			return
+		}
+
+		// we need to check if consent is required
+
+		// we'll first find out what is the effective scope,
+		// by filtering out the scopes where the user is not authorized
+		effectiveScope, err := permissionChecker.FilterOutScopesWhereUserIsNotAuthorized(r.Context(), authContext.Scope, user)
+		if err != nil {
+			httpHelper.InternalServerError(w, r, err)
+			return
+		}
+
+		// in the auth context replace the scope with the effective scope
+		authContext.SetScope(effectiveScope)
+		if len(authContext.Scope) == 0 {
+			// The clear goes FIRST, for the same reason as the disabled-user refusal above: a
+			// Set-Cookie written after redirToClientWithError has committed never reaches the
+			// wire, so the browser keeps a replayable auth context (#141).
+			err = authHelper.ClearAuthContext(w, r)
+			if err != nil {
+				// The clear failed, so Save wrote no cookie and the browser still holds the
+				// auth context. The client is owed an error response regardless: its redirect
+				// URI was validated upstream, so OIDC Core 1.0 3.1.2.2 with 3.1.2.6 applies,
+				// and RFC 6749 4.1.2.1 mints server_error for exactly this condition (#141).
+				slog.ErrorContext(r.Context(), "unable to clear the auth context, answering the client with server_error",
+					"error", err)
+				err = redirToClientWithError(w, r, database, httpHelper, templateFS,
+					redirectErrorFromAuthContext(authContext, client, "server_error", "Internal server error"))
+				if err != nil {
+					// Nowhere left to send the client, so the 500 is the last resort here.
+					httpHelper.InternalServerError(w, r, err)
+				}
+				return
+			}
+
+			err = redirToClientWithError(w, r, database, httpHelper, templateFS,
+				redirectErrorFromAuthContext(authContext, client,
+					"access_denied", "The user is not authorized to access any of the requested scopes"))
+			if err != nil {
+				httpHelper.InternalServerError(w, r, err)
+				return
+			}
+			return
+		}
+
+		// Handle prompt=consent: force consent screen regardless of existing consent or client settings
+		if authContext.HasPromptValue("consent") {
+			authContext.AuthState = ceremony.AuthStateRequiresConsent
+			err = authHelper.SaveAuthContext(w, r, authContext)
+			if err != nil {
+				httpHelper.InternalServerError(w, r, err)
+				return
+			}
+			http.Redirect(w, r, config.GetAuthServer().BaseURL+"/auth/consent", http.StatusFound)
+			return
+		}
+
+		// we must redirect to consent if the client requires it or if there's an offline_access scope
+		if client.ConsentRequired || oidc.HasOfflineAccessScope(authContext.Scope) {
+			authContext.AuthState = ceremony.AuthStateRequiresConsent
+
+			err = authHelper.SaveAuthContext(w, r, authContext)
+			if err != nil {
+				httpHelper.InternalServerError(w, r, err)
+				return
+			}
+			http.Redirect(w, r, config.GetAuthServer().BaseURL+"/auth/consent", http.StatusFound)
+			return
+		}
+
+		// if there's no need for consent, we're ready to issue the code
+		authContext.AuthState = ceremony.AuthStateReadyToIssueCode
+		err = authHelper.SaveAuthContext(w, r, authContext)
+		if err != nil {
+			httpHelper.InternalServerError(w, r, err)
+			return
+		}
+		http.Redirect(w, r, config.GetAuthServer().BaseURL+"/auth/issue", http.StatusFound)
+	}
+}

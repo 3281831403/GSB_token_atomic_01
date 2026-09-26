@@ -1,0 +1,200 @@
+package adminuserhandlers
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"strconv"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/leodip/goiabada/adminconsole/internal/constants"
+	"github.com/leodip/goiabada/adminconsole/internal/handlers"
+	"github.com/leodip/goiabada/adminconsole/internal/oauthclient"
+	"github.com/leodip/goiabada/core/api"
+	coreconstants "github.com/leodip/goiabada/core/constants"
+	"github.com/leodip/goiabada/core/errs"
+	"github.com/leodip/goiabada/core/sessionstore"
+)
+
+// userAuthenticationAPI is what the user authentication page needs: the user, and the password
+// and OTP writes.
+type userAuthenticationAPI interface {
+	GetUserById(ctx context.Context, accessToken string, userId int64) (*api.UserResponse, error)
+	UpdateUserOTP(ctx context.Context, accessToken string, userId int64, request *api.UpdateUserOTPRequest) (*api.UserResponse, error)
+	UpdateUserPassword(ctx context.Context, accessToken string, userId int64, request *api.UpdateUserPasswordRequest) (*api.UserResponse, error)
+}
+
+func HandleAdminUserAuthenticationGet(
+	httpHelper handlers.HttpHelper,
+	httpSession sessionstore.Store,
+	apiClient userAuthenticationAPI,
+) http.HandlerFunc {
+
+	return func(w http.ResponseWriter, r *http.Request) {
+
+		idStr := chi.URLParam(r, "userId")
+		if len(idStr) == 0 {
+			httpHelper.NotFound(w, r)
+			return
+		}
+
+		id, err := strconv.ParseInt(idStr, 10, 64)
+		if err != nil {
+			httpHelper.NotFound(w, r)
+			return
+		}
+
+		// Get JWT info from context to extract access token
+		jwtInfo, ok := r.Context().Value(constants.ContextKeyJwtInfo).(oauthclient.JwtInfo)
+		if !ok {
+			httpHelper.InternalServerError(w, r, errs.New("no JWT info found in context"))
+			return
+		}
+		accessToken := jwtInfo.TokenResponse.AccessToken
+
+		user, err := apiClient.GetUserById(r.Context(), accessToken, id)
+		if err != nil {
+			handlers.HandleAPIError(httpHelper, w, r, err)
+			return
+		}
+		if user == nil {
+			httpHelper.NotFound(w, r)
+			return
+		}
+
+		sess, err := httpSession.Get(r, coreconstants.AdminConsoleSessionName)
+		if err != nil {
+			httpHelper.InternalServerError(w, r, err)
+			return
+		}
+
+		_, savedSuccessfully := sess.TakeFlash("savedSuccessfully")
+		if savedSuccessfully {
+			err = httpSession.Save(r, w, sess)
+			if err != nil {
+				httpHelper.InternalServerError(w, r, err)
+				return
+			}
+		}
+
+		bind := map[string]interface{}{
+			"user":              user,
+			"otpEnabled":        user.OTPEnabled,
+			"page":              r.URL.Query().Get("page"),
+			"query":             r.URL.Query().Get("query"),
+			"savedSuccessfully": savedSuccessfully,
+		}
+
+		err = httpHelper.RenderTemplate(w, r, "/layouts/menu_layout.html", "/admin_users_authentication.html", bind)
+		if err != nil {
+			httpHelper.InternalServerError(w, r, err)
+			return
+		}
+	}
+}
+
+func HandleAdminUserAuthenticationPost(
+	httpHelper handlers.HttpHelper,
+	httpSession sessionstore.Store,
+	apiClient userAuthenticationAPI,
+) http.HandlerFunc {
+
+	return func(w http.ResponseWriter, r *http.Request) {
+
+		idStr := chi.URLParam(r, "userId")
+		if len(idStr) == 0 {
+			httpHelper.NotFound(w, r)
+			return
+		}
+
+		id, err := strconv.ParseInt(idStr, 10, 64)
+		if err != nil {
+			httpHelper.NotFound(w, r)
+			return
+		}
+
+		// Get JWT info from context to extract access token
+		jwtInfo, ok := r.Context().Value(constants.ContextKeyJwtInfo).(oauthclient.JwtInfo)
+		if !ok {
+			httpHelper.InternalServerError(w, r, errs.New("no JWT info found in context"))
+			return
+		}
+		accessToken := jwtInfo.TokenResponse.AccessToken
+
+		user, err := apiClient.GetUserById(r.Context(), accessToken, id)
+		if err != nil {
+			handlers.HandleAPIError(httpHelper, w, r, err)
+			return
+		}
+		if user == nil {
+			httpHelper.NotFound(w, r)
+			return
+		}
+
+		renderError := func(message string) {
+			bind := map[string]interface{}{
+				"user":       user,
+				"otpEnabled": r.FormValue("otpEnabled") == "on",
+				"page":       r.URL.Query().Get("page"),
+				"query":      r.URL.Query().Get("query"),
+				"error":      message,
+			}
+
+			renderErr := httpHelper.RenderTemplate(w, r, "/layouts/menu_layout.html", "/admin_users_authentication.html", bind)
+			if renderErr != nil {
+				httpHelper.InternalServerError(w, r, renderErr)
+			}
+		}
+
+		// Handle password update.
+		//
+		// r.PostFormValue rather than r.FormValue: r.Form merges the URL query behind the request
+		// body, so /admin/users/{userId}/authentication?newPassword=... would have set another
+		// account's password, leaving it in the browser's history, in the Referer of anything the
+		// page loads, and in the access log of every proxy in front of the deployment. This route is
+		// POST-only with a separate GET handler rendering the form, so the query was never a
+		// submission (#202).
+		newPassword := r.PostFormValue("newPassword")
+		if len(newPassword) > 0 {
+			passwordReq := &api.UpdateUserPasswordRequest{
+				NewPassword: newPassword,
+			}
+			_, updateUserPasswordErr := apiClient.UpdateUserPassword(r.Context(), accessToken, id, passwordReq)
+			if updateUserPasswordErr != nil {
+				handlers.HandleAPIErrorWithCallback(httpHelper, w, r, updateUserPasswordErr, renderError)
+				return
+			}
+		}
+
+		// Handle OTP toggle
+		if user.OTPEnabled {
+			otpEnabled := r.FormValue("otpEnabled") == "on"
+			if !otpEnabled {
+				otpReq := &api.UpdateUserOTPRequest{
+					Enabled: false,
+				}
+				_, updateUserOTPErr := apiClient.UpdateUserOTP(r.Context(), accessToken, id, otpReq)
+				if updateUserOTPErr != nil {
+					handlers.HandleAPIError(httpHelper, w, r, updateUserOTPErr)
+					return
+				}
+			}
+		}
+
+		// Set success flash
+		sess, err := httpSession.Get(r, coreconstants.AdminConsoleSessionName)
+		if err != nil {
+			httpHelper.InternalServerError(w, r, err)
+			return
+		}
+
+		sess.SetFlash("savedSuccessfully", "true")
+		err = httpSession.Save(r, w, sess)
+		if err != nil {
+			httpHelper.InternalServerError(w, r, err)
+			return
+		}
+
+		http.Redirect(w, r, withListPosition(fmt.Sprintf("/admin/users/%v/authentication", user.Id), r), http.StatusFound)
+	}
+}

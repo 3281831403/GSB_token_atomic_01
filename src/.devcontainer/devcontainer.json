@@ -1,0 +1,98 @@
+{
+	"name": "dev-container-server",
+	"dockerComposeFile": "docker-compose.yml",
+	"service": "devcontainer",
+	"workspaceFolder": "/workspaces/goiabada/src/",
+
+	"containerEnv": {
+		"GOIABADA_ADMIN_EMAIL": "admin@example.com",
+		"GOIABADA_ADMIN_PASSWORD": "changeme",
+		"GOIABADA_APPNAME": "Goiabada",
+
+		"GOIABADA_AUTHSERVER_BASEURL": "http://localhost:19090",
+		"GOIABADA_AUTHSERVER_INTERNALBASEURL": "",
+		"GOIABADA_AUTHSERVER_LISTEN_HOST_HTTPS": "0.0.0.0",
+		"GOIABADA_AUTHSERVER_LISTEN_PORT_HTTPS": "19443",
+		"GOIABADA_AUTHSERVER_LISTEN_HOST_HTTP": "0.0.0.0",
+		"GOIABADA_AUTHSERVER_LISTEN_PORT_HTTP": "19090",
+		"GOIABADA_AUTHSERVER_CERTFILE": "",
+		"GOIABADA_AUTHSERVER_KEYFILE": "",
+		"GOIABADA_AUTHSERVER_TRUST_PROXY_HEADERS": "false",
+		"GOIABADA_AUTHSERVER_RATELIMITER_ENABLED": "false",
+		"GOIABADA_AUTHSERVER_LOG_HTTP_REQUESTS": "true",
+		"GOIABADA_AUTHSERVER_LOG_SQL": "false",
+		"GOIABADA_AUTHSERVER_STATICDIR": "",
+		"GOIABADA_AUTHSERVER_TEMPLATEDIR": "",
+		"GOIABADA_AUTHSERVER_DEBUG_API_REQUESTS": "false",
+		"GOIABADA_AUTHSERVER_SESSION_AUTHENTICATION_KEY": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		"GOIABADA_AUTHSERVER_SESSION_ENCRYPTION_KEY": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		"GOIABADA_AES_ENCRYPTION_KEY": "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+
+		"GOIABADA_ADMINCONSOLE_OAUTH_CLIENT_SECRET": "devcontainer-admin-console-secret-0123456789abcdef",
+
+		"GOIABADA_DB_TYPE": "mssql",
+		"GOIABADA_DB_USERNAME": "sa",
+		"GOIABADA_DB_PASSWORD": "YourStr0ngPassw0rd!",
+		"GOIABADA_DB_HOST": "mssql-server",
+		"GOIABADA_DB_PORT": "11433",
+		"GOIABADA_DB_NAME": "goiabada",
+		"GOIABADA_DB_DSN": "file::memory:?cache=shared",
+
+		"GOIABADA_ADMINCONSOLE_BASEURL": "http://localhost:19091",
+		"GOIABADA_ADMINCONSOLE_LISTEN_HOST_HTTPS": "0.0.0.0",
+		"GOIABADA_ADMINCONSOLE_LISTEN_PORT_HTTPS": "19444",
+		"GOIABADA_ADMINCONSOLE_LISTEN_HOST_HTTP": "0.0.0.0",
+		"GOIABADA_ADMINCONSOLE_LISTEN_PORT_HTTP": "19091",
+		"GOIABADA_ADMINCONSOLE_CERTFILE": "",
+		"GOIABADA_ADMINCONSOLE_KEYFILE": "",
+		"GOIABADA_ADMINCONSOLE_TRUST_PROXY_HEADERS": "false",
+		"GOIABADA_ADMINCONSOLE_LOG_HTTP_REQUESTS": "true",
+		"GOIABADA_ADMINCONSOLE_STATICDIR": "",
+		"GOIABADA_ADMINCONSOLE_TEMPLATEDIR": "",
+		"GOIABADA_ADMINCONSOLE_SESSION_AUTHENTICATION_KEY": "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+		"GOIABADA_ADMINCONSOLE_SESSION_ENCRYPTION_KEY": "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+
+		// The Dockerfile installs gcc so that `run-tests.sh --race` can run the race detector,
+		// which needs cgo. Go turns cgo on by default whenever a C compiler is found, which would
+		// make every ordinary build in the container link glibc and use the cgo DNS resolver,
+		// unlike the release binaries (build-binaries.sh exports CGO_ENABLED=0). Pinning it here
+		// keeps the default build as it was; the --race leg sets CGO_ENABLED=1 for itself.
+		"CGO_ENABLED": "0"
+	},
+
+	"forwardPorts": [19090, 19091],	
+	"otherPortsAttributes": {
+		"onAutoForward": "ignore"
+	},
+
+	"customizations": {
+		"vscode": {
+			"extensions": [
+				"formulahendry.auto-close-tag",
+				"formulahendry.auto-rename-tag",
+				"GitHub.copilot",
+				"GitHub.copilot-chat",
+				"golang.go",
+				"jinliming2.vscode-go-template",
+				"heybourn.headwind",
+				"esbenp.prettier-vscode",
+				"vscode-icons-team.vscode-icons",
+				"bradlc.vscode-tailwindcss"
+			]
+		}
+	},
+
+	"remoteUser": "vscode"
+	
+	// Note: UID/GID mapping is handled via USER_UID/USER_GID build args in docker-compose.yml
+	// The devcontainer CLI automatically passes these from the host environment
+
+	// Use 'postCreateCommand' to run commands after the container is created.
+	// "postCreateCommand": "go version",
+
+	// Configure tool-specific properties.
+	// "customizations": {},
+
+	// Uncomment to connect as root instead. More info: https://aka.ms/dev-containers-non-root.
+	// "remoteUser": "root"
+}

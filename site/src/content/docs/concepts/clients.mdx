@@ -1,0 +1,298 @@
+---
+title: Clients
+description: Configure OAuth clients for your applications.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+A client represents an application that requests access to protected resources.
+
+This access can either be on behalf of a user (using the authorization code flow with PKCE) or for the client itself (using the client credentials flow).
+
+Clients can be created through the admin console or dynamically via the [dynamic client registration](/concepts/clients/#dynamic-client-registration-rfc-7591) endpoint (RFC 7591).
+
+The client identifier is case-sensitive: `my-app` and `My-App` are two different clients, so an application whose `client_id` reaches the authorization or token endpoint in a different case than it was registered under is not found.
+
+## Public or confidential clients
+
+Clients can be either public or confidential, depending on whether they can securely store credentials.
+
+**Public clients** are for applications that **cannot** keep secrets confidential:
+
+- **Single-page applications (SPAs)** - JavaScript code runs in the browser where all secrets are visible to users
+- **Mobile apps** - APK/IPA files can be decompiled, exposing any embedded secrets
+- **Desktop applications** - Binaries can be reverse-engineered to extract credentials
+
+Public clients must use the authorization code flow with PKCE and cannot use client credentials flow.
+
+**Confidential clients** are for applications that **can** securely protect credentials:
+
+- **Server-side web applications** - Backend code runs on servers not accessible to end-users
+- **Backend services** - APIs and microservices with secure credential storage
+- **Server-to-server integrations** - Services running in controlled environments
+
+Confidential clients can safely store client secrets and use both authorization code flow and client credentials flow.
+
+**Which should you choose?** If your application code runs entirely in the browser or on user devices, you must use a public client. If you have a backend server that handles OAuth flows, use a confidential client for better security.
+
+## Consent required
+
+In OAuth2, the consent process ensures that users explicitly authorize third-party applications to access their resources.
+
+When the client is affiliated with the same organization as the authorization server and a high level of trust exists, explicit consent is not usually required.
+
+However, for clients from third-party organizations, configure the client to request user consent. This ensures that users are aware of who is accessing their tokens.
+
+**The default differs by how the client was created.** A client an administrator creates, through the admin console or the admin API, starts with consent off: an administrator vouched for it. A client that registered itself through [dynamic client registration](#dynamic-client-registration-rfc-7591) starts with consent **on**, because nobody has reviewed it. You can untick it on that client's settings page once you have reviewed it.
+
+## Default ACR level
+
+ACR stands for "Authentication Context Class Reference." It specifies the level of authentication assurance or the strength of the authentication method used to authenticate the end-user.
+
+Goiabada has 3 levels:
+
+<table>
+  <thead>
+    <tr>
+      <th style="white-space: nowrap;">ACR level</th>
+      <th>Description</th>
+      <th>When to use</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style="white-space: nowrap;"><code>urn:goiabada:level1</code></td>
+      <td>Level 1 authentication only (password)</td>
+      <td>Low-security resources, read-only access</td>
+    </tr>
+    <tr>
+      <td style="white-space: nowrap;"><code>urn:goiabada:level2_optional</code></td>
+      <td>Level 1 with optional 2FA (if enabled by user)</td>
+      <td>Balanced security, respects user preferences</td>
+    </tr>
+    <tr>
+      <td style="white-space: nowrap;"><code>urn:goiabada:level2_mandatory</code></td>
+      <td>Level 1 with mandatory 2FA</td>
+      <td>High-security resources, admin operations, financial transactions</td>
+    </tr>
+  </tbody>
+</table>
+
+By default, a client comes configured with `urn:goiabada:level2_optional`, which provides a good balance between security and user experience.
+
+You can raise the client's default ACR level on a per-authorization basis, but never lower it. For example, if your client has the default `urn:goiabada:level2_optional` but you have a specific resource that requires 2FA, you can specify `urn:goiabada:level2_mandatory` in the `acr_values` parameter of the authorization request.
+
+Changing this setting applies to authorization requests that start after the change, so a sign-in already in progress finishes at the level it was accepted under. See [ACR and AMR](/concepts/acr-amr/) for the full rules.
+
+## Client display settings
+
+Each client can be configured with display metadata that is shown to users during authentication and consent screens:
+
+- **Display name** - A human-friendly name shown instead of the client identifier (e.g., "My Application" instead of `my-app`). If the display name is empty, the client identifier is shown as a fallback.
+- **Description** - A short description of the client, shown on consent and auth screens when enabled.
+- **Website URL** - A link to the client's website, shown on the consent screen when enabled. Must use `http` or `https` scheme.
+
+Each of these has a corresponding **visibility toggle** (`showDisplayName`, `showDescription`, `showWebsiteURL`) that controls whether it appears on auth/consent screens. There is also a `showLogo` toggle for controlling logo visibility (see below).
+
+**Self-registered clients are named differently on the consent screen.** A client created through [dynamic client registration](#dynamic-client-registration-rfc-7591) supplies its own name at registration, and the consent screen shows that name with a note saying it has not been verified. Give the client a display name and turn on `showDisplayName` to replace it, with no note. The password and OTP screens are not affected and keep showing whatever the display settings above select.
+
+These settings can be managed through the admin console under the client's **Settings** tab, or via the [REST API](/integration/rest-api/#update-client-settings).
+
+## Client logo
+
+Each client can have a logo image that is displayed on authentication screens (password, OTP, consent).
+
+### Managing logos
+
+Logos can be uploaded and managed through:
+- The **Logo** tab in the admin console client settings
+- The [REST API](/integration/rest-api/#client-logo) endpoints
+
+### Public logo endpoint
+
+Client logos are publicly accessible at:
+
+```
+GET /client/logo/{clientIdentifier}
+```
+
+This endpoint requires no authentication and returns the image directly with appropriate content type headers. It returns `404` if the client or logo does not exist. The response includes `ETag` and `Cache-Control` headers for efficient caching.
+
+### Image requirements
+
+| Constraint | Value |
+|------------|-------|
+| Formats | JPEG, PNG, GIF, WebP |
+| Dimensions | 10x10 to 512x512 pixels |
+| Max size | 3MB |
+
+## System-level client
+
+The `admin-console-client` is a **system-level client** used internally by the admin console. It has special protections:
+
+- Its **client identifier cannot be changed** (renaming is blocked)
+- It **cannot be deleted**
+- All other settings (description, display name, redirect URIs, etc.) can be modified normally
+
+The API response for this client includes `"isSystemLevelClient": true` to indicate its protected status.
+
+## Redirect URIs
+
+In the redirect-based flows, Authorization code with PKCE and Implicit, the client application specifies a redirect URI in its authorization request.
+
+After the user grants or denies permission, the authorization server redirects the user back to this specified URI.
+
+It's necessary to pre-configure this URI in the client, and only exact matches are accepted (no wildcards). The single exception is the port of an http loopback address, described below.
+
+### What a redirect URI must look like
+
+Three rules apply to every redirect URI, however it was registered: through the admin console, through the API, or through [dynamic client registration](#dynamic-client-registration).
+
+- **It must be absolute**, with a scheme, per [RFC 6749 section 3.1.2](https://datatracker.ietf.org/doc/html/rfc6749#section-3.1.2). Values like `//example.com/callback` and `/callback` are rejected.
+- **An `http` or `https` URI must name a host.** `https:///example.com/callback` and `http:/example.com/callback` are rejected, even though both are technically absolute URIs. They carry no host that a URI parser will read as one, and browsers do not agree with the authorization server about what they mean. A browser reads `https:///example.com/callback` as the host `example.com`, and reads `http:/example.com/callback` as `example.com` when the current page is `https` but as a path on the current host when it is `http`. One spelling can therefore name two different places depending on the scheme your deployment is served over, so Goiabada refuses it rather than guess. Custom schemes are exempt, because a private-use URI such as `com.example.app:/oauth2redirect` is hostless by design and is handed to the operating system rather than navigated to.
+- **A fragment is not permitted**, per the same section. `http://127.0.0.1/callback#done` is rejected. A percent-encoded `%23` is not a fragment and is fine.
+
+**A query component is permitted**, per the same section again, and it comes back exactly as registered. `https://example.com/callback?lang=en&mode=dark` is accepted, and the authorization server appends its response parameters to it rather than rewriting it: field order, percent-encoding and unusual separators are all preserved byte for byte.
+
+The one exception is a field that names a response parameter. The authorization response owns `state`, `code`, `error` and `error_description`, so if your registered URI carries one of those names it is removed and the server's own value takes its place. The response may only contain each of them once. A client that registers `https://example.com/callback?state=fixed` sees the `state` it sent on the authorization request, not `state=fixed`.
+
+**The field is removed even when the server has nothing of its own to put there.** An authorization request that sends no `state` comes back with no `state` at all, rather than with the registered one, so a `state` in the callback is always the one your client sent. A successful authorization never arrives carrying a leftover `error` from the registered URI, and a refused one never arrives carrying a `code`. Only those four names are affected: everything else comes through untouched, `error_uri` included, since this server never emits it. Register a name outside the four if you need a fixed value to survive.
+
+This applies to the query component, which is where the response is written in the default `query` response mode. With `response_mode=fragment` or `response_mode=form_post` the response travels in the URL fragment or the form body instead, and the registered query is left exactly as registered, a `state=fixed` in it included.
+
+These rules are enforced when a client asks to be redirected, not only when the URI is registered. **A redirect URI that breaks them is refused even if it is already stored on the client**, and the user sees an error page rather than being redirected. If a client fails with a redirect URI error, this is the first thing to check: open the client's redirect URIs page and look for a value with no scheme, no host, or a `#`.
+
+### Loopback redirect URIs for native apps
+
+A native or desktop app receives its callback on a temporary HTTP server bound to a port the operating system assigns at startup. The app cannot know that port when the client is registered, so [RFC 8252](https://datatracker.ietf.org/doc/html/rfc8252#section-7.3) requires the authorization server to accept any port on a loopback redirect URI.
+
+Register the URI without a port:
+
+```
+http://127.0.0.1/callback
+```
+
+Any port is then accepted at authorization time, so `http://127.0.0.1:54321/callback` matches. The loopback hosts are `127.0.0.1`, `::1` (written as `http://[::1]/callback`) and `localhost`.
+
+**The port is the only component that may differ.** Scheme, host, path and query are still compared byte for byte, including character case and percent-encoding. The code is delivered to the port the client actually requested, and that same URI must be presented at the token endpoint.
+
+Three limits apply:
+
+- **`http` only.** An `https` loopback URI still requires an exact match, since RFC 8252 defines loopback redirects as using `http`.
+- **`response_type=code` only.** The implicit flow gets no port flexibility, because it returns tokens directly in the redirect and interception cannot be mitigated.
+- **PKCE is required for public native clients.** Port flexibility widens the set of local ports that may receive an authorization code, and PKCE is what makes an intercepted code useless. It is enforced for every public client and cannot be turned off; the global and per-client settings govern confidential clients. See [PKCE](/concepts/pkce/).
+
+If the client registers itself through [dynamic client registration](#dynamic-client-registration-rfc-7591) rather than being created in the admin console, additional restrictions apply to its redirect URIs. See [Redirect URI rules](#redirect-uri-rules).
+
+<Aside type="caution">
+Prefer the IP literals `127.0.0.1` and `::1` over `localhost`. [RFC 8252 section 8.3](https://datatracker.ietf.org/doc/html/rfc8252#section-8.3) marks the `localhost` hostname NOT RECOMMENDED: resolving the name is not guaranteed to reach the loopback interface, and binding a server by hostname can inadvertently listen on a non-loopback interface, exposing the callback to the network. Goiabada accepts `localhost` as a convenience, not as a recommendation.
+</Aside>
+
+## Web origins
+
+If your client application plans to make calls to the `/auth/token`, `/auth/logout` or `/userinfo` endpoints from JavaScript, you must register the origin of the web application to enable Cross-Origin Resource Sharing (CORS) access. Failure to do so will result in CORS blocking the HTTP requests.
+
+An origin is not a URL: it is a scheme, a host and an optional port, with nothing after the host, such as `https://www.example.com`. Goiabada stores the canonical form and refuses what it cannot canonicalize.
+
+Web origins are permitted server-wide. A CORS preflight carries no client identity, so an origin registered against any client is accepted for every client, and the client it is listed under is only a label.
+
+## Client permissions
+
+Client permissions are used in server-to-server checks, specifically within the client credentials flow. This is about the permissions granted to the client itself, allowing it to access other resources.
+
+## Token configuration
+
+Each client can override global token settings to meet specific application requirements. In the client's **Tokens** settings, you can customize:
+
+- **Token expiration** - Override the global access/ID token lifetime
+- **Refresh token timeouts** - Configure offline refresh token idle timeout and max lifetime
+- **OIDC claims in tokens** - Control whether OpenID Connect scope claims (profile, email, phone, address) are included in access tokens and ID tokens
+
+For example, you might:
+- Require shorter token lifetimes for high-security applications
+- Disable OIDC claims in ID tokens for strict OIDC conformance
+- Enable longer refresh token lifetimes for background services
+
+See [Tokens](/concepts/tokens/) for detailed information about token configuration options.
+
+## Dynamic client registration (RFC 7591)
+
+Goiabada supports dynamic client registration according to [RFC 7591](https://datatracker.ietf.org/doc/html/rfc7591), allowing applications to self-register as OAuth clients without manual administrator intervention.
+
+<Aside>
+This is OAuth client registration (for applications), not to be confused with user self-registration, which is for end-users creating accounts.
+</Aside>
+
+This feature is particularly useful for:
+
+- **MCP (Model Context Protocol) servers** - AI tools and IDE extensions that need OAuth credentials
+- **Native desktop applications** - Apps that need unique client credentials per installation
+- **Development tools** - CLI tools, testing frameworks, and developer utilities
+- **Automated deployments** - CI/CD pipelines that provision OAuth clients automatically
+
+### Enabling dynamic client registration
+
+By default, this feature is disabled for security reasons. To enable it:
+
+1. Navigate to **Settings → Dynamic Client Registration** in the admin console
+2. Enable the feature
+3. The registration endpoint becomes available at `/connect/register`
+
+### Security considerations
+
+When enabled, any application can register as a client. Consider these security measures:
+
+- **Limit to trusted networks** - Use firewall rules or reverse proxy to restrict access
+- **Monitor registrations** - Regularly audit newly registered clients in the admin console. The client list marks each one with a **Self-registered** badge, so you can tell at a glance which clients arrived through this endpoint and which an administrator created
+- **Review client metadata** - Check redirect URIs and other metadata of self-registered clients
+- **Disable untrusted clients** - Clients can be disabled through the admin console if needed
+
+A self-registered client's **identifier cannot be changed**, in the same way the [system-level client](#system-level-client)'s cannot: it is generated rather than chosen, so the name in your client list is always the name the client authenticates under. Every other setting can be changed, including **Consent required**.
+
+**Self-registered clients require [consent](#consent-required) by default**, and the consent screen shows their self-asserted name with [a note saying it is unverified](#client-display-settings). Clients an administrator creates are unaffected and keep their existing default of consent off.
+
+**A refused authorization is not redirected back to a self-registered client.** Anyone can register a client and point it at any address, so an error response is an instruction to send someone's browser to a site nobody here has checked. When Goiabada refuses an authorization for a self-registered client, whether the user declined it or the request was invalid, it shows the user a page naming the application and the address it asked to send them to, and the request stops there. Clients an administrator created keep the ordinary redirect, unless the address has since been removed from the client: deleting a redirect URI takes effect on sign-ins already under way, which stop on that same page instead of receiving the error.
+
+[Silent authentication](/concepts/prompt-parameter/) with `prompt=none` is covered rather than exempt: it is the version of the same attack that needs no session and nothing from the user. Inside the hidden iframe silent renewal normally runs in, nothing is displayed to anyone.
+
+<Aside type="caution">
+**If you build a self-registered client:** you receive no error response in any of those cases. An authorization the user declines or the server refuses simply never completes, so treat one that does not return within a reasonable time as abandoned rather than waiting indefinitely. `prompt=none` included: a silent request that cannot be completed times out rather than returning `consent_required`, so send the user through one ordinary authorization when a silent one does not come back. If your integration needs the error response, it needs a client an administrator registered.
+</Aside>
+
+<Aside type="caution">
+**A self-registered client can be missing its badge.** One that registered itself before Goiabada started marking them, and was renamed back when that was still possible, carries no mark: no badge, and the self-registered refusal above does not apply to it. Nothing in the client list distinguishes it from a client an administrator created, so if your deployment is old enough to have one, check that **Consent required** is set the way you want across your clients.
+</Aside>
+
+### Redirect URI rules
+
+The [universal rules](#what-a-redirect-uri-must-look-like) apply here as they do everywhere else. On top of them, dynamic registration restricts the scheme and host, because the caller is anonymous, and what is accepted depends on whether the client is public, which is determined by `token_endpoint_auth_method`:
+
+| Client type | Allowed | Not allowed |
+|---|---|---|
+| Public (`token_endpoint_auth_method: none`) | `http` on `127.0.0.1`, `::1` or `localhost`, with any port; custom schemes such as `myapp://callback` | `https`; `http` on any other host |
+| Confidential (any other auth method) | `https` on any host; `http` on the three loopback hosts | custom schemes; `http` on any other host |
+
+Two further rules apply to both client types, and these two are specific to dynamic registration:
+
+- **The host is matched exactly**, after case folding. A host that merely starts with a loopback name, such as `localhost.attacker.com`, is not a loopback host and is rejected.
+- **Characters that cannot appear in a URI are rejected**, namely `<`, `>`, `"`, `{`, `}`, `|`, `\`, `^`, backtick and space. Percent-encode them if you genuinely need them.
+
+Some schemes are refused outright, either because a browser cannot deliver an authorization response to them or because they can execute script: `javascript`, `data`, `vbscript`, `file`, `blob`, `about`, `chrome`, `chrome-extension`, `moz-extension`, `view-source`, `filesystem`, `resource`, `ftp`, `ftps`, `ws`, `wss`, `gopher` and `telnet`.
+
+For loopback redirect URIs, the port flexibility described under [Loopback redirect URIs for native apps](#loopback-redirect-uris-for-native-apps) applies here too: register `http://127.0.0.1/callback` without a port and any port is accepted at authorization time.
+
+<Aside type="caution">
+Public clients registered through dynamic registration cannot use an `https` redirect URI. This is a deliberate Goiabada restriction rather than a rule from the specifications, and it is stricter than most identity providers.
+
+**It is a conservative policy, not a security boundary.** It does not prevent an anonymous caller from registering an attacker-controlled `https` callback: the same caller can choose a confidential `token_endpoint_auth_method` instead, register any `https` URI, and receive the generated client secret in the response. Nothing about the public-client rule closes that. The control that binds a client's identity to a user's authority is the consent screen, which is why every self-registered client [requires consent by default](#security-considerations).
+
+Two consequences follow from the restriction. A browser-based single-page app cannot register itself through this endpoint at all, since it needs an `https` redirect URI. And a native app cannot use the claimed-`https` pattern that [RFC 8252 section 7.2](https://datatracker.ietf.org/doc/html/rfc8252#section-7.2) recommends, and should use a loopback or custom-scheme redirect URI instead. In both cases, register the client through the admin console rather than through dynamic registration.
+</Aside>
+
+### Registration endpoint
+
+**POST** `/connect/register`
+
+The endpoint accepts client metadata as defined in RFC 7591 and returns client credentials.
+
+For detailed API documentation and examples, see the [RFC 7591 specification](https://datatracker.ietf.org/doc/html/rfc7591).

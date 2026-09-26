@@ -1,0 +1,1630 @@
+---
+title: REST API
+description: Admin and Account REST API reference for programmatic management.
+---
+
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+Goiabada provides REST APIs for programmatic management of users, groups, clients, and settings. These APIs are used internally by the admin console but can also be called directly from your applications.
+
+## Overview
+
+The auth server exposes two main API groups:
+
+| API | Required Scope | Purpose |
+|-----|----------------|---------|
+| **Admin API**<br/>`/api/v1/admin` | `authserver:manage` (or granular scopes) | Administrative control |
+| **Account API**<br/>`/api/v1/account` | `authserver:manage-account` | Self-service account management |
+
+### Granular Admin API scopes
+
+Instead of granting full admin access with `authserver:manage`, you can use granular scopes to limit access to specific API domains:
+
+| Scope | Access Level | Endpoints |
+|-------|--------------|-----------|
+| <span style="white-space: nowrap;">`authserver:admin-read`</span> | Read-only | GET requests across all admin endpoints |
+| <span style="white-space: nowrap;">`authserver:manage-users`</span> | Full | Users, groups, permissions, sessions, consents |
+| <span style="white-space: nowrap;">`authserver:manage-clients`</span> | Full | OAuth2 clients and their configurations |
+| <span style="white-space: nowrap;">`authserver:manage-settings`</span> | Full | System settings, resources, and signing keys |
+| <span style="white-space: nowrap;">`authserver:manage`</span> | Full | All admin endpoints (backwards compatible) |
+
+<Aside type="tip">
+Use granular scopes to follow the principle of least privilege. For example, a user provisioning service only needs `authserver:manage-users`, not full admin access.
+</Aside>
+
+#### Scope hierarchy
+
+- **Read operations (GET)**: Allowed by `authserver:admin-read`, the domain-specific scope, or `authserver:manage`
+- **Write operations (POST, PUT, DELETE)**: Require the domain-specific scope or `authserver:manage`
+
+For example, to read user data you need any of:
+- `authserver:admin-read`
+- `authserver:manage-users`
+- `authserver:manage`
+
+But to create or update a user, you need:
+- `authserver:manage-users`
+- `authserver:manage`
+
+## Authentication
+
+All API endpoints require a valid JWT access token in the `Authorization` header:
+
+```
+Authorization: Bearer <access_token>
+```
+
+### Setting up API access
+
+Before you can call the REST APIs, you need to create a dedicated client and assign the appropriate permissions:
+
+#### Step 1: Create a new client
+
+1. Log into the admin console
+2. Navigate to **Clients** and click **Create new**
+3. Configure the client:
+   - **Client identifier**: Choose a meaningful name (e.g., `api-client`)
+   - **Description**: Describe the purpose (e.g., "Client for REST API access")
+   - **Enabled flow**: Enable only **Client credentials** (you don't need 'Authorization code flow with PKCE')   
+4. Save the client
+5. **Important**: Go to the **Authentication** tab and copy the **Client secret** - you'll need it for authentication
+
+#### Step 2: Assign permissions
+
+After creating the client, assign the required resource permissions:
+
+1. Go to the **Permissions** tab of your client
+2. For **Admin API** access:
+   - Select the `authserver` resource
+   - Assign the appropriate permission(s):
+     - `manage` - Full access to all Admin API endpoints
+     - `admin-read` - Read-only access to all Admin API endpoints
+     - `manage-users` - Full access to user, group, and permission endpoints
+     - `manage-clients` - Full access to client endpoints
+     - `manage-settings` - Full access to settings and key endpoints
+3. For **Account API** access (self-service endpoints):
+   - Select the `authserver` resource
+   - Assign the `manage-account` permission
+   - This allows users to manage their own accounts
+
+<Aside type="note">
+The **Admin API** scope (`authserver:manage`) provides full administrative control over your Goiabada instance. Only assign this to trusted applications. Consider using granular scopes like `authserver:manage-users` to limit access to specific domains. For user self-service operations, use the **Account API** scope (`authserver:manage-account`) instead.
+</Aside>
+
+### Obtaining an access token
+
+Once your client is configured with the required permissions, use the [client credentials flow](/integration/endpoints/#authtoken-post) to obtain an access token:
+
+```bash
+curl -X POST https://auth.example.com/auth/token \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "grant_type=client_credentials" \
+  -d "client_id=your-client-id" \
+  -d "client_secret=your-client-secret" \
+  -d "scope=authserver:manage"
+```
+
+For granular access, request only the scopes you need:
+
+```bash
+# Read-only access to all admin endpoints
+-d "scope=authserver:admin-read"
+
+# Full access to user management only
+-d "scope=authserver:manage-users"
+
+# Multiple scopes (space-separated)
+-d "scope=authserver:manage-users authserver:manage-clients"
+```
+
+**Response:**
+
+```json
+{
+  "access_token": "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9...",
+  "token_type": "Bearer",
+  "expires_in": 300
+}
+```
+
+Use the `access_token` in the `Authorization` header for subsequent API calls.
+
+## OpenAPI Specification
+
+Goiabada provides a complete OpenAPI 3.0 specification for the REST APIs, which you can use with tools like Swagger UI, Postman, or code generators.
+
+### Accessing the OpenAPI spec
+
+The OpenAPI specification is available at:
+
+```
+GET https://auth.example.com/openapi.yaml
+```
+
+This endpoint is publicly accessible (no authentication required) and returns the complete API specification in YAML format.
+
+### Using the OpenAPI spec
+
+You can use the specification with various tools:
+
+- **Swagger UI**: Import the URL to get an interactive API explorer
+- **Postman**: Import the OpenAPI spec to automatically generate a complete API collection
+- **Code generation**: Use tools like `openapi-generator` to generate client SDKs in your preferred language
+- **API testing**: Use the spec for automated API testing and validation
+
+<Aside type="tip">
+The OpenAPI spec includes all endpoint paths, request/response schemas, authentication requirements, and detailed parameter descriptions. It's kept in sync with the actual API implementation.
+</Aside>
+
+## Error responses
+
+All endpoints return errors in a consistent, flat format:
+
+```json
+{
+  "error_code": "VALIDATION_ERROR",
+  "error_args": { "max": 60 },
+  "error_description": "Human-readable error description"
+}
+```
+
+- `error_code` — a stable identifier for the failure. Either an `UPPER_SNAKE` category (see below) or, for localizable validation errors, a translation-catalog key (e.g. `validator.address.locality_too_long`).
+- `error_args` — optional parameters for that message, present only for parameterized errors.
+- `error_description` — human-readable text, localized to the request's language when applicable, English otherwise.
+
+Route on the **HTTP status code**, not the body.
+
+Common `error_code` categories:
+- `ACCESS_TOKEN_REQUIRED` - Missing or invalid bearer token
+- `INVALID_REQUEST_BODY` - Malformed JSON in request
+- `VALIDATION_ERROR` - Input validation failed
+- `NOT_FOUND` - Resource not found
+- `FORBIDDEN` - The token is valid but the resource belongs to another user
+- `TOO_MANY_REQUESTS` - Rate limit reached; the response carries a `Retry-After` header
+- `INTERNAL_SERVER_ERROR` - Server-side error
+
+<Aside type="caution">
+This flat shape replaced the older nested `{ "error": { "code", "message" } }` envelope. Protocol endpoints (`/auth/token`, `/auth/authorize`, `/connect/register`, `/userinfo`) keep their RFC-defined error format and are unaffected.
+</Aside>
+
+---
+
+## Admin API
+
+The Admin API provides administrative control over your Goiabada instance. Endpoints are organized by domain and support granular authorization:
+
+| Domain | Read Scope | Write Scope |
+|--------|------------|-------------|
+| Users, Groups, Permissions | `authserver:admin-read` or `authserver:manage-users` | `authserver:manage-users` |
+| Clients | `authserver:admin-read` or `authserver:manage-clients` | `authserver:manage-clients` |
+| Settings, Resources, Keys | `authserver:admin-read` or `authserver:manage-settings` | `authserver:manage-settings` |
+
+The `authserver:manage` scope grants full access to all domains (backwards compatible).
+
+### Users
+
+#### Search users
+
+```
+GET /api/v1/admin/users/search?query=john&page=1&size=10
+```
+
+**Query parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `query` | string | Search term (matches email, username, name) |
+| `page` | int | Page number (default: 1) |
+| `size` | int | Results per page (default: 10) |
+
+**Response:**
+
+```json
+{
+  "users": [
+    {
+      "id": 1,
+      "email": "john@example.com",
+      "emailVerified": true,
+      "username": "johndoe",
+      "givenName": "John",
+      "familyName": "Doe",
+      "enabled": true,
+      "subject": "550e8400-e29b-41d4-a716-446655440000"
+    }
+  ],
+  "total": 1,
+  "page": 1,
+  "size": 10
+}
+```
+
+#### Get user
+
+```
+GET /api/v1/admin/users/{id}
+```
+
+Returns the user's own fields: profile, email, phone, address and OTP state. Groups, permissions and attributes are not included; each is served by its own endpoint, documented below: `GET /api/v1/admin/users/{id}/groups`, `/permissions` and `/attributes`.
+
+#### Create user
+
+```
+POST /api/v1/admin/users/create
+```
+
+**Request body:**
+
+```json
+{
+  "email": "newuser@example.com",
+  "emailVerified": false,
+  "givenName": "New",
+  "familyName": "User",
+  "setPasswordType": "now",
+  "password": "SecurePassword123!"
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| <span style="white-space: nowrap;">`email`</span> | string | Yes | User's email address |
+| <span style="white-space: nowrap;">`emailVerified`</span> | bool | No | Whether email is pre-verified |
+| <span style="white-space: nowrap;">`givenName`</span> | string | No | First name |
+| <span style="white-space: nowrap;">`middleName`</span> | string | No | Middle name |
+| <span style="white-space: nowrap;">`familyName`</span> | string | No | Last name |
+| <span style="white-space: nowrap;">`setPasswordType`</span> | string | No | `"now"` to set password immediately, `"email"` to send setup email. Defaults to `"now"` when absent; any other value is rejected with 400 |
+| <span style="white-space: nowrap;">`password`</span> | string | Conditional | Required unless a setup email will be sent, so: required whenever `setPasswordType` is not `"email"`, and required whatever it says on a deployment with no SMTP configured |
+
+Answers `409` with error code `EMAIL_ALREADY_EXISTS` when the address is already registered. Retrying the same address will not succeed.
+
+#### Update user profile
+
+```
+PUT /api/v1/admin/users/{id}/profile
+```
+
+**Request body:**
+
+```json
+{
+  "username": "johndoe",
+  "givenName": "John",
+  "middleName": "",
+  "familyName": "Doe",
+  "nickname": "Johnny",
+  "website": "https://johndoe.com",
+  "gender": "male",
+  "dateOfBirth": "1990-01-15",
+  "zoneInfoCountryName": "United States",
+  "zoneInfo": "America/New_York",
+  "locale": "en-US"
+}
+```
+
+#### Update user email
+
+```
+PUT /api/v1/admin/users/{id}/email
+```
+
+```json
+{
+  "email": "newemail@example.com",
+  "emailVerified": true
+}
+```
+
+#### Generate email verification code
+
+```
+POST /api/v1/admin/users/{id}/email/verification-code
+```
+
+No request body required. Returns:
+
+```json
+{
+  "verificationCode": "ABCD1234",
+  "verificationCodeExpiresAt": "2026-01-23T21:19:43Z",
+  "userId": 123,
+  "email": "newemail@example.com"
+}
+```
+
+<Aside type="note">
+This call always generates a new code, and it sets <code>emailVerified</code> to <code>false</code>.
+</Aside>
+
+The verification code is 8 characters (4 letters + 4 numbers) and expires after 5 minutes.
+
+#### Update user phone
+
+```
+PUT /api/v1/admin/users/{id}/phone
+```
+
+```json
+{
+  "phoneCountryUniqueId": "US",
+  "phoneNumber": "5551234567",
+  "phoneNumberVerified": false
+}
+```
+
+#### Update user address
+
+```
+PUT /api/v1/admin/users/{id}/address
+```
+
+```json
+{
+  "addressLine1": "123 Main St",
+  "addressLine2": "Apt 4B",
+  "addressLocality": "New York",
+  "addressRegion": "NY",
+  "addressPostalCode": "10001",
+  "addressCountry": "US"
+}
+```
+
+#### Update user password
+
+```
+PUT /api/v1/admin/users/{id}/password
+```
+
+```json
+{
+  "newPassword": "NewSecurePassword123!"
+}
+```
+
+#### Enable/disable user
+
+```
+PUT /api/v1/admin/users/{id}/enabled
+```
+
+```json
+{
+  "enabled": false
+}
+```
+
+#### Disable user OTP
+
+```
+PUT /api/v1/admin/users/{id}/otp
+```
+
+```json
+{
+  "enabled": false
+}
+```
+
+<Aside type="note">
+OTP can only be disabled through the Admin API, not enabled. Users must enroll in OTP themselves through the Account API or web interface.
+</Aside>
+
+#### Delete user
+
+```
+DELETE /api/v1/admin/users/{id}
+```
+
+#### Get user profile picture status
+
+```
+GET /api/v1/admin/users/{id}/profile-picture
+```
+
+Returns whether the user has a profile picture and the URL to retrieve it.
+
+**Response:**
+
+```json
+{
+  "hasPicture": true,
+  "pictureUrl": "https://auth.example.com/userinfo/picture/550e8400-e29b-41d4-a716-446655440000"
+}
+```
+
+#### Upload user profile picture
+
+```
+POST /api/v1/admin/users/{id}/profile-picture
+```
+
+Upload a profile picture for a user. Send as `multipart/form-data` with field name `picture`.
+
+**Image requirements:**
+
+| Constraint | Value |
+|------------|-------|
+| Formats | JPEG, PNG, GIF, WebP |
+| Dimensions | 10x10 to 512x512 pixels |
+| Max size | 3MB |
+
+**Response:**
+
+```json
+{
+  "pictureUrl": "https://auth.example.com/userinfo/picture/550e8400-e29b-41d4-a716-446655440000"
+}
+```
+
+#### Delete user profile picture
+
+```
+DELETE /api/v1/admin/users/{id}/profile-picture
+```
+
+Removes a user's profile picture.
+
+---
+
+### User attributes
+
+Custom key-value attributes that can be included in tokens.
+
+#### List user attributes
+
+```
+GET /api/v1/admin/users/{id}/attributes
+```
+
+#### Get attribute
+
+```
+GET /api/v1/admin/user-attributes/{id}
+```
+
+Returns a single user attribute by ID.
+
+#### Create attribute
+
+```
+POST /api/v1/admin/user-attributes
+```
+
+```json
+{
+  "userId": 1,
+  "key": "department",
+  "value": "Engineering",
+  "includeInIdToken": true,
+  "includeInAccessToken": false
+}
+```
+
+#### Update attribute
+
+```
+PUT /api/v1/admin/user-attributes/{id}
+```
+
+#### Delete attribute
+
+```
+DELETE /api/v1/admin/user-attributes/{id}
+```
+
+---
+
+### User sessions
+
+#### List user sessions
+
+```
+GET /api/v1/admin/users/{id}/sessions
+```
+
+Returns the user's active sessions with their device, IP address and the identifiers of the clients they authorized, so an expired session is not in the list.
+
+#### Get session
+
+```
+GET /api/v1/admin/user-sessions/{sessionIdentifier}
+```
+
+Returns details for a specific session by its session identifier.
+
+#### Delete session
+
+```
+DELETE /api/v1/admin/user-sessions/{id}
+```
+
+Terminates a user session by ID. This also revokes the refresh tokens and authorization codes that session authorized, including offline refresh tokens. See [ending a session](/concepts/user-sessions/#ending-a-session).
+
+---
+
+### User consents
+
+#### List user consents
+
+```
+GET /api/v1/admin/users/{id}/consents
+```
+
+#### Revoke consent
+
+```
+DELETE /api/v1/admin/user-consents/{id}
+```
+
+---
+
+### Groups
+
+#### List groups
+
+```
+GET /api/v1/admin/groups
+```
+
+Returns all groups in the system.
+
+**Response:**
+
+```json
+{
+  "groups": [
+    {
+      "id": 1,
+      "groupIdentifier": "developers",
+      "description": "Development team",
+      "includeInIdToken": true,
+      "includeInAccessToken": true,
+      "memberCount": 5
+    }
+  ]
+}
+```
+
+#### Search groups
+
+```
+GET /api/v1/admin/groups/search?query=dev
+```
+
+Search for groups by name or description.
+
+**Query parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `query` | string | Search term (matches group identifier and description) |
+
+#### Create group
+
+```
+POST /api/v1/admin/groups
+```
+
+```json
+{
+  "groupIdentifier": "developers",
+  "description": "Development team",
+  "includeInIdToken": true,
+  "includeInAccessToken": true
+}
+```
+
+#### Get group
+
+```
+GET /api/v1/admin/groups/{id}
+```
+
+#### Update group
+
+```
+PUT /api/v1/admin/groups/{id}
+```
+
+#### Delete group
+
+```
+DELETE /api/v1/admin/groups/{id}
+```
+
+---
+
+### Group members
+
+#### List members
+
+```
+GET /api/v1/admin/groups/{id}/members?page=1&size=10
+```
+
+#### Add member
+
+```
+POST /api/v1/admin/groups/{id}/members
+```
+
+```json
+{
+  "userId": 1
+}
+```
+
+#### Remove member
+
+```
+DELETE /api/v1/admin/groups/{id}/members/{userId}
+```
+
+---
+
+### User groups
+
+#### Get user's groups
+
+```
+GET /api/v1/admin/users/{id}/groups
+```
+
+#### Set user's groups
+
+```
+PUT /api/v1/admin/users/{id}/groups
+```
+
+```json
+{
+  "groupIds": [1, 2, 3]
+}
+```
+
+---
+
+### Group attributes
+
+Custom key-value attributes for groups that can be included in tokens.
+
+#### List group attributes
+
+```
+GET /api/v1/admin/groups/{id}/attributes
+```
+
+#### Get group attribute
+
+```
+GET /api/v1/admin/group-attributes/{id}
+```
+
+Returns a single group attribute by ID.
+
+#### Create group attribute
+
+```
+POST /api/v1/admin/group-attributes
+```
+
+```json
+{
+  "groupId": 1,
+  "key": "costCenter",
+  "value": "CC-1234",
+  "includeInIdToken": true,
+  "includeInAccessToken": false
+}
+```
+
+#### Update group attribute
+
+```
+PUT /api/v1/admin/group-attributes/{id}
+```
+
+#### Delete group attribute
+
+```
+DELETE /api/v1/admin/group-attributes/{id}
+```
+
+---
+
+### Resources
+
+Resources represent APIs or services that can be protected with permissions.
+
+#### List resources
+
+```
+GET /api/v1/admin/resources
+```
+
+#### Create resource
+
+```
+POST /api/v1/admin/resources
+```
+
+```json
+{
+  "resourceIdentifier": "product-api",
+  "description": "Product catalog API"
+}
+```
+
+#### Get resource
+
+```
+GET /api/v1/admin/resources/{id}
+```
+
+#### Update resource
+
+```
+PUT /api/v1/admin/resources/{id}
+```
+
+#### Delete resource
+
+```
+DELETE /api/v1/admin/resources/{id}
+```
+
+#### Get resource permissions
+
+```
+GET /api/v1/admin/resources/{id}/permissions
+```
+
+#### Update resource permissions
+
+```
+PUT /api/v1/admin/resources/{id}/permissions
+```
+
+```json
+{
+  "permissions": [
+    {
+      "permissionIdentifier": "read",
+      "description": "Read access"
+    },
+    {
+      "id": 5,
+      "permissionIdentifier": "write",
+      "description": "Write access (updated)"
+    }
+  ]
+}
+```
+
+<Aside type="note">
+Include `id` to update existing permissions, omit it to create new ones.
+</Aside>
+
+---
+
+### Permissions
+
+#### Get user permissions
+
+```
+GET /api/v1/admin/users/{id}/permissions
+```
+
+#### Set user permissions
+
+```
+PUT /api/v1/admin/users/{id}/permissions
+```
+
+```json
+{
+  "permissionIds": [1, 2, 3]
+}
+```
+
+#### Get group permissions
+
+```
+GET /api/v1/admin/groups/{id}/permissions
+```
+
+#### Set group permissions
+
+```
+PUT /api/v1/admin/groups/{id}/permissions
+```
+
+```json
+{
+  "permissionIds": [1, 2, 3]
+}
+```
+
+#### Get users with permission
+
+```
+GET /api/v1/admin/permissions/{id}/users?page=1&size=10
+```
+
+---
+
+### Clients
+
+OAuth2/OIDC client applications.
+
+#### List clients
+
+```
+GET /api/v1/admin/clients
+```
+
+#### Create client
+
+```
+POST /api/v1/admin/clients
+```
+
+```json
+{
+  "clientIdentifier": "my-web-app",
+  "description": "My web application",
+  "displayName": "My Web App",
+  "authorizationCodeEnabled": true,
+  "clientCredentialsEnabled": false
+}
+```
+
+#### Get client
+
+```
+GET /api/v1/admin/clients/{id}
+```
+
+#### Update client settings
+
+```
+PUT /api/v1/admin/clients/{id}
+```
+
+```json
+{
+  "clientIdentifier": "my-web-app",
+  "description": "Updated description",
+  "displayName": "My Web App",
+  "websiteUrl": "https://mywebapp.com",
+  "enabled": true,
+  "consentRequired": true,
+  "showLogo": true,
+  "showDisplayName": true,
+  "showDescription": false,
+  "showWebsiteUrl": true,
+  "defaultAcrLevel": "urn:goiabada:level1"
+}
+```
+
+#### Update client authentication
+
+```
+PUT /api/v1/admin/clients/{id}/authentication
+```
+
+```json
+{
+  "isPublic": false,
+  "clientSecret": "new-secret-value"
+}
+```
+
+#### Update OAuth2 flows
+
+```
+PUT /api/v1/admin/clients/{id}/oauth2-flows
+```
+
+```json
+{
+  "authorizationCodeEnabled": true,
+  "clientCredentialsEnabled": true
+}
+```
+
+#### Update redirect URIs
+
+```
+PUT /api/v1/admin/clients/{id}/redirect-uris
+```
+
+```json
+{
+  "redirectURIs": [
+    "https://myapp.com/callback",
+    "https://myapp.com/silent-refresh"
+  ]
+}
+```
+
+#### Update web origins
+
+```
+PUT /api/v1/admin/clients/{id}/web-origins
+```
+
+```json
+{
+  "webOrigins": [
+    "https://myapp.com"
+  ]
+}
+```
+
+#### Update token settings
+
+```
+PUT /api/v1/admin/clients/{id}/tokens
+```
+
+```json
+{
+  "tokenExpirationInSeconds": 3600,
+  "refreshTokenOfflineIdleTimeoutInSeconds": 2592000,
+  "refreshTokenOfflineMaxLifetimeInSeconds": 31536000,
+  "includeOpenIDConnectClaimsInAccessToken": "default",
+  "includeOpenIDConnectClaimsInIdToken": "default"
+}
+```
+
+**Field notes:**
+- `includeOpenIDConnectClaimsInAccessToken`: Three-state setting (`"default"`, `"on"`, `"off"`) - Controls OIDC scope claims in access tokens
+- `includeOpenIDConnectClaimsInIdToken`: Three-state setting (`"default"`, `"on"`, `"off"`) - Controls OIDC scope claims in ID tokens (see [OIDC claims configuration](/concepts/openid-connect/#oidc-claims-in-tokens))
+
+#### Get client permissions
+
+```
+GET /api/v1/admin/clients/{id}/permissions
+```
+
+#### Set client permissions
+
+```
+PUT /api/v1/admin/clients/{id}/permissions
+```
+
+```json
+{
+  "permissionIds": [1, 2, 3]
+}
+```
+
+#### Get client sessions
+
+```
+GET /api/v1/admin/clients/{id}/sessions?page=1&size=10
+```
+
+Returns the client's active sessions alongside a normalized `users` array holding the name and email of each owner, so a session's `userId` is resolved from the same response rather than read back one user at a time.
+
+#### Client logo
+
+##### Get client logo status
+
+```
+GET /api/v1/admin/clients/{id}/logo
+```
+
+Returns whether the client has a logo and the URL to retrieve it.
+
+**Response:**
+
+```json
+{
+  "hasLogo": true,
+  "logoUrl": "https://auth.example.com/client/logo/my-web-app"
+}
+```
+
+##### Upload client logo
+
+```
+POST /api/v1/admin/clients/{id}/logo
+```
+
+Upload a logo for a client. Send as `multipart/form-data` with field name `picture`.
+
+**Image requirements:**
+
+| Constraint | Value |
+|------------|-------|
+| Formats | JPEG, PNG, GIF, WebP |
+| Dimensions | 10x10 to 512x512 pixels |
+| Max size | 3MB |
+
+**Response:**
+
+```json
+{
+  "success": true,
+  "pictureUrl": "https://auth.example.com/client/logo/my-web-app"
+}
+```
+
+##### Delete client logo
+
+```
+DELETE /api/v1/admin/clients/{id}/logo
+```
+
+Removes the client's logo.
+
+---
+
+#### Delete client
+
+```
+DELETE /api/v1/admin/clients/{id}
+```
+
+<Aside type="note">
+System-level clients (such as `admin-console-client`) cannot be deleted. Attempting to do so will return a validation error.
+</Aside>
+
+---
+
+### Settings
+
+#### General settings
+
+```
+GET /api/v1/admin/settings/general
+PUT /api/v1/admin/settings/general
+```
+
+```json
+{
+  "appName": "My Auth Server",
+  "issuer": "https://auth.example.com",
+  "selfRegistrationEnabled": true,
+  "selfRegistrationRequiresEmailVerification": true,
+  "dynamicClientRegistrationEnabled": false,
+  "passwordPolicy": "at_least_8_chars_one_number_one_uppercase_one_lowercase"
+}
+```
+
+#### Email settings
+
+```
+GET /api/v1/admin/settings/email
+PUT /api/v1/admin/settings/email
+```
+
+```json
+{
+  "smtpEnabled": true,
+  "smtpHost": "smtp.example.com",
+  "smtpPort": 587,
+  "smtpUsername": "noreply@example.com",
+  "smtpPassword": "password",
+  "smtpEncryption": "starttls",
+  "smtpFromName": "My App",
+  "smtpFromEmail": "noreply@example.com"
+}
+```
+
+#### Send test email
+
+```
+POST /api/v1/admin/settings/email/send-test
+```
+
+```json
+{
+  "to": "test@example.com"
+}
+```
+
+#### Session settings
+
+```
+GET /api/v1/admin/settings/sessions
+PUT /api/v1/admin/settings/sessions
+```
+
+```json
+{
+  "userSessionIdleTimeoutInSeconds": 7200,
+  "userSessionMaxLifetimeInSeconds": 86400
+}
+```
+
+#### UI theme
+
+```
+GET /api/v1/admin/settings/ui-theme
+PUT /api/v1/admin/settings/ui-theme
+```
+
+```json
+{
+  "uiTheme": "dark"
+}
+```
+
+#### Token settings
+
+```
+GET /api/v1/admin/settings/tokens
+PUT /api/v1/admin/settings/tokens
+```
+
+```json
+{
+  "tokenExpirationInSeconds": 300,
+  "refreshTokenOfflineIdleTimeoutInSeconds": 2592000,
+  "refreshTokenOfflineMaxLifetimeInSeconds": 31536000,
+  "includeOpenIDConnectClaimsInAccessToken": false,
+  "includeOpenIDConnectClaimsInIdToken": true
+}
+```
+
+**Field notes:**
+- `includeOpenIDConnectClaimsInAccessToken`: Boolean - Global default for including OIDC scope claims in access tokens
+- `includeOpenIDConnectClaimsInIdToken`: Boolean - Global default for including OIDC scope claims in ID tokens (default: `true`). See [OIDC claims configuration](/concepts/openid-connect/#oidc-claims-in-tokens) for details.
+
+#### Audit log settings
+
+```
+GET /api/v1/admin/settings/audit-logs
+PUT /api/v1/admin/settings/audit-logs
+```
+
+```json
+{
+  "auditLogsInConsoleEnabled": true,
+  "auditLogsInDatabaseEnabled": true,
+  "auditLogRetentionDays": 90
+}
+```
+
+**Field notes:**
+- `auditLogsInConsoleEnabled`: Write each audit event to the application log as one record, with the event name and its details as fields
+- `auditLogsInDatabaseEnabled`: Persist audit events to the `audit_logs` database table
+- `auditLogRetentionDays`: Number of days to retain audit logs in the database. Use `0` for infinite retention. Maximum `3650` (10 years). A background worker periodically deletes logs older than this value.
+
+#### Audit logs (viewer)
+
+```
+GET /api/v1/admin/audit-logs?page=1&size=20&auditEvent=auth_success_pwd&requestId=host/Ppg6bHPK5f-000012
+```
+
+Returns paginated audit log entries from the database. All query parameters are optional.
+
+**Field notes:**
+- `auditEvent`: Return only entries carrying this event identifier, matched exactly. The accepted values are the catalog below, and a value outside it returns an empty page rather than an error
+- `requestId`: Return only entries carrying this request id, matched exactly
+
+```json
+{
+  "auditLogs": [
+    {
+      "id": 1,
+      "createdAt": "2025-01-15T10:30:00Z",
+      "auditEvent": "auth_success_pwd",
+      "details": "{\"userId\":\"123\",\"ip\":\"192.168.1.1\"}",
+      "requestId": "host/Ppg6bHPK5f-000012"
+    }
+  ],
+  "total": 150,
+  "page": 1,
+  "size": 20
+}
+```
+
+#### Audit event types
+
+```
+GET /api/v1/admin/audit-logs/event-types
+```
+
+Returns the catalog of audit event identifiers this server can write, which is the set the `auditEvent` filter accepts. The list is fixed at build time rather than derived from the rows present, so it carries events that have not occurred on this deployment yet. The admin console's audit log viewer fills its filter dropdown from this endpoint.
+
+```json
+{
+  "auditEventTypes": [
+    "activated_account",
+    "added_group_attribute",
+    "added_group_permission",
+    "added_user_attribute"
+  ]
+}
+```
+
+The response carries the whole catalog, sorted by identifier; the sample above is its first four entries.
+
+#### Signing keys
+
+```
+GET /api/v1/admin/settings/keys
+```
+
+Returns all signing keys with their public key material in PEM and JWK formats.
+
+```
+POST /api/v1/admin/settings/keys/rotate
+```
+
+Rotates to a new signing key. The old key remains available for validation.
+
+Answers `409` with error code `ROTATION_IN_PROGRESS` when another rotation won the race. Do not retry: that rotation already happened, and a retry rotates a second time.
+
+```
+DELETE /api/v1/admin/settings/keys/{id}
+```
+
+---
+
+### Reference data
+
+#### Phone countries
+
+```
+GET /api/v1/admin/phone-countries
+```
+
+Returns list of countries with calling codes for phone number validation.
+
+---
+
+## Account API
+
+The Account API provides self-service endpoints for authenticated users to manage their own account. All endpoints require the `authserver:manage-account` scope.
+
+### Profile
+
+#### Get profile
+
+```
+GET /api/v1/account/profile
+```
+
+Returns the authenticated user's complete profile.
+
+#### Update profile
+
+```
+PUT /api/v1/account/profile
+```
+
+```json
+{
+  "username": "johndoe",
+  "givenName": "John",
+  "middleName": "",
+  "familyName": "Doe",
+  "nickname": "Johnny",
+  "website": "https://johndoe.com",
+  "gender": "male",
+  "dateOfBirth": "1990-01-15",
+  "zoneInfoCountryName": "United States",
+  "zoneInfo": "America/New_York",
+  "locale": "en-US"
+}
+```
+
+---
+
+### Email
+
+#### Update email
+
+```
+PUT /api/v1/account/email
+```
+
+```json
+{
+  "email": "newemail@example.com"
+}
+```
+
+<Aside type="note">
+Changing email marks it as unverified. Use the verification endpoints to verify the new email.
+</Aside>
+
+#### Send verification email
+
+```
+POST /api/v1/account/email/verification/send
+```
+
+No request body required. Returns:
+
+```json
+{
+  "emailVerificationSent": true,
+  "emailDestination": "j***@example.com",
+  "tooManyRequests": false,
+  "waitInSeconds": 0,
+  "emailVerified": false
+}
+```
+
+<Aside type="caution">
+Rate limited to one request per 60 seconds. If rate limited, `tooManyRequests` will be `true` and `waitInSeconds` indicates the remaining cooldown.
+</Aside>
+
+#### Verify email
+
+```
+POST /api/v1/account/email/verification
+```
+
+```json
+{
+  "verificationCode": "ABCD1234"
+}
+```
+
+The verification code is 8 characters (4 letters + 4 numbers) and expires after 5 minutes.
+
+---
+
+### Phone
+
+#### Update phone
+
+```
+PUT /api/v1/account/phone
+```
+
+```json
+{
+  "phoneCountryUniqueId": "US",
+  "phoneNumber": "5551234567"
+}
+```
+
+Send an empty `phoneNumber` to clear the phone number.
+
+---
+
+### Address
+
+#### Update address
+
+```
+PUT /api/v1/account/address
+```
+
+```json
+{
+  "addressLine1": "123 Main St",
+  "addressLine2": "Apt 4B",
+  "addressLocality": "New York",
+  "addressRegion": "NY",
+  "addressPostalCode": "10001",
+  "addressCountry": "US"
+}
+```
+
+---
+
+### Password
+
+#### Change password
+
+```
+PUT /api/v1/account/password
+```
+
+```json
+{
+  "currentPassword": "OldPassword123!",
+  "newPassword": "NewPassword456!"
+}
+```
+
+<Aside type="note">
+Requires the current password for verification. The new password must meet the configured password policy.
+</Aside>
+
+---
+
+### Profile picture
+
+#### Get profile picture status
+
+```
+GET /api/v1/account/profile-picture
+```
+
+Returns whether the authenticated user has a profile picture and the URL to retrieve it.
+
+**Response:**
+
+```json
+{
+  "hasPicture": true,
+  "pictureUrl": "https://auth.example.com/userinfo/picture/550e8400-e29b-41d4-a716-446655440000"
+}
+```
+
+#### Upload profile picture
+
+```
+POST /api/v1/account/profile-picture
+```
+
+Upload a new profile picture. Send as `multipart/form-data` with field name `picture`.
+
+**Image requirements:**
+
+| Constraint | Value |
+|------------|-------|
+| Formats | JPEG, PNG, GIF, WebP |
+| Dimensions | 10x10 to 512x512 pixels |
+| Max size | 3MB |
+
+**Response:**
+
+```json
+{
+  "pictureUrl": "https://auth.example.com/userinfo/picture/550e8400-e29b-41d4-a716-446655440000"
+}
+```
+
+#### Delete profile picture
+
+```
+DELETE /api/v1/account/profile-picture
+```
+
+Removes the authenticated user's profile picture.
+
+---
+
+### Two-factor authentication (OTP)
+
+#### Start OTP enrollment
+
+```
+GET /api/v1/account/otp/enrollment
+```
+
+Returns a QR code and secret key for TOTP setup:
+
+```json
+{
+  "base64Image": "data:image/png;base64,...",
+  "secretKey": "JBSWY3DPEHPK3PXP"
+}
+```
+
+Repeat calls return the same secret and QR code while the enrollment is pending (15 minutes).
+
+<Aside type="caution">
+This endpoint fails if OTP is already enabled for the user.
+</Aside>
+
+#### Enable or disable OTP
+
+```
+PUT /api/v1/account/otp
+```
+
+**Enable OTP:**
+
+```json
+{
+  "enabled": true,
+  "password": "CurrentPassword123!",
+  "otpCode": "123456"
+}
+```
+
+Call the enrollment endpoint first: the code is verified against the secret it issued, and that secret is the one enrolled. Sending a `secretKey` is refused with `400 SECRET_KEY_NOT_ACCEPTED`; no pending enrollment gives `400 OTP_ENROLLMENT_NOT_PENDING`.
+
+**Disable OTP:**
+
+```json
+{
+  "enabled": false,
+  "password": "CurrentPassword123!"
+}
+```
+
+---
+
+### Consents
+
+#### List consents
+
+```
+GET /api/v1/account/consents
+```
+
+Returns all OAuth2 client consents granted by the user.
+
+#### Revoke consent
+
+```
+DELETE /api/v1/account/consents/{id}
+```
+
+---
+
+### Sessions
+
+#### List sessions
+
+```
+GET /api/v1/account/sessions
+```
+
+Returns the caller's active sessions with their device, IP address and the identifiers of the clients they authorized, so an expired session is not in the list. The account, user and client session list endpoints mark the session the calling token was issued through with `isCurrent`, which is `false` throughout for a token carrying no `sid` claim, such as one obtained through the client credentials grant.
+
+#### Terminate session
+
+```
+DELETE /api/v1/account/sessions/{id}
+```
+
+Terminates one of the caller's own sessions, including the current one. This also revokes the refresh tokens and authorization codes that session authorized, including offline refresh tokens. See [ending a session](/concepts/user-sessions/#ending-a-session).
+
+---
+
+### Logout
+
+#### Request logout URL
+
+```
+POST /api/v1/account/logout-request
+```
+
+```json
+{
+  "postLogoutRedirectUri": "https://myapp.com/logged-out",
+  "state": "xyz123",
+  "clientIdentifier": "my-app",
+  "responseMode": "redirect"
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `postLogoutRedirectUri` | string | Yes | URI to redirect after logout |
+| `state` | string | No | State parameter (echoed back) |
+| `clientIdentifier` | string | No | Client ID (auto-resolved if omitted) |
+| `responseMode` | string | No | `"form_post"` or `"redirect"` (the default) |
+
+**Response, with `responseMode` set to `"redirect"` or omitted:**
+
+```json
+{
+  "logoutUrl": "https://auth.example.com/auth/logout?id_token_hint=..."
+}
+```
+
+Follow the `logoutUrl` to complete the logout process.
+
+**Response, with `responseMode` set to `"form_post"`:**
+
+```json
+{
+  "method": "POST",
+  "endpoint": "https://auth.example.com/auth/logout",
+  "params": {
+    "id_token_hint": "eyJhbGciOi...",
+    "post_logout_redirect_uri": "https://myapp.com/logged-out",
+    "state": "xyz123"
+  }
+}
+```
+
+`method` is always `"POST"` and `endpoint` carries no query string of its own. Render `params` as the
+hidden inputs of a form your page submits itself to `endpoint`, rather than as a query string:
+keeping the `id_token_hint` out of a URL is the point of this mode, since a URL reaches the address
+bar, the browser history and the access log of every proxy on the way.

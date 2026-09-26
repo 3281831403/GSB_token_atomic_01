@@ -1,0 +1,36 @@
+{{define "title"}}{{ .appName }} - {{ T $.ctx "auth.otp.page_title" }}{{end}}
+{{define "head"}}
+
+
+{{end}}
+
+{{define "body"}}
+
+    <h2 class='mb-2 text-xl font-semibold text-center'>{{ T $.ctx "auth.otp.title" }}</h2>
+    <form action="" method="post">
+
+        <input type="hidden" name="ceremonyId" value="{{.ceremonyId}}" />
+
+        <div class="mb-3">
+
+            <p class="mt-5">{{ T $.ctx "auth.otp.instructions" }}</p>
+
+            <div class="w-full mt-6 form-control">
+                <label class="label">
+                    <span class="label-text text-base-content">{{ T $.ctx "auth.otp.code_label" }}</span>
+                </label>
+                <input type="text" name="otp" value="" placeholder="123456"
+                    class="w-full input input-bordered" autocomplete="off" autofocus />
+            </div>
+
+        </div>
+
+        {{if .error}}
+            <p class="mt-8 text-center text-error">{{.error}}</p>
+        {{end}}
+
+        <button class="w-full mt-2 btn btn-primary">{{ T $.ctx "auth.otp.button" }}</button>
+
+    </form>
+
+{{end}}

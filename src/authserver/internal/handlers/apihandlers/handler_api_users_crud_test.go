@@ -1,0 +1,681 @@
+package apihandlers
+
+import (
+	"bytes"
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/leodip/goiabada/authserver/internal/accountvalidation"
+	"github.com/leodip/goiabada/authserver/internal/audit"
+	mocks_audit "github.com/leodip/goiabada/authserver/internal/audit/mocks"
+	"github.com/leodip/goiabada/authserver/internal/constants"
+	"github.com/leodip/goiabada/authserver/internal/data"
+	mocks_data "github.com/leodip/goiabada/authserver/internal/data/mocks"
+	"github.com/leodip/goiabada/authserver/internal/emaillinks"
+	"github.com/leodip/goiabada/authserver/internal/encryption"
+	mocks_handlerhelpers "github.com/leodip/goiabada/authserver/internal/handlerhelpers/mocks"
+	mocks_handlers "github.com/leodip/goiabada/authserver/internal/handlers/mocks"
+	"github.com/leodip/goiabada/authserver/internal/models"
+	"github.com/leodip/goiabada/authserver/internal/passwordhash"
+	"github.com/leodip/goiabada/authserver/internal/usercreation"
+	"github.com/leodip/goiabada/core/errs"
+	"github.com/leodip/goiabada/core/hashutil"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
+)
+
+// This file did not exist before #106 stage 5, which the test-landscape sweep recorded as a
+// finding: the admin user CRUD endpoints had no unit coverage.
+
+const adminSubject = "the-admin"
+
+func enabledRequest(t *testing.T, userId string, enabled bool) *http.Request {
+	t.Helper()
+	body, err := json.Marshal(map[string]bool{"enabled": enabled})
+	require.NoError(t, err)
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/admin/users/"+userId+"/enabled",
+		bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req = setChiURLParam(req, "id", userId)
+	return setTokenContextWithClaims(req, map[string]interface{}{
+		"sub": adminSubject, "auth_time": float64(1),
+	})
+}
+
+// TestHandleAPIUserEnabledPut_RevocationConditionality is the four-row matrix from #106 findings 4
+// and 21. The endpoint serves BOTH directions through one handler, so which requests revoke is a
+// real branch rather than a formality.
+//
+// The rule under test: only a genuine enabled-to-disabled transition sweeps. Enabling never does,
+// because no credential changed, and re-disabling an already-disabled account never does either,
+// because it would advance the generation and evict sessions a previous disable already handled,
+// making a repeated request non-idempotent.
+//
+// Every row asserts AuditUpdatedUserDetails still fires. That event is pre-existing and decision 7
+// requires it to be untouched, so a row where it stopped firing would be a regression this change
+// caused rather than a behaviour it intended.
+func TestHandleAPIUserEnabledPut_RevocationConditionality(t *testing.T) {
+	const userId = int64(42)
+
+	for _, tc := range []struct {
+		label string
+		// requestedEnabled is the body's enabled field.
+		requestedEnabled bool
+		// transitioned is what TrySetUserEnabled reports, standing in for the row's starting
+		// state: false means the row was already in the requested state.
+		transitioned bool
+		wantSweep    bool
+	}{
+		{
+			label:            "disabling a live account sweeps and audits",
+			requestedEnabled: false, transitioned: true, wantSweep: true,
+		},
+		{
+			// The idempotence row. A second disable must be a no-op beyond the generic event.
+			label:            "disabling an already-disabled account does neither",
+			requestedEnabled: false, transitioned: false, wantSweep: false,
+		},
+		{
+			label:            "enabling a disabled account does neither",
+			requestedEnabled: true, transitioned: true, wantSweep: false,
+		},
+		{
+			label:            "enabling an already-enabled account does neither",
+			requestedEnabled: true, transitioned: false, wantSweep: false,
+		},
+	} {
+		t.Run(tc.label, func(t *testing.T) {
+			database := mocks_data.NewDatabase(t)
+			auditLogger := mocks_audit.NewAuditLogger(t)
+
+			database.On("GetUserById", mock.Anything, (*sql.Tx)(nil), userId).
+				Return(&models.User{Id: userId}, nil).Once()
+
+			// Set on the disabling rows, which are the ones that open a transaction.
+			var stub *mocks_data.RunInTransactionStub
+			if tc.requestedEnabled {
+				// Enabling: the compare-and-set runs outside a transaction, since there is no
+				// sweep to be atomic with. Both directions go through it, so neither stays on
+				// the full-row UpdateUser that decision 14 rules out.
+				database.On("TrySetUserEnabled", mock.Anything, (*sql.Tx)(nil), userId, false, true).
+					Return(tc.transitioned, nil).Once()
+			} else {
+				stub = mocks_data.ExpectRunInTransaction(database, apiRevokeTx)
+				database.On("TrySetUserEnabled", mock.Anything, apiRevokeTx, userId, true, false).
+					Return(tc.transitioned, nil).Once()
+				if tc.transitioned {
+					database.On("IncrementUserAuthStateGeneration", mock.Anything, apiRevokeTx, userId).
+						Return(int64(4), nil).Once()
+					database.On("GetRefreshTokensByUserId", mock.Anything, apiRevokeTx, userId).
+						Return([]*models.RefreshToken{}, nil).Once()
+					database.On("PromoteRefreshTokenGenerations", mock.Anything, apiRevokeTx, []int64{}, int64(4)).
+						Return(nil).Once()
+					database.On("GetUserSessionsByUserId", mock.Anything, apiRevokeTx, userId).
+						Return([]models.UserSession{}, nil).Once()
+				}
+			}
+
+			// The pre-existing event, on every row.
+			auditLogger.On("Log", mock.Anything, audit.AuditUpdatedUserDetails, mock.Anything).Return().Once()
+			var revocationPayload map[string]interface{}
+			if tc.wantSweep {
+				auditLogger.On("Log", mock.Anything, audit.AuditRevokedUserAuthState, mock.Anything).
+					Run(func(args mock.Arguments) {
+						revocationPayload = args.Get(2).(map[string]interface{})
+					}).Return().Once()
+			}
+
+			// The response re-reads the user.
+			database.On("GetUserById", mock.Anything, (*sql.Tx)(nil), userId).
+				Return(&models.User{Id: userId, Enabled: tc.requestedEnabled}, nil).Once()
+
+			rr := httptest.NewRecorder()
+			handler := HandleAPIUserEnabledPut(database, auditLogger)
+			handler.ServeHTTP(rr, enabledRequest(t, "42", tc.requestedEnabled))
+
+			assert.Equal(t, http.StatusOK, rr.Code)
+			if stub != nil && !tc.transitioned {
+				// Already disabled: the body leaves the helper on the sentinel, so the empty
+				// transaction rolls back rather than commits, and the caller still answers 200.
+				assert.ErrorIs(t, stub.BodyErr, errUserAlreadyDisabled)
+			}
+			if stub != nil && tc.transitioned {
+				assert.NoError(t, stub.BodyErr)
+			}
+			database.AssertExpectations(t)
+			auditLogger.AssertExpectations(t)
+
+			if tc.wantSweep {
+				require.NotNil(t, revocationPayload)
+				assert.Equal(t, "account_disabled", revocationPayload["reason"])
+				assert.Equal(t, adminSubject, revocationPayload["loggedInUser"])
+				// Nothing preserved on this site, reported as "" rather than omitted.
+				value, present := revocationPayload["preservedSessionIdentifier"]
+				assert.True(t, present)
+				assert.Equal(t, "", value)
+			} else {
+				// No generation advance and no revocation event. Both matter: the first is the
+				// state change, the second is the claim about it.
+				database.AssertNotCalled(t, "IncrementUserAuthStateGeneration",
+					mock.Anything, mock.Anything, mock.Anything)
+				auditLogger.AssertNotCalled(t, "Log", mock.Anything, audit.AuditRevokedUserAuthState,
+					mock.Anything)
+			}
+
+			// Never the full-row write, in either direction (decision 14).
+			database.AssertNotCalled(t, "UpdateUser", mock.Anything, mock.Anything, mock.Anything)
+		})
+	}
+}
+
+// TestHandleAPIUserEnabledPut_SweepFailureRollsBack: the disable transition succeeded and the
+// sweep then failed. The compare-and-set must not survive, so the user stays enabled and no event
+// claims otherwise.
+func TestHandleAPIUserEnabledPut_SweepFailureRollsBack(t *testing.T) {
+	const userId = int64(42)
+	database := mocks_data.NewDatabase(t)
+	auditLogger := mocks_audit.NewAuditLogger(t)
+
+	database.On("GetUserById", mock.Anything, (*sql.Tx)(nil), userId).Return(&models.User{Id: userId}, nil).Once()
+	stub := mocks_data.ExpectRunInTransaction(database, apiRevokeTx)
+	database.On("TrySetUserEnabled", mock.Anything, apiRevokeTx, userId, true, false).Return(true, nil).Once()
+	database.On("IncrementUserAuthStateGeneration", mock.Anything, apiRevokeTx, userId).
+		Return(int64(0), assert.AnError).Once()
+
+	rr := httptest.NewRecorder()
+	handler := HandleAPIUserEnabledPut(database, auditLogger)
+	handler.ServeHTTP(rr, enabledRequest(t, "42", false))
+
+	assert.Equal(t, http.StatusInternalServerError, rr.Code)
+	database.AssertExpectations(t)
+	assert.ErrorIs(t, stub.BodyErr, assert.AnError, "the body hands its error to the helper, which rolls back")
+	// Not even the pre-existing event: the disable did not happen, so recording it as a user
+	// detail update would be false.
+	auditLogger.AssertNotCalled(t, "Log", mock.Anything, mock.Anything, mock.Anything)
+}
+
+// TestHandleAPIUserPasswordPut_RevokesEverything covers the fourth site, the one the issue never
+// mentioned (#106 decision 2). An admin setting another user's password revokes all of that
+// user's state with no exceptSid: the admin's own session belongs to a different user and is
+// unaffected.
+func TestHandleAPIUserPasswordPut_RevokesEverything(t *testing.T) {
+	const userId = int64(42)
+	const newPassword = "N3wP4ss!word"
+
+	database := mocks_data.NewDatabase(t)
+	auditLogger := mocks_audit.NewAuditLogger(t)
+	passwordValidator := accountvalidation.NewPasswordValidator()
+
+	database.On("GetUserById", mock.Anything, (*sql.Tx)(nil), userId).Return(&models.User{Id: userId}, nil).Once()
+
+	var savedHash string
+	database.On("SetUserPasswordHash", mock.Anything, apiRevokeTx, userId, mock.Anything).
+		Run(func(args mock.Arguments) {
+			savedHash = args.Get(3).(string)
+		}).Return(nil).Once()
+	stubSweep(database, userId, 4)
+
+	auditLogger.On("Log", mock.Anything, audit.AuditUpdatedUserAuthentication, mock.Anything).Return().Once()
+	var payload map[string]interface{}
+	auditLogger.On("Log", mock.Anything, audit.AuditRevokedUserAuthState, mock.Anything).
+		Run(func(args mock.Arguments) {
+			payload = args.Get(2).(map[string]interface{})
+		}).Return().Once()
+
+	database.On("GetUserById", mock.Anything, (*sql.Tx)(nil), userId).
+		Return(&models.User{Id: userId, Enabled: true}, nil).Once()
+
+	body, err := json.Marshal(map[string]string{"newPassword": newPassword})
+	require.NoError(t, err)
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/admin/users/42/password", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req = setChiURLParam(req, "id", "42")
+	ctx := context.WithValue(req.Context(), constants.ContextKeySettings,
+		&models.Settings{PasswordPolicy: models.PasswordPolicyLow})
+	req = setTokenContextWithClaims(req.WithContext(ctx),
+		map[string]interface{}{"sub": adminSubject, "auth_time": float64(1)})
+
+	rr := httptest.NewRecorder()
+	handler := HandleAPIUserPasswordPut(database, passwordValidator, auditLogger)
+	handler.ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusOK, rr.Code)
+	database.AssertExpectations(t)
+	auditLogger.AssertExpectations(t)
+
+	assert.True(t, passwordhash.Verify(savedHash, newPassword))
+	database.AssertNotCalled(t, "UpdateUser", mock.Anything, mock.Anything, mock.Anything)
+	// No exceptSid, so no sid-scoped query and nothing promoted.
+	database.AssertNotCalled(t, "GetRefreshTokensBySessionIdentifier", mock.Anything, mock.Anything, mock.Anything)
+
+	require.NotNil(t, payload)
+	assert.Equal(t, "admin_password_set", payload["reason"])
+	assert.Equal(t, adminSubject, payload["loggedInUser"])
+	assert.Equal(t, userId, payload["userId"])
+	value, present := payload["preservedSessionIdentifier"]
+	assert.True(t, present)
+	assert.Equal(t, "", value)
+}
+
+// TestHandleAPIUserOTPPut_DisableCommitsBothWritesAtomically is the admin half of #111 decision 13.
+// Decision 4 names two disable sites and this is the second: they share otpcredential.Remove, and this case
+// is what pins that this handler goes through it rather than keeping two unbound writes of its own.
+// Its account sibling, TestHandleAPIAccountOTPPut_Disable_CommitsBothWritesAtomically, carries the
+// reasoning about why the two writes have to commit together.
+func TestHandleAPIUserOTPPut_DisableCommitsBothWritesAtomically(t *testing.T) {
+	const userId = int64(42)
+
+	database := mocks_data.NewDatabase(t)
+	auditLogger := mocks_audit.NewAuditLogger(t)
+
+	user := &models.User{Id: userId, Enabled: true, OTPEnabled: true}
+	database.On("GetUserById", mock.Anything, (*sql.Tx)(nil), userId).Return(user, nil).Once()
+
+	var calls []string
+	mocks_data.ExpectRunInTransaction(database, otpDisableTx, func(edge string) { calls = append(calls, edge) })
+	database.On("UpdateUser", mock.Anything, otpDisableTx, user).Return(nil).
+		Run(func(mock.Arguments) { calls = append(calls, "update") }).Once()
+	database.On("ResetUserOTPStep", mock.Anything, otpDisableTx, userId).Return(nil).
+		Run(func(mock.Arguments) { calls = append(calls, "reset") }).Once()
+	// The counter joins the same transaction here for free, because both disable sites share
+	// otpcredential.Remove. That is what closes the hole #242 found at this endpoint specifically: it
+	// flagged no session at all, so a target user whose authenticator an administrator removed
+	// kept every live session asserting amr ["pwd","otp"] for it.
+	database.On("IncrementUserOtpConfigGeneration", mock.Anything, otpDisableTx, userId).Return(int64(1), nil).
+		Run(func(mock.Arguments) { calls = append(calls, "increment") }).Once()
+
+	auditLogger.On("Log", mock.Anything, audit.AuditDisabledOTP, mock.Anything).Return().Once()
+	database.On("GetUserById", mock.Anything, (*sql.Tx)(nil), userId).
+		Return(&models.User{Id: userId, Enabled: true}, nil).Once()
+
+	body, err := json.Marshal(map[string]bool{"enabled": false})
+	require.NoError(t, err)
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/admin/users/42/otp", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req = setChiURLParam(req, "id", "42")
+	req = setTokenContextWithClaims(req, map[string]interface{}{
+		"sub": adminSubject, "auth_time": float64(1),
+	})
+
+	rr := httptest.NewRecorder()
+	HandleAPIUserOTPPut(database, auditLogger).ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusOK, rr.Code)
+	assert.Equal(t, []string{"begin", "update", "reset", "increment", "commit"}, calls,
+		"all three writes belong inside one transaction, otp_enabled first per #111 decision 10, "+
+			"the counter advance last before the commit per #242 decision 2")
+	assert.False(t, user.OTPEnabled)
+}
+
+// TestHandleAPIUserCreatePost_StoresResetCodeHash covers the admin user-create path, which
+// is one of the three places Goiabada issues a password-reset link and the only one with
+// no unit coverage of the email branch before this.
+//
+// The property: the hash stored beside the encrypted code is the hash of the code that
+// actually went into the link. It is the only thing that will find this row when the link
+// comes back, since the link carries the code and no email address (#112), so a hash of
+// anything else leaves the new user unable to set a password at all.
+func TestHandleAPIUserCreatePost_StoresResetCodeHash(t *testing.T) {
+	httpHelper := mocks_handlerhelpers.NewHttpHelper(t)
+	database := mocks_data.NewDatabase(t)
+	userCreator := mocks_handlers.NewUserCreator(t)
+	auditLogger := mocks_audit.NewAuditLogger(t)
+	emailSender := mocks_handlers.NewEmailSender(t)
+
+	handler := HandleAPIUserCreatePost(httpHelper, database, userCreator,
+		accountvalidation.NewEmailValidator(database),
+		accountvalidation.NewProfileValidator(database),
+		accountvalidation.NewPasswordValidator(),
+		auditLogger, emailSender)
+
+	body, err := json.Marshal(map[string]interface{}{
+		"email":           "newuser@example.com",
+		"setPasswordType": "email",
+	})
+	require.NoError(t, err)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/users", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req = setTokenContextWithClaims(req, map[string]interface{}{"sub": adminSubject})
+	req = req.WithContext(context.WithValue(req.Context(), constants.ContextKeySettings,
+		&models.Settings{AppName: "TestApp", SMTPEnabled: true}))
+
+	// The handler mutates this model in place before writing it, so it is what the
+	// assertions below read.
+	createdUser := &models.User{Id: 7, Email: "newuser@example.com"}
+
+	database.On("GetUserByEmail", mock.Anything, mock.Anything, "newuser@example.com").Return(nil, nil)
+	userCreator.On("CreateUser", mock.Anything, mock.Anything).Return(createdUser, nil)
+	database.On("UpdateUser", mock.Anything, mock.Anything, createdUser).Return(nil)
+	auditLogger.On("Log", mock.Anything, audit.AuditCreatedUser, mock.Anything).Return()
+	var emailedLink string
+	httpHelper.On("RenderTemplateToBuffer", mock.Anything, "/layouts/email_layout.html",
+		"/emails/email_newuser_set_password.html", mock.Anything).
+		Run(func(args mock.Arguments) {
+			emailedLink, _ = args.Get(3).(map[string]interface{})["link"].(string)
+		}).Return(&bytes.Buffer{}, nil)
+	emailSender.On("SendEmail", mock.Anything, mock.Anything).Return(nil)
+
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusCreated, rr.Code, rr.Body.String())
+
+	// Derived from the code the handler issued, decrypted out of the column it wrote,
+	// rather than from a value this test chose.
+	issuedCode, err := encryption.DecryptData(createdUser.ForgotPasswordCodeEncrypted)
+	require.NoError(t, err)
+	expectedHash, err := hashutil.HashString(issuedCode)
+	require.NoError(t, err)
+	assert.Equal(t, expectedHash, createdUser.ForgotPasswordCodeHash,
+		"the stored hash must be the hash of the code that was issued")
+
+	// This site's only job is to hand the issued code to the shared builder; the link's shape
+	// and the absence of an address in it belong to ResetPasswordLink's own tests (#112
+	// decision 5).
+	assert.Equal(t, emaillinks.ResetPasswordLink(issuedCode), emailedLink,
+		"the emailed link must be the shared builder's output for the code that was issued")
+
+	httpHelper.AssertExpectations(t)
+	database.AssertExpectations(t)
+	emailSender.AssertExpectations(t)
+}
+
+// TestHandleAPIUserCreatePost_LostRaceOnTheEmailAnswers409 covers the branch decision 15 built the
+// unique-key sentinel for.
+//
+// HandleAPIUserCreatePost pre-checks the address with GetUserByEmail and answers 409 from that,
+// which is the ordinary case and what the integration suite exercises. This is the race that check
+// cannot close: a concurrent create takes the address between the read and the write, the engine
+// refuses the insert, and the data layer tags the failure with data.ErrUniqueViolation.
+//
+// Before #279 the branch tested the driver's sentence for the words "email" and "already", which
+// matched none of the four engines' duplicate-key messages, so every lost race answered 500 and the
+// caller was told to report a bug rather than to pick another address.
+//
+// The error is wrapped twice on the way here, as it is in production -- ExecSql tags, CreateUser
+// wraps, the user creator wraps -- because a bare type assertion or a comparison against the
+// outermost error would pass on an untouched sentinel and fail on the real one.
+func TestHandleAPIUserCreatePost_LostRaceOnTheEmailAnswers409(t *testing.T) {
+	httpHelper := mocks_handlerhelpers.NewHttpHelper(t)
+	database := mocks_data.NewDatabase(t)
+	userCreator := mocks_handlers.NewUserCreator(t)
+	auditLogger := mocks_audit.NewAuditLogger(t)
+	emailSender := mocks_handlers.NewEmailSender(t)
+
+	handler := HandleAPIUserCreatePost(httpHelper, database, userCreator,
+		accountvalidation.NewEmailValidator(database),
+		accountvalidation.NewProfileValidator(database),
+		accountvalidation.NewPasswordValidator(),
+		auditLogger, emailSender)
+
+	body, err := json.Marshal(map[string]interface{}{
+		"email":           "taken@example.com",
+		"setPasswordType": "now",
+		"password":        "a-long-enough-password-1",
+	})
+	require.NoError(t, err)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/users", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req = setTokenContextWithClaims(req, map[string]interface{}{"sub": adminSubject})
+	req = req.WithContext(context.WithValue(req.Context(), constants.ContextKeySettings,
+		&models.Settings{AppName: "TestApp"}))
+
+	// The pre-check passes: at this instant nobody holds the address.
+	database.On("GetUserByEmail", mock.Anything, mock.Anything, "taken@example.com").Return(nil, nil)
+	// By the time the insert runs, somebody does.
+	lostRace := errs.Wrap(errs.Wrap(
+		errs.Wrap(errs.Errorf("%w: %w", data.ErrUniqueViolation,
+			errors.New("Duplicate entry 'taken@example.com' for key 'users.idx_email'")),
+			"unable to execute SQL"),
+		"unable to insert user"), "unable to create user")
+	userCreator.On("CreateUser", mock.Anything, mock.Anything).Return(nil, lostRace)
+
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusConflict, rr.Code, rr.Body.String())
+
+	var resp map[string]interface{}
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &resp))
+	assert.Equal(t, "EMAIL_ALREADY_EXISTS", resp["error_code"],
+		"the caller routes on the status, but the code is what tells it which field to change")
+
+	httpHelper.AssertExpectations(t)
+	database.AssertExpectations(t)
+	userCreator.AssertExpectations(t)
+}
+
+// TestHandleAPIUserCreatePost_AnyOtherCreateFailureAnswers500 is the other side of that branch, and
+// it is what stops the 409 from becoming the answer to every failed create. A caller told 409 will
+// retry with a different address; told 500, it reports the failure, which is the right thing to do
+// when the write failed for a reason no address change fixes.
+func TestHandleAPIUserCreatePost_AnyOtherCreateFailureAnswers500(t *testing.T) {
+	httpHelper := mocks_handlerhelpers.NewHttpHelper(t)
+	database := mocks_data.NewDatabase(t)
+	userCreator := mocks_handlers.NewUserCreator(t)
+	auditLogger := mocks_audit.NewAuditLogger(t)
+	emailSender := mocks_handlers.NewEmailSender(t)
+
+	handler := HandleAPIUserCreatePost(httpHelper, database, userCreator,
+		accountvalidation.NewEmailValidator(database),
+		accountvalidation.NewProfileValidator(database),
+		accountvalidation.NewPasswordValidator(),
+		auditLogger, emailSender)
+
+	body, err := json.Marshal(map[string]interface{}{
+		"email":           "fresh@example.com",
+		"setPasswordType": "now",
+		"password":        "a-long-enough-password-1",
+	})
+	require.NoError(t, err)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/users", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req = setTokenContextWithClaims(req, map[string]interface{}{"sub": adminSubject})
+	req = req.WithContext(context.WithValue(req.Context(), constants.ContextKeySettings,
+		&models.Settings{AppName: "TestApp"}))
+
+	database.On("GetUserByEmail", mock.Anything, mock.Anything, "fresh@example.com").Return(nil, nil)
+	userCreator.On("CreateUser", mock.Anything, mock.Anything).Return(nil,
+		errs.Wrap(errs.New("connection refused"), "unable to execute SQL"))
+
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusInternalServerError, rr.Code, rr.Body.String())
+
+	var resp map[string]interface{}
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &resp))
+	assert.Equal(t, "INTERNAL_SERVER_ERROR", resp["error_code"])
+
+	httpHelper.AssertExpectations(t)
+	database.AssertExpectations(t)
+	userCreator.AssertExpectations(t)
+}
+
+// TestHandleAPIUserCreatePost_SetPasswordTypeMatrix is the whole of what setPasswordType decides,
+// on both SMTP settings, including the cell that used to fall through both arms.
+//
+// openapi.yaml publishes the property as enum [now, email] and leaves it out of the schema's
+// required array, which in OpenAPI means absent is allowed and a present value must be one of the
+// two. The handler compared against the two and refused nothing else, so with SMTP configured a
+// third value -- the field's absence included -- took neither the password branch nor the email
+// branch: the row was created enabled, holding authserver:manage-account, with no password hash, no
+// forgot-password code and no setup email. Nobody was ever told the account existed.
+//
+// The rows below are the contract as it now stands: a present value outside the set is refused, an
+// absent one is "now", and "email" is the one value that skips the password, and only where there
+// is SMTP to send it with. The two arms are driven by one boolean, so "neither" is no longer a
+// reachable state; these rows are what would go red if that boolean were split back into two
+// independent conditions.
+func TestHandleAPIUserCreatePost_SetPasswordTypeMatrix(t *testing.T) {
+	const goodPassword = "password123"
+
+	for _, tc := range []struct {
+		name string
+		// setPasswordType is omitted from the body entirely when absent is true, which is the
+		// case the schema permits and the one the defect was reachable through.
+		setPasswordType string
+		absent          bool
+		smtpEnabled     bool
+		password        string
+
+		wantStatus  int
+		wantCreated bool
+		wantEmail   bool
+		wantMessage string
+	}{
+		{name: "now with a password", setPasswordType: "now", smtpEnabled: true,
+			password: goodPassword, wantStatus: http.StatusCreated, wantCreated: true},
+		{name: "now without a password", setPasswordType: "now", smtpEnabled: true,
+			wantStatus: http.StatusBadRequest, wantMessage: "Password is required"},
+		{name: "now with no smtp", setPasswordType: "now", smtpEnabled: false,
+			password: goodPassword, wantStatus: http.StatusCreated, wantCreated: true},
+
+		{name: "email sends the setup mail", setPasswordType: "email", smtpEnabled: true,
+			wantStatus: http.StatusCreated, wantCreated: true, wantEmail: true},
+		// With no SMTP there is no mail to send, so the password is required whatever the field
+		// says. This is the one row where "email" does not mean email, and it is long-standing
+		// behaviour that the refusal above must not have disturbed.
+		{name: "email with no smtp still needs a password", setPasswordType: "email",
+			smtpEnabled: false, password: goodPassword,
+			wantStatus: http.StatusCreated, wantCreated: true},
+		{name: "email with no smtp and no password", setPasswordType: "email", smtpEnabled: false,
+			wantStatus: http.StatusBadRequest, wantMessage: "Password is required"},
+
+		// Absent is permitted by the schema and defaults to "now": it asks for a password rather
+		// than creating an account nobody can reach. Before the fix the first of these two was a
+		// 201 with an empty hash and no mail.
+		{name: "absent defaults to now", absent: true, smtpEnabled: true, password: goodPassword,
+			wantStatus: http.StatusCreated, wantCreated: true},
+		{name: "absent without a password is refused", absent: true, smtpEnabled: true,
+			wantStatus: http.StatusBadRequest, wantMessage: "Password is required"},
+		{name: "absent with no smtp", absent: true, smtpEnabled: false, password: goodPassword,
+			wantStatus: http.StatusCreated, wantCreated: true},
+		// Empty reaches the handler as absent does, because a client that always sends the key
+		// sends "" rather than omitting it.
+		{name: "empty is absent", setPasswordType: "", smtpEnabled: true, password: goodPassword,
+			wantStatus: http.StatusCreated, wantCreated: true},
+
+		// A present value outside the set is refused, which is what the published enum has always
+		// promised. Case matters: the enum is lowercase and so is the comparison.
+		{name: "a third value", setPasswordType: "later", smtpEnabled: true,
+			password: goodPassword, wantStatus: http.StatusBadRequest,
+			wantMessage: "setPasswordType"},
+		{name: "a near miss on email", setPasswordType: "e-mail", smtpEnabled: true,
+			wantStatus: http.StatusBadRequest, wantMessage: "setPasswordType"},
+		{name: "the right word in the wrong case", setPasswordType: "Email", smtpEnabled: true,
+			password: goodPassword, wantStatus: http.StatusBadRequest,
+			wantMessage: "setPasswordType"},
+		// Refused before the SMTP question is asked, so an unlisted value cannot be laundered
+		// into the password arm by a deployment that happens to have no mail configured.
+		{name: "a third value with no smtp", setPasswordType: "NOW", smtpEnabled: false,
+			password: goodPassword, wantStatus: http.StatusBadRequest,
+			wantMessage: "setPasswordType"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			httpHelper := mocks_handlerhelpers.NewHttpHelper(t)
+			database := mocks_data.NewDatabase(t)
+			userCreator := mocks_handlers.NewUserCreator(t)
+			auditLogger := mocks_audit.NewAuditLogger(t)
+			emailSender := mocks_handlers.NewEmailSender(t)
+
+			handler := HandleAPIUserCreatePost(httpHelper, database, userCreator,
+				accountvalidation.NewEmailValidator(database),
+				accountvalidation.NewProfileValidator(database),
+				accountvalidation.NewPasswordValidator(),
+				auditLogger, emailSender)
+
+			payload := map[string]interface{}{"email": "newuser@example.com"}
+			if !tc.absent {
+				payload["setPasswordType"] = tc.setPasswordType
+			}
+			if tc.password != "" {
+				payload["password"] = tc.password
+			}
+			body, err := json.Marshal(payload)
+			require.NoError(t, err)
+
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/users", bytes.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			req = setTokenContextWithClaims(req, map[string]interface{}{"sub": adminSubject})
+			req = req.WithContext(context.WithValue(req.Context(), constants.ContextKeySettings,
+				&models.Settings{AppName: "TestApp", SMTPEnabled: tc.smtpEnabled,
+					PasswordPolicy: models.PasswordPolicyLow}))
+
+			database.On("GetUserByEmail", mock.Anything, mock.Anything, "newuser@example.com").Return(nil, nil)
+
+			// createdUser is what the handler mutates on the email arm, so the assertions below
+			// read the hash off the input the handler actually passed rather than off a value
+			// this test chose.
+			createdUser := &models.User{Id: 7, Email: "newuser@example.com"}
+			var gotPasswordHash string
+			if tc.wantCreated {
+				userCreator.On("CreateUser", mock.Anything, mock.Anything).
+					Run(func(args mock.Arguments) {
+						gotPasswordHash = args.Get(1).(*usercreation.CreateUserInput).PasswordHash
+					}).Return(createdUser, nil)
+				auditLogger.On("Log", mock.Anything, audit.AuditCreatedUser, mock.Anything).Return()
+			}
+			if tc.wantEmail {
+				database.On("UpdateUser", mock.Anything, mock.Anything, createdUser).Return(nil)
+				httpHelper.On("RenderTemplateToBuffer", mock.Anything, "/layouts/email_layout.html",
+					"/emails/email_newuser_set_password.html", mock.Anything).
+					Return(&bytes.Buffer{}, nil)
+				emailSender.On("SendEmail", mock.Anything, mock.Anything).Return(nil)
+			}
+
+			rr := httptest.NewRecorder()
+			handler.ServeHTTP(rr, req)
+
+			require.Equal(t, tc.wantStatus, rr.Code, rr.Body.String())
+			if tc.wantMessage != "" {
+				assert.Contains(t, rr.Body.String(), tc.wantMessage)
+			}
+
+			if tc.wantCreated && !tc.wantEmail {
+				// The password arm: a real bcrypt hash of the password that was sent. Asserting
+				// that it verifies, rather than that it is non-empty, is what separates this from
+				// the defect, where the row was created with an empty hash bcrypt refuses.
+				require.NotEmpty(t, gotPasswordHash, "the account must be created with a password")
+				assert.True(t, passwordhash.Verify(gotPasswordHash, tc.password),
+					"the stored hash must verify against the password the request carried")
+			}
+			if tc.wantEmail {
+				// The email arm legitimately creates the row with no hash: the setup link is how
+				// the account becomes reachable, and the row carries the code that answers it.
+				assert.Empty(t, gotPasswordHash)
+				assert.NotEmpty(t, createdUser.ForgotPasswordCodeHash,
+					"a setup email is only meaningful beside the code that answers its link")
+			}
+
+			// The refusals must not have created anything, and the password arm must not have
+			// sent mail. Both are what mockery's strict expectations assert here: a call this
+			// table did not register fails the case.
+			httpHelper.AssertExpectations(t)
+			database.AssertExpectations(t)
+			userCreator.AssertExpectations(t)
+			emailSender.AssertExpectations(t)
+		})
+	}
+}
+
+// An empty password hash is what the email arm legitimately writes and what the defect wrote by
+// accident, so the property that made the defect a silent provisioning failure rather than a way in
+// is worth pinning where it can be read: bcrypt refuses such a row for every password, including
+// the empty one. Without this, "creates an account with no password" carries no information about
+// whether that account can be signed in to.
+func TestVerifyPasswordHash_AnEmptyHashAuthenticatesNothing(t *testing.T) {
+	for _, password := range []string{"", " ", "password123", "\x00"} {
+		assert.False(t, passwordhash.Verify("", password),
+			"an account with no password hash must not authenticate with %q", password)
+	}
+}

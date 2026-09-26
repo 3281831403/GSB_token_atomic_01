@@ -1,0 +1,89 @@
+name: goiabada
+services:
+  devcontainer:
+    build: 
+      context: .
+      dockerfile: Dockerfile
+      args:
+        USER_UID: ${USER_UID:-1000}
+        USER_GID: ${USER_GID:-1000}
+    volumes:
+      - ../..:/workspaces/goiabada
+    # gh reaches the container through the environment, not through a mounted file.
+    #
+    # There used to be a `~/.config/gh/hosts.yml:/root/.config/gh/hosts.yml` bind here. It
+    # never worked on any platform: this container runs as `vscode` (see remoteUser), so gh
+    # reads /home/vscode/.config/gh and never looked at /root's. On Windows it was worse
+    # than dead -- ~/.config/gh does not exist there, so docker created a directory by that
+    # name on the host and mounted it over the file, and gh keeps its token in the
+    # Credential Manager rather than in hosts.yml anyway.
+    #
+    # The bare name passes the host's GH_TOKEN through when it is set and leaves it unset
+    # otherwise, which is the one form that behaves the same on Windows, macOS and Linux.
+    # Nothing in the image requires it; export it only if you want gh inside the container:
+    #
+    #   macOS/Linux   export GH_TOKEN=$(gh auth token)
+    #   PowerShell    $env:GH_TOKEN = (gh auth token)
+    environment:
+      - GH_TOKEN
+    command: sleep infinity
+    networks: 
+      - goiabada-network
+
+  mysql-server:
+    image: mysql:latest
+    command: --port=13306
+    volumes:
+      - mysql-data:/var/lib/mysql
+    ports:
+      - 13306:13306  # Devcontainer uses 13306 to avoid conflict with sample docker-compose files
+    environment:
+      MYSQL_ROOT_PASSWORD: mySqlPass123
+    networks:
+      - goiabada-network
+
+  postgres-server:
+    image: postgres:18
+    command: -p 15432
+    volumes:
+      - postgres-data:/var/lib/postgresql
+    ports:
+      - 15432:15432  # Devcontainer uses 15432 to avoid conflict with sample docker-compose files
+    environment:
+      POSTGRES_PASSWORD: myPostgresPass123
+    networks:
+      - goiabada-network
+
+  mssql-server:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    environment:
+      ACCEPT_EULA: Y
+      MSSQL_SA_PASSWORD: YourStr0ngPassw0rd!  # Must be at least 8 characters including uppercase, lowercase, digits
+      MSSQL_PID: Developer
+      MSSQL_TCP_PORT: 11433
+    ports:
+      - 11433:11433  # Devcontainer uses 11433 to avoid conflict with sample docker-compose files
+    volumes:
+      - mssql-data:/var/opt/mssql
+    networks:
+      - goiabada-network
+    deploy:
+      resources:
+        limits:
+          memory: 4GB    # SQL Server requires at least 2GB of RAM, increased for stability
+
+  mailpit:
+    image: axllent/mailpit
+    ports:
+      - 8025:8025
+    networks:
+      - goiabada-network
+
+volumes:
+  mysql-data:
+  postgres-data:
+  mssql-data:
+
+networks:
+  goiabada-network:
+    driver: bridge

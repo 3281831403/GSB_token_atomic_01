@@ -1,0 +1,30 @@
+# This config covers only the interfaces core itself owns, which since #385 is the
+# session store alone, and it is now the only mock written under core/ at all. No mock
+# for a validator is written here any more: #344 moved the two protocol validators to
+# authserver/internal/protocolvalidation, and their mocks went with them; the Database
+# mock is authserver/.mockery.yaml's since #359 moved the interface to
+# authserver/internal/data; the two middleware mocks, AuthHelper and tokenParser,
+# followed the JWT middleware out of core -- the session half to
+# adminconsole/.mockery.yaml, the bearer half's parser port to authserver's; and the
+# HttpHelper mock authserver/.mockery.yaml used to write into core/handlerhelpers/mocks
+# is two mocks now, one per module, because the renderer is two packages (#385).
+filename: "{{.InterfaceName | snakecase}}_mock.go"
+structname: "{{.InterfaceName}}"
+template: testify
+# Emits "//go:build !production" in every generated mock, keeping testify out of
+# production builds (see build/Dockerfile-*, which build with -tags=production).
+#
+# boilerplate-file names the same file authserver/.mockery.yaml does, spelled
+# relative to this module because the path resolves against mockery's working
+# directory. See that file for what it is for (#338).
+template-data:
+  mock-build-tags: "!production"
+  boilerplate-file: "../mockery-header.txt"
+packages:
+  # Session store
+  github.com/leodip/goiabada/core/sessionstore:
+    interfaces:
+      Store:
+        config:
+          dir: "./sessionstore/mocks"
+          pkgname: "mocks_sessionstore"

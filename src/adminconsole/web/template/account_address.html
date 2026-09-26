@@ -1,0 +1,101 @@
+{{define "title"}}{{ .appName }} - {{ T $.ctx "adminconsole.account.address.page_title" }}{{end}}
+{{define "pageTitle"}}{{ T $.ctx "adminconsole.account.address.page_title" }}{{end}}
+{{define "subTitle"}}
+    <div class="text-xl font-semibold">{{ T $.ctx "adminconsole.account.address.section_title" }}</div>
+    <div class="mt-2 divider"></div>
+{{end}}
+
+{{define "menu"}}
+    {{template "account_menu" . }}
+{{end}}
+
+{{define "head"}}
+
+
+{{end}}
+
+{{define "body"}}
+
+<form action="/account/address" method="post">
+
+    <div class="grid grid-cols-1 gap-6 md:grid-cols-3">
+        <div class="w-full form-control">
+            <label class="label">
+                <span class="label-text text-base-content">{{ T $.ctx "adminconsole.account.address.field.address_line1" }}</span>
+            </label>
+            <input type="text" name="addressLine1" value="{{.address.AddressLine1}}"
+                class="w-full input input-bordered " autocomplete="off" />
+        </div>
+
+        <div class="w-full form-control">
+            <label class="label">
+                <span class="label-text text-base-content">{{ T $.ctx "adminconsole.account.address.field.address_line2" }}</span>
+            </label>
+            <input type="text" name="addressLine2" value="{{.address.AddressLine2}}"
+            class="w-full input input-bordered " autocomplete="off" />
+        </div>
+    </div>
+
+    <div class="grid grid-cols-1 gap-6 mt-2 md:grid-cols-3">
+        <div class="w-full form-control">
+            <label class="label">
+                <span class="label-text text-base-content">{{ T $.ctx "adminconsole.account.address.field.locality" }}</span>
+            </label>
+            <input type="text" name="addressLocality" value="{{.address.AddressLocality}}"
+                class="w-full input input-bordered " autocomplete="off" />
+        </div>
+
+        <div class="w-full form-control">
+            <label class="label">
+                <span class="label-text text-base-content">{{ T $.ctx "adminconsole.account.address.field.region" }}</span>
+            </label>
+            <input type="text" name="addressRegion" value="{{.address.AddressRegion}}"
+                class="w-full input input-bordered " autocomplete="off" />
+        </div>
+    </div>
+
+    <div class="grid grid-cols-1 gap-6 mt-2 md:grid-cols-3">
+        <div class="w-full form-control">
+            <label class="label">
+                <span class="label-text text-base-content">{{ T $.ctx "adminconsole.account.address.field.postal_code" }}</span>
+            </label>
+            <input type="text" name="addressPostalCode" value="{{.address.AddressPostalCode}}"
+                class="w-full input input-bordered " autocomplete="off" />
+        </div>
+
+        <div class="w-full form-control">
+            <label class="label">
+                <span class="label-text text-base-content">{{ T $.ctx "adminconsole.account.address.field.country" }}</span>
+            </label>
+            <select class="w-full select select-bordered country-flags" name="addressCountry">
+                <option value="" {{ if eq .address.AddressCountry "" }}selected{{ end }}>{{ T $.ctx "adminconsole.account.address.country_blank" }}</option>
+                {{ $address := .address }}
+                {{range .countries}}
+                <option class="country-flags" value="{{.Alpha2}}" {{ if eq $address.AddressCountry .Alpha2 }}selected{{ end }}>
+                    {{.Emoji}} - {{ RefCountry $.ctx .Alpha2 .Name }}</option>
+                {{end}}
+            </select>
+        </div>
+    </div>
+
+    <div class="grid grid-cols-1 gap-6 mt-2 md:grid-cols-3">
+        <div class="w-full col-span-2 mt-10">
+            {{if .error}}
+                <div class="mb-4 text-right text-error">
+                    <p>{{.error}}</p>
+                </div>
+            {{end}}
+            {{if .savedSuccessfully}}
+                <div class="mb-4 text-right text-success">
+                    <p>&#10004; {{ T $.ctx "adminconsole.account.address.saved_successfully" }}</p>
+                </div>
+            {{end}}
+            <button class="float-right btn btn-primary">{{ T $.ctx "adminconsole.account.address.update_button" }}</button>
+        </div>
+        <div>
+        </div>
+    </div>
+
+</form>
+
+{{end}}

@@ -1,0 +1,332 @@
+package integrationtests
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"strconv"
+	"strings"
+	"testing"
+
+	"github.com/leodip/goiabada/authserver/internal/config"
+	"github.com/leodip/goiabada/authserver/internal/testutil/fake"
+	"github.com/leodip/goiabada/core/api"
+	"github.com/leodip/goiabada/core/constants"
+	"github.com/stretchr/testify/assert"
+)
+
+// GET /api/v1/admin/resources/{id}
+func TestAPIResourceGet_Success(t *testing.T) {
+	accessToken, _ := createAdminClientWithToken(t)
+
+	res := createTestResource(t, "api-test-get-resource-"+fake.LetterN(6), "Get Resource")
+	defer func() { _ = database.DeleteResource(context.Background(), nil, res.Id) }()
+
+	url := config.GetAuthServer().BaseURL + "/api/v1/admin/resources/" + strconv.FormatInt(res.Id, 10)
+	resp := makeAPIRequest(t, "GET", url, accessToken, nil)
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, "application/json", resp.Header.Get("Content-Type"))
+
+	var getResp api.GetResourceResponse
+	err := json.NewDecoder(resp.Body).Decode(&getResp)
+	assert.NoError(t, err)
+
+	assert.Equal(t, res.Id, getResp.Resource.Id)
+	assert.Equal(t, res.ResourceIdentifier, getResp.Resource.ResourceIdentifier)
+	assert.Equal(t, res.Description, getResp.Resource.Description)
+}
+
+func TestAPIResourceGet_NotFoundAndInvalidId(t *testing.T) {
+	accessToken, _ := createAdminClientWithToken(t)
+
+	// Not found
+	urlNF := config.GetAuthServer().BaseURL + "/api/v1/admin/resources/9999999"
+	respNF := makeAPIRequest(t, "GET", urlNF, accessToken, nil)
+	defer func() { _ = respNF.Body.Close() }()
+	assert.Equal(t, http.StatusNotFound, respNF.StatusCode)
+	var errRespNF api.ErrorResponse
+	_ = json.NewDecoder(respNF.Body).Decode(&errRespNF)
+	assert.Equal(t, "Resource not found", errRespNF.ErrorDescription)
+
+	// Invalid id (non-numeric)
+	urlBad := config.GetAuthServer().BaseURL + "/api/v1/admin/resources/abc"
+	respBad := makeAPIRequest(t, "GET", urlBad, accessToken, nil)
+	defer func() { _ = respBad.Body.Close() }()
+	assert.Equal(t, http.StatusBadRequest, respBad.StatusCode)
+	var errRespBad api.ErrorResponse
+	_ = json.NewDecoder(respBad.Body).Decode(&errRespBad)
+	assert.Equal(t, "Invalid resource ID", errRespBad.ErrorDescription)
+
+	// Negative id -> not found
+	urlNeg := config.GetAuthServer().BaseURL + "/api/v1/admin/resources/-1"
+	respNeg := makeAPIRequest(t, "GET", urlNeg, accessToken, nil)
+	defer func() { _ = respNeg.Body.Close() }()
+	assert.Equal(t, http.StatusNotFound, respNeg.StatusCode)
+}
+
+func TestAPIResourceGet_UnauthorizedAndScope(t *testing.T) {
+	// No token
+	url := config.GetAuthServer().BaseURL + "/api/v1/admin/resources/1"
+	req, err := http.NewRequest("GET", url, nil)
+	assert.NoError(t, err)
+	httpClient := createHttpClient(t)
+	resp, err := httpClient.Do(req)
+	assert.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+
+	// Invalid token
+	resp2 := makeAPIRequest(t, "GET", url, "invalid-token", nil)
+	defer func() { _ = resp2.Body.Close() }()
+	assert.Equal(t, http.StatusUnauthorized, resp2.StatusCode)
+
+	// Insufficient scope (userinfo)
+	token := createClientCredentialsTokenWithScope(t, constants.AuthServerResourceIdentifier, constants.UserinfoPermissionIdentifier)
+	resp3 := makeAPIRequest(t, "GET", url, token, nil)
+	defer func() { _ = resp3.Body.Close() }()
+	assert.Equal(t, http.StatusForbidden, resp3.StatusCode)
+}
+
+// PUT /api/v1/admin/resources/{id}
+func TestAPIResourceUpdatePut_Success(t *testing.T) {
+	accessToken, _ := createAdminClientWithToken(t)
+
+	res := createTestResource(t, "api-test-update-resource-"+fake.LetterN(6), "Original")
+	defer func() { _ = database.DeleteResource(context.Background(), nil, res.Id) }()
+
+	updateReq := api.UpdateResourceRequest{
+		ResourceIdentifier: "updated-resource-" + fake.LetterN(6),
+		Description:        "  Updated desc  ",
+	}
+	url := config.GetAuthServer().BaseURL + "/api/v1/admin/resources/" + strconv.FormatInt(res.Id, 10)
+	resp := makeAPIRequest(t, "PUT", url, accessToken, updateReq)
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, "application/json", resp.Header.Get("Content-Type"))
+
+	var updResp api.UpdateResourceResponse
+	err := json.NewDecoder(resp.Body).Decode(&updResp)
+	assert.NoError(t, err)
+
+	assert.Equal(t, res.Id, updResp.Resource.Id)
+	assert.Equal(t, updateReq.ResourceIdentifier, updResp.Resource.ResourceIdentifier)
+	assert.Equal(t, "Updated desc", updResp.Resource.Description)
+
+	// Verify DB persisted
+	stored, err := database.GetResourceById(context.Background(), nil, res.Id)
+	assert.NoError(t, err)
+	assert.NotNil(t, stored)
+	assert.Equal(t, updateReq.ResourceIdentifier, stored.ResourceIdentifier)
+	assert.Equal(t, "Updated desc", stored.Description)
+}
+
+func TestAPIResourceUpdatePut_ValidationErrors(t *testing.T) {
+	accessToken, _ := createAdminClientWithToken(t)
+	res := createTestResource(t, "api-test-update-val-"+fake.LetterN(6), "desc")
+	defer func() { _ = database.DeleteResource(context.Background(), nil, res.Id) }()
+
+	// Empty identifier
+	url := config.GetAuthServer().BaseURL + "/api/v1/admin/resources/" + strconv.FormatInt(res.Id, 10)
+	resp := makeAPIRequest(t, "PUT", url, accessToken, api.UpdateResourceRequest{ResourceIdentifier: "", Description: "x"})
+	defer func() { _ = resp.Body.Close() }()
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	var errResp api.ErrorResponse
+	_ = json.NewDecoder(resp.Body).Decode(&errResp)
+	assert.Equal(t, "Resource identifier is required", errResp.ErrorDescription)
+
+	// Too long description
+	longDesc := strings.Repeat("a", 101)
+	resp2 := makeAPIRequest(t, "PUT", url, accessToken, api.UpdateResourceRequest{ResourceIdentifier: "valid-identifier", Description: longDesc})
+	defer func() { _ = resp2.Body.Close() }()
+	assert.Equal(t, http.StatusBadRequest, resp2.StatusCode)
+	var errResp2 api.ErrorResponse
+	_ = json.NewDecoder(resp2.Body).Decode(&errResp2)
+	assert.Equal(t, "The description cannot exceed a maximum length of 100 characters", errResp2.ErrorDescription)
+
+	// Invalid identifier format
+	resp3 := makeAPIRequest(t, "PUT", url, accessToken, api.UpdateResourceRequest{ResourceIdentifier: "invalid identifier", Description: "x"})
+	defer func() { _ = resp3.Body.Close() }()
+	assert.Equal(t, http.StatusBadRequest, resp3.StatusCode)
+	var errResp3 api.ErrorResponse
+	_ = json.NewDecoder(resp3.Body).Decode(&errResp3)
+	assert.Equal(t, "Invalid identifier format. It must start with a letter, can include letters, numbers, dashes, and underscores, but cannot end with a dash or underscore, or have two consecutive dashes or underscores.", errResp3.ErrorDescription)
+}
+
+func TestAPIResourceUpdatePut_DuplicateIdentifier(t *testing.T) {
+	accessToken, _ := createAdminClientWithToken(t)
+	res1 := createTestResource(t, "api-test-dup1-"+fake.LetterN(6), "desc")
+	res2 := createTestResource(t, "api-test-dup2-"+fake.LetterN(6), "desc")
+	defer func() {
+		_ = database.DeleteResource(context.Background(), nil, res1.Id)
+		_ = database.DeleteResource(context.Background(), nil, res2.Id)
+	}()
+
+	url := config.GetAuthServer().BaseURL + "/api/v1/admin/resources/" + strconv.FormatInt(res2.Id, 10)
+	resp := makeAPIRequest(t, "PUT", url, accessToken, api.UpdateResourceRequest{ResourceIdentifier: res1.ResourceIdentifier, Description: "x"})
+	defer func() { _ = resp.Body.Close() }()
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	var errResp api.ErrorResponse
+	_ = json.NewDecoder(resp.Body).Decode(&errResp)
+	assert.Equal(t, "The resource identifier is already in use", errResp.ErrorDescription)
+}
+
+func TestAPIResourceUpdatePut_SystemLevelResourceAllowed(t *testing.T) {
+	accessToken, _ := createAdminClientWithToken(t)
+
+	// Find system-level resource (authserver)
+	sysRes, err := database.GetResourceByResourceIdentifier(context.Background(), nil, constants.AuthServerResourceIdentifier)
+	assert.NoError(t, err)
+	assert.NotNil(t, sysRes)
+
+	// Update with same identifier (should succeed)
+	url := config.GetAuthServer().BaseURL + "/api/v1/admin/resources/" + strconv.FormatInt(sysRes.Id, 10)
+	newDesc := "Updated authserver description"
+	resp := makeAPIRequest(t, "PUT", url, accessToken, api.UpdateResourceRequest{
+		ResourceIdentifier: sysRes.ResourceIdentifier, // Keep same identifier
+		Description:        newDesc,
+	})
+	defer func() { _ = resp.Body.Close() }()
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+	var updatedRes api.GetResourceResponse
+	err = json.NewDecoder(resp.Body).Decode(&updatedRes)
+	assert.NoError(t, err)
+	assert.Equal(t, constants.AuthServerResourceIdentifier, updatedRes.Resource.ResourceIdentifier)
+	assert.Equal(t, newDesc, updatedRes.Resource.Description)
+}
+
+func TestAPIResourceUpdatePut_SystemLevelResourceIdentifierChangeBlocked(t *testing.T) {
+	accessToken, _ := createAdminClientWithToken(t)
+
+	// Find system-level resource (authserver)
+	sysRes, err := database.GetResourceByResourceIdentifier(context.Background(), nil, constants.AuthServerResourceIdentifier)
+	assert.NoError(t, err)
+	assert.NotNil(t, sysRes)
+
+	// Attempt to change identifier (should fail)
+	url := config.GetAuthServer().BaseURL + "/api/v1/admin/resources/" + strconv.FormatInt(sysRes.Id, 10)
+	resp := makeAPIRequest(t, "PUT", url, accessToken, api.UpdateResourceRequest{
+		ResourceIdentifier: "different-resource-identifier",
+		Description:        sysRes.Description,
+	})
+	defer func() { _ = resp.Body.Close() }()
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+
+	var errResp api.ErrorResponse
+	err = json.NewDecoder(resp.Body).Decode(&errResp)
+	assert.NoError(t, err)
+	assert.Contains(t, errResp.ErrorDescription, "identifier of a system-level resource cannot be changed")
+}
+
+func TestAPIResourceUpdatePut_InvalidIdAndBody(t *testing.T) {
+	accessToken, _ := createAdminClientWithToken(t)
+
+	// Invalid ID
+	urlBad := config.GetAuthServer().BaseURL + "/api/v1/admin/resources/abc"
+	respBad := makeAPIRequest(t, "PUT", urlBad, accessToken, api.UpdateResourceRequest{ResourceIdentifier: "x", Description: "y"})
+	defer func() { _ = respBad.Body.Close() }()
+	assert.Equal(t, http.StatusBadRequest, respBad.StatusCode)
+	var errRespBad api.ErrorResponse
+	_ = json.NewDecoder(respBad.Body).Decode(&errRespBad)
+	assert.Equal(t, "Invalid resource ID", errRespBad.ErrorDescription)
+
+	// Not found
+	urlNF := config.GetAuthServer().BaseURL + "/api/v1/admin/resources/9999999"
+	respNF := makeAPIRequest(t, "PUT", urlNF, accessToken, api.UpdateResourceRequest{ResourceIdentifier: "valid-" + fake.LetterN(6), Description: "y"})
+	defer func() { _ = respNF.Body.Close() }()
+	assert.Equal(t, http.StatusNotFound, respNF.StatusCode)
+
+	// Empty body -> invalid request body
+	// Build request manually with empty body
+	url := config.GetAuthServer().BaseURL + "/api/v1/admin/resources/1"
+	req, err := http.NewRequest("PUT", url, nil)
+	assert.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Content-Type", "application/json")
+	httpClient := createHttpClient(t)
+	resp, err := httpClient.Do(req)
+	assert.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+}
+
+func TestAPIResourceUpdatePut_UnauthorizedAndScope(t *testing.T) {
+	// Prepare a test resource to reference
+	res := createTestResource(t, "api-test-update-unauth-"+fake.LetterN(6), "desc")
+	defer func() { _ = database.DeleteResource(context.Background(), nil, res.Id) }()
+
+	url := config.GetAuthServer().BaseURL + "/api/v1/admin/resources/" + strconv.FormatInt(res.Id, 10)
+
+	// No token
+	req, err := http.NewRequest("PUT", url, nil)
+	assert.NoError(t, err)
+	httpClient := createHttpClient(t)
+	resp, err := httpClient.Do(req)
+	assert.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+
+	// Invalid token
+	resp2 := makeAPIRequest(t, "PUT", url, "invalid-token", api.UpdateResourceRequest{ResourceIdentifier: res.ResourceIdentifier, Description: res.Description})
+	defer func() { _ = resp2.Body.Close() }()
+	assert.Equal(t, http.StatusUnauthorized, resp2.StatusCode)
+
+	// Insufficient scope
+	token := createClientCredentialsTokenWithScope(t, constants.AuthServerResourceIdentifier, constants.UserinfoPermissionIdentifier)
+	resp3 := makeAPIRequest(t, "PUT", url, token, api.UpdateResourceRequest{ResourceIdentifier: res.ResourceIdentifier, Description: res.Description})
+	defer func() { _ = resp3.Body.Close() }()
+	assert.Equal(t, http.StatusForbidden, resp3.StatusCode)
+}
+
+// TestAPIResourceUpdatePut_AngleBracketsRejected covers the update handler's own description check,
+// a separate wiring point from the create handler's (#275).
+func TestAPIResourceUpdatePut_AngleBracketsRejected(t *testing.T) {
+	accessToken, _ := createAdminClientWithToken(t)
+
+	res := createTestResource(t, "api-test-update-angle-"+fake.LetterN(6), "Original")
+	defer func() { _ = database.DeleteResource(context.Background(), nil, res.Id) }()
+
+	updateReq := api.UpdateResourceRequest{
+		ResourceIdentifier: res.ResourceIdentifier,
+		Description:        "x > y",
+	}
+	url := config.GetAuthServer().BaseURL + "/api/v1/admin/resources/" + strconv.FormatInt(res.Id, 10)
+	resp := makeAPIRequest(t, "PUT", url, accessToken, updateReq)
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	var errResp api.ErrorResponse
+	_ = json.NewDecoder(resp.Body).Decode(&errResp)
+	assert.Equal(t, "validator.description.angle_brackets", errResp.ErrorCode)
+
+	// The old sanitizer rewrote a bare ">" to the literal "&gt;" and stored it; nothing is stored
+	// now.
+	stored, err := database.GetResourceById(context.Background(), nil, res.Id)
+	assert.NoError(t, err)
+	assert.Equal(t, "Original", stored.Description)
+}
+
+// TestAPIResourceUpdatePut_AmpersandsAndQuotesStoredVerbatim is the accepted twin.
+func TestAPIResourceUpdatePut_AmpersandsAndQuotesStoredVerbatim(t *testing.T) {
+	accessToken, _ := createAdminClientWithToken(t)
+
+	res := createTestResource(t, "api-test-update-verbatim-"+fake.LetterN(6), "Original")
+	defer func() { _ = database.DeleteResource(context.Background(), nil, res.Id) }()
+
+	updateReq := api.UpdateResourceRequest{
+		ResourceIdentifier: res.ResourceIdentifier,
+		Description:        `Tom & Jerry said "hi"`,
+	}
+	url := config.GetAuthServer().BaseURL + "/api/v1/admin/resources/" + strconv.FormatInt(res.Id, 10)
+	resp := makeAPIRequest(t, "PUT", url, accessToken, updateReq)
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+	stored, err := database.GetResourceById(context.Background(), nil, res.Id)
+	assert.NoError(t, err)
+	assert.Equal(t, `Tom & Jerry said "hi"`, stored.Description)
+}

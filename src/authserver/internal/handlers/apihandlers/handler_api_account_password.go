@@ -1,0 +1,142 @@
+package apihandlers
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"net/http"
+	"strings"
+
+	"github.com/leodip/goiabada/authserver/internal/apimapping"
+	"github.com/leodip/goiabada/authserver/internal/audit"
+	"github.com/leodip/goiabada/authserver/internal/middleware"
+	"github.com/leodip/goiabada/authserver/internal/models"
+	"github.com/leodip/goiabada/authserver/internal/passwordhash"
+	"github.com/leodip/goiabada/authserver/internal/revocation"
+	"github.com/leodip/goiabada/core/api"
+)
+
+// accountPasswordDatabase is what the account password endpoint needs: the caller's user row and
+// the hash write.
+//
+// It embeds the revocation port because a password change revokes the credentials issued under
+// the old one.
+type accountPasswordDatabase interface {
+	revocation.Database
+
+	GetUserBySubject(ctx context.Context, tx *sql.Tx, subject string) (*models.User, error)
+	SetUserPasswordHash(ctx context.Context, tx *sql.Tx, userId int64, passwordHash string) error
+}
+
+// HandleAPIAccountPasswordPut - PUT /api/v1/account/password
+func HandleAPIAccountPasswordPut(
+	database accountPasswordDatabase,
+	passwordValidator PasswordValidator,
+	auditLogger AuditLogger,
+	credentialFailures CredentialFailureRecorder,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Token and scope are enforced by middleware; extract validated token
+		jwtToken, ok := middleware.GetValidatedToken(r)
+		if !ok {
+			writeJSONError(w, "Access token required", "ACCESS_TOKEN_REQUIRED", http.StatusUnauthorized)
+			return
+		}
+
+		subject := jwtToken.GetStringClaim("sub")
+		if strings.TrimSpace(subject) == "" {
+			writeJSONError(w, "Invalid token subject", "INVALID_SUBJECT", http.StatusUnauthorized)
+			return
+		}
+
+		// Decode request
+		var req api.UpdateAccountPasswordRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSONError(w, "Invalid request body", "INVALID_REQUEST_BODY", http.StatusBadRequest)
+			return
+		}
+
+		// Validate required fields
+		if strings.TrimSpace(req.CurrentPassword) == "" {
+			writeJSONError(w, "Current password is required.", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+		if strings.TrimSpace(req.NewPassword) == "" {
+			writeJSONError(w, "New password is required.", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		// Load user
+		user, err := database.GetUserBySubject(r.Context(), nil, subject)
+		if err != nil {
+			writeInternalServerError(w, r, err)
+			return
+		}
+		if user == nil {
+			writeJSONError(w, "User not found", "NOT_FOUND", http.StatusNotFound)
+			return
+		}
+
+		// Verify current password
+		if !passwordhash.Verify(user.PasswordHash, req.CurrentPassword) {
+			// The only branch that is a guess at the password, which is why it is the only one
+			// that spends the budget shared with PUT /api/v1/account/otp. A missing token, a
+			// blank subject, an undecodable body, a missing field and an unknown user are all
+			// refused above without comparing anything, so charging them would let a caller
+			// spend a budget without ever attempting the credential (#219).
+			credentialFailures.RecordCredentialFailure(r)
+
+			writeJSONError(w, "Authentication failed. Check your current password and try again.", "AUTHENTICATION_FAILED", http.StatusBadRequest)
+			return
+		}
+
+		// Validate new password against policy
+		if validatePasswordErr := passwordValidator.ValidatePassword(r.Context(), req.NewPassword); validatePasswordErr != nil {
+			writeValidationError(w, r, validatePasswordErr)
+			return
+		}
+
+		// Hash and update
+		passwordHash, err := passwordhash.Hash(req.NewPassword)
+		if err != nil {
+			writeInternalServerError(w, r, err)
+			return
+		}
+
+		// The ONE site that preserves a session (#106 decision 4): the user changing their own
+		// password should not be logged out of the client they are doing it from. exceptSid
+		// comes from the validated token's own sid claim, so it cannot be chosen by the caller.
+		//
+		// It is empty for a bearer that carries no sid, which after decision 9 means any
+		// offline or ROPC access token. That is correct rather than a gap: such a token proves
+		// no live session to preserve, so the change revokes everything, which is the
+		// conservative direction.
+		exceptSid := strings.TrimSpace(jwtToken.GetStringClaim("sid"))
+
+		// Narrow write, not a full-row UpdateUser: the user model was loaded before the
+		// password was validated, so writing every column back would undo a concurrent admin
+		// disable (decision 14).
+		result, err := revocation.RevokeUserAuthStateTx(r.Context(), database, user.Id, exceptSid,
+			func(tx *sql.Tx) error {
+				return database.SetUserPasswordHash(r.Context(), tx, user.Id, passwordHash)
+			})
+		if err != nil {
+			writeInternalServerError(w, r, err)
+			return
+		}
+
+		// Both events, after commit. The pre-existing one is unchanged, per decision 7: every
+		// existing event stays exactly as it is, and the revocation gets its own so revocations
+		// are queryable as a class rather than spread across four generic event types.
+		auditLogger.Log(r.Context(), audit.AuditChangedPassword, map[string]interface{}{
+			"userId":       user.Id,
+			"loggedInUser": subject,
+		})
+		revocation.LogRevokedUserAuthState(r.Context(), auditLogger, user.Id,
+			revocation.RevocationReasonPasswordChange, subject, result)
+
+		// Response
+		resp := api.UpdateUserResponse{User: *apimapping.ToUserResponse(user)}
+		writeJSON(w, r, http.StatusOK, resp)
+	}
+}

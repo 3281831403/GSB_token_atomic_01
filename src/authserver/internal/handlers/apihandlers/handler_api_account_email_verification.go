@@ -1,0 +1,243 @@
+package apihandlers
+
+import (
+	"context"
+	"crypto/subtle"
+	"database/sql"
+	"encoding/json"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/leodip/goiabada/authserver/internal/apimapping"
+	"github.com/leodip/goiabada/authserver/internal/audit"
+	"github.com/leodip/goiabada/authserver/internal/config"
+	"github.com/leodip/goiabada/authserver/internal/constants"
+	"github.com/leodip/goiabada/authserver/internal/emaildelivery"
+	"github.com/leodip/goiabada/authserver/internal/encryption"
+	"github.com/leodip/goiabada/authserver/internal/middleware"
+	"github.com/leodip/goiabada/authserver/internal/models"
+	"github.com/leodip/goiabada/core/api"
+	"github.com/leodip/goiabada/core/errs"
+	"github.com/leodip/goiabada/core/i18n"
+)
+
+// accountEmailVerificationDatabase is what the account email verification endpoints need: the
+// caller's own user row.
+type accountEmailVerificationDatabase interface {
+	GetUserBySubject(ctx context.Context, tx *sql.Tx, subject string) (*models.User, error)
+	UpdateUser(ctx context.Context, tx *sql.Tx, user *models.User) error
+}
+
+// HandleAPIAccountEmailVerificationSendPost - POST /api/v1/account/email/verification/send
+func HandleAPIAccountEmailVerificationSendPost(
+	httpHelper HttpHelper,
+	database accountEmailVerificationDatabase,
+	emailSender EmailSender,
+	auditLogger AuditLogger,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Auth and scope are enforced by middleware; extract validated token
+		jwtToken, ok := middleware.GetValidatedToken(r)
+		if !ok {
+			writeJSONError(w, "Access token required", "ACCESS_TOKEN_REQUIRED", http.StatusUnauthorized)
+			return
+		}
+
+		subject := jwtToken.GetStringClaim("sub")
+		if strings.TrimSpace(subject) == "" {
+			writeJSONError(w, "Invalid token subject", "INVALID_SUBJECT", http.StatusUnauthorized)
+			return
+		}
+
+		settings := r.Context().Value(constants.ContextKeySettings).(*models.Settings)
+		if !settings.SMTPEnabled {
+			writeJSONError(w, "SMTP is not enabled", "SMTP_NOT_ENABLED", http.StatusBadRequest)
+			return
+		}
+
+		user, err := database.GetUserBySubject(r.Context(), nil, subject)
+		if err != nil {
+			writeInternalServerError(w, r, errs.Wrap(err, "Failed to get user by subject in email verification send (first call)"), "subject", subject)
+			return
+		}
+		if user == nil {
+			writeJSONError(w, "User not found", "NOT_FOUND", http.StatusNotFound)
+			return
+		}
+
+		// If already verified, inform client
+		if user.EmailVerified {
+			resp := api.AccountEmailVerificationSendResponse{EmailVerified: true}
+			writeJSON(w, r, http.StatusOK, resp)
+			return
+		}
+
+		// Enforce resend cooldown
+		if len(user.EmailVerificationCodeEncrypted) > 0 && user.EmailVerificationCodeIssuedAt.Valid {
+			const waitTime = 60 * time.Second
+			remaining := int(user.EmailVerificationCodeIssuedAt.Time.Add(waitTime).Sub(time.Now().UTC()).Seconds())
+			if remaining > 0 {
+				resp := api.AccountEmailVerificationSendResponse{TooManyRequests: true, WaitInSeconds: remaining}
+				writeJSON(w, r, http.StatusOK, resp)
+				return
+			}
+		}
+
+		// Generate code and store encrypted
+		verificationCode := generateEmailVerificationCode()
+		encrypted, err := encryption.EncryptData(verificationCode)
+		if err != nil {
+			writeInternalServerError(w, r, errs.Wrap(err, "Failed to encrypt verification code"))
+			return
+		}
+		user.EmailVerificationCodeEncrypted = encrypted
+		user.EmailVerificationCodeIssuedAt = sql.NullTime{Time: time.Now().UTC(), Valid: true}
+		if updateUserErr := database.UpdateUser(r.Context(), nil, user); updateUserErr != nil {
+			writeInternalServerError(w, r, errs.Wrap(updateUserErr, "Failed to update user with verification code"), "user_id", user.Id)
+			return
+		}
+
+		// Render email content
+		bind := map[string]interface{}{
+			"name":             user.GetFullName(),
+			"link":             config.GetAdminConsole().BaseURL + "/account/email-verification",
+			"verificationCode": verificationCode,
+		}
+		emailReq := r.WithContext(i18n.WithLocale(r.Context(), true, user.Locale, "en"))
+		buf, err := httpHelper.RenderTemplateToBuffer(emailReq, "/layouts/email_layout.html", "/emails/email_verification.html", bind)
+		if err != nil {
+			writeInternalServerError(w, r, errs.Wrap(err, "Failed to render email template"), "user_id", user.Id)
+			return
+		}
+
+		input := &emaildelivery.SendEmailInput{
+			To:       user.Email,
+			Subject:  i18n.T(emailReq.Context(), "email.verification.subject", map[string]any{"code": verificationCode}),
+			HtmlBody: buf.String(),
+		}
+		if err := emailSender.SendEmail(r.Context(), input); err != nil {
+			writeInternalServerError(w, r, errs.Wrap(err, "Failed to send verification email"), "user_id", user.Id, "email", user.Email)
+			return
+		}
+
+		// Audit
+		auditLogger.Log(r.Context(), audit.AuditSentEmailVerificationMessage, map[string]interface{}{
+			"userId":           user.Id,
+			"emailDestination": user.Email,
+			"loggedInUser":     subject,
+		})
+
+		// Response
+		resp := api.AccountEmailVerificationSendResponse{
+			EmailVerificationSent: true,
+			EmailDestination:      user.Email,
+		}
+		writeJSON(w, r, http.StatusOK, resp)
+	}
+}
+
+// HandleAPIAccountEmailVerificationPost - POST /api/v1/account/email/verification
+func HandleAPIAccountEmailVerificationPost(
+	database accountEmailVerificationDatabase,
+	auditLogger AuditLogger,
+	credentialFailures CredentialFailureRecorder,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Auth and scope are enforced by middleware; extract validated token
+		jwtToken, ok := middleware.GetValidatedToken(r)
+		if !ok {
+			writeJSONError(w, "Access token required", "ACCESS_TOKEN_REQUIRED", http.StatusUnauthorized)
+			return
+		}
+
+		subject := jwtToken.GetStringClaim("sub")
+		if strings.TrimSpace(subject) == "" {
+			writeJSONError(w, "Invalid token subject", "INVALID_SUBJECT", http.StatusUnauthorized)
+			return
+		}
+
+		settings := r.Context().Value(constants.ContextKeySettings).(*models.Settings)
+		if !settings.SMTPEnabled {
+			writeJSONError(w, "SMTP is not enabled", "SMTP_NOT_ENABLED", http.StatusBadRequest)
+			return
+		}
+
+		var req api.VerifyAccountEmailRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSONError(w, "Invalid request body", "INVALID_REQUEST_BODY", http.StatusBadRequest)
+			return
+		}
+		code := strings.TrimSpace(req.VerificationCode)
+
+		user, err := database.GetUserBySubject(r.Context(), nil, subject)
+		if err != nil {
+			writeInternalServerError(w, r, err)
+			return
+		}
+		if user == nil {
+			writeJSONError(w, "User not found", "NOT_FOUND", http.StatusNotFound)
+			return
+		}
+
+		if user.EmailVerified {
+			// Already verified; return current state
+			resp := api.UpdateUserResponse{User: *apimapping.ToUserResponse(user)}
+			writeJSON(w, r, http.StatusOK, resp)
+			return
+		}
+
+		storedCode, err := encryption.DecryptData(user.EmailVerificationCodeEncrypted)
+		if err != nil {
+			// Treat as mismatch
+			storedCode = ""
+		}
+
+		// Constant-time, and unlike its siblings this comparison is reached on every guess:
+		// the reset-password code, client secrets and HOTP all compare with
+		// subtle.ConstantTimeCompare already. Uppercasing the submission keeps the
+		// case-insensitive input the single-case alphabet relies on, and drops only exotic
+		// Unicode foldings that no generated code can contain.
+		//
+		// The emptiness check is not redundant. Decryption failure above leaves storedCode
+		// empty, and two empty strings compare equal under both this and the EqualFold that
+		// preceded it, so without it the request is refused only by the IssuedAt check
+		// behind the comparison (#219).
+		codeMatches := len(storedCode) > 0 && len(code) > 0 &&
+			subtle.ConstantTimeCompare([]byte(storedCode), []byte(strings.ToUpper(code))) == 1
+
+		if !codeMatches || !user.EmailVerificationCodeIssuedAt.Valid ||
+			user.EmailVerificationCodeIssuedAt.Time.Add(5*time.Minute).Before(time.Now().UTC()) {
+
+			// The only branch that is a guess against the code. A missing token, a blank
+			// subject, disabled SMTP and an unknown user are refused before anything is
+			// compared, so charging them would let a caller spend a budget without ever
+			// attempting the credential.
+			credentialFailures.RecordCredentialFailure(r)
+
+			auditLogger.Log(r.Context(), audit.AuditFailedEmailVerificationCode, map[string]interface{}{
+				"userId":       user.Id,
+				"loggedInUser": subject,
+			})
+
+			writeJSONError(w, "Invalid or expired verification code", "INVALID_OR_EXPIRED_VERIFICATION_CODE", http.StatusBadRequest)
+			return
+		}
+
+		user.EmailVerified = true
+		user.EmailVerificationCodeEncrypted = nil
+		user.EmailVerificationCodeIssuedAt = sql.NullTime{Valid: false}
+		if err := database.UpdateUser(r.Context(), nil, user); err != nil {
+			writeInternalServerError(w, r, err)
+			return
+		}
+
+		auditLogger.Log(r.Context(), audit.AuditVerifiedEmail, map[string]interface{}{
+			"userId":       user.Id,
+			"loggedInUser": subject,
+		})
+
+		resp := api.UpdateUserResponse{User: *apimapping.ToUserResponse(user)}
+		writeJSON(w, r, http.StatusOK, resp)
+	}
+}

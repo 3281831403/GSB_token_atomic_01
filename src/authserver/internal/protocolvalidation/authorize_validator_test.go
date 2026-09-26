@@ -1,0 +1,1616 @@
+package protocolvalidation
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"testing"
+
+	mocks_data "github.com/leodip/goiabada/authserver/internal/data/mocks"
+	"github.com/leodip/goiabada/authserver/internal/models"
+	"github.com/leodip/goiabada/core/constants"
+	"github.com/leodip/goiabada/core/customerrors"
+	"github.com/leodip/goiabada/core/i18n"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
+)
+
+func TestValidateScopes(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	tests := []struct {
+		name          string
+		scope         string
+		mockSetup     func()
+		expectedError string
+	}{
+		{
+			name:          "Empty scope",
+			scope:         "",
+			expectedError: "The 'scope' parameter is missing. Ensure to include one or more scopes, separated by spaces. Scopes can be an OpenID Connect scope, a resource:permission scope, or a combination of both.",
+		},
+		{
+			name:          "Valid OpenID Connect scope",
+			scope:         "openid profile email",
+			expectedError: "",
+		},
+		{
+			name:          "Valid offline_access scope",
+			scope:         "offline_access",
+			expectedError: "",
+		},
+		{
+			// Scope values are case-sensitive (RFC 6749 section 3.3). This spelling used to be
+			// case-folded into offline_access and skipped; it is now some other scope, and not
+			// one in resource:permission form (#425).
+			name:          "Uppercase OFFLINE_ACCESS is not offline_access",
+			scope:         "OFFLINE_ACCESS",
+			expectedError: "Invalid scope format: 'OFFLINE_ACCESS'. Scopes must adhere to the resource-identifier:permission-identifier format. For instance: backend-service:create-product.",
+		},
+		{
+			name:  "Invalid userinfo scope",
+			scope: constants.AuthServerResourceIdentifier + ":" + constants.UserinfoPermissionIdentifier,
+			expectedError: "The 'authserver:userinfo' scope is automatically included in the access token when an OpenID Connect scope is present. " +
+				"There's no need to request it explicitly. Please remove it from your request.",
+		},
+		{
+			name:          "Invalid scope format",
+			scope:         "invalid:scope:format",
+			expectedError: "Invalid scope format: 'invalid:scope:format'. Scopes must adhere to the resource-identifier:permission-identifier format. For instance: backend-service:create-product.",
+		},
+		{
+			name:  "Valid resource:permission scope",
+			scope: "resource1:permission1",
+			mockSetup: func() {
+				mockDB.On("GetResourceByResourceIdentifier", mock.Anything, mock.Anything, "resource1").Return(&models.Resource{Id: 1}, nil)
+				mockDB.On("GetPermissionsByResourceId", mock.Anything, mock.Anything, int64(1)).Return([]models.Permission{{PermissionIdentifier: "permission1"}}, nil)
+			},
+			expectedError: "",
+		},
+		{
+			name:  "Invalid resource",
+			scope: "invalid-resource:permission",
+			mockSetup: func() {
+				mockDB.On("GetResourceByResourceIdentifier", mock.Anything, mock.Anything, "invalid-resource").Return(nil, nil)
+			},
+			expectedError: "Invalid scope: 'invalid-resource:permission'. Could not find a resource with identifier 'invalid-resource'.",
+		},
+		{
+			name:  "Invalid permission",
+			scope: "resource1:invalid-permission",
+			mockSetup: func() {
+				mockDB.On("GetResourceByResourceIdentifier", mock.Anything, mock.Anything, "resource1").Return(&models.Resource{Id: 1}, nil)
+				mockDB.On("GetPermissionsByResourceId", mock.Anything, mock.Anything, int64(1)).Return([]models.Permission{{PermissionIdentifier: "valid-permission"}}, nil)
+			},
+			expectedError: "Scope 'resource1:invalid-permission' is invalid. The resource identified by 'resource1' does not have a permission with identifier 'invalid-permission'.",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.mockSetup != nil {
+				tt.mockSetup()
+			}
+
+			err := validator.ValidateScopes(context.Background(), tt.scope)
+
+			if tt.expectedError == "" {
+				assert.NoError(t, err)
+			} else {
+				assert.Error(t, err)
+				customErr := err.(*customerrors.ErrorDetail)
+				assert.Equal(t, tt.expectedError, customErr.GetDescription())
+			}
+		})
+	}
+}
+
+// A database failure while resolving a scope must propagate as an error (a 500), not be swallowed
+// into an invalid_scope denial: the two are indistinguishable to a client reading only the status
+// code, and a swallowed error would deny a legitimate authorization request for the duration of a
+// database fault. The token endpoint's client credentials arm pins the same property; this is the
+// authorize endpoint's, and both now run through one resolver (#124).
+func TestValidateScopes_DatabaseFailurePropagates(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(*mocks_data.Database)
+	}{
+		{
+			name: "GetResourceByResourceIdentifier error propagates",
+			setup: func(mockDB *mocks_data.Database) {
+				mockDB.On("GetResourceByResourceIdentifier", mock.Anything, mock.Anything, "billing-api").
+					Return(nil, errors.New("database is down"))
+			},
+		},
+		{
+			name: "GetPermissionsByResourceId error propagates",
+			setup: func(mockDB *mocks_data.Database) {
+				mockDB.On("GetResourceByResourceIdentifier", mock.Anything, mock.Anything, "billing-api").
+					Return(&models.Resource{Id: 1, ResourceIdentifier: "billing-api"}, nil)
+				mockDB.On("GetPermissionsByResourceId", mock.Anything, mock.Anything, int64(1)).
+					Return(nil, errors.New("database is down"))
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mockDB := mocks_data.NewDatabase(t)
+			tc.setup(mockDB)
+
+			err := NewAuthorizeValidator(mockDB).ValidateScopes(context.Background(), "billing-api:read")
+
+			assert.EqualError(t, err, "database is down")
+			_, isErrorDetail := err.(*customerrors.ErrorDetail)
+			assert.False(t, isErrorDetail, "a database failure must not be reported as an OAuth error")
+		})
+	}
+}
+
+func TestValidateClientAndRedirectURI_MissingClientId(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	input := ValidateClientAndRedirectURIInput{ClientId: "", RedirectURI: "http://example.com"}
+	err := validator.ValidateClientAndRedirectURI(context.Background(), &input)
+
+	assert.Error(t, err)
+	locErr := err.(*i18n.LocalizedError)
+	assert.Equal(t, i18n.ErrCodeAuthorizeClientIdMissing, locErr.Code)
+	assert.Equal(t, "The client_id parameter is missing.", locErr.EnglishFallback())
+}
+
+func TestValidateClientAndRedirectURI_NonExistentClient(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	mockDB.On("GetClientByClientIdentifier", mock.Anything, mock.Anything, "non-existent").Return(nil, nil)
+
+	input := ValidateClientAndRedirectURIInput{ClientId: "non-existent", RedirectURI: "http://example.com"}
+	err := validator.ValidateClientAndRedirectURI(context.Background(), &input)
+
+	assert.Error(t, err)
+	locErr := err.(*i18n.LocalizedError)
+	assert.Equal(t, i18n.ErrCodeAuthorizeClientNotFound, locErr.Code)
+	assert.Equal(t, "Invalid client_id parameter. The client does not exist.", locErr.EnglishFallback())
+}
+
+func TestValidateClientAndRedirectURI_DisabledClient(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	mockDB.On("GetClientByClientIdentifier", mock.Anything, mock.Anything, "disabled-client").Return(&models.Client{Enabled: false}, nil)
+
+	input := ValidateClientAndRedirectURIInput{ClientId: "disabled-client", RedirectURI: "http://example.com"}
+	err := validator.ValidateClientAndRedirectURI(context.Background(), &input)
+
+	assert.Error(t, err)
+	locErr := err.(*i18n.LocalizedError)
+	assert.Equal(t, i18n.ErrCodeAuthorizeClientDisabled, locErr.Code)
+	assert.Equal(t, "Invalid client_id parameter. The client is disabled.", locErr.EnglishFallback())
+}
+
+func TestValidateClientAndRedirectURI_ClientWithoutAuthorizationCodeFlow(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	mockDB.On("GetClientByClientIdentifier", mock.Anything, mock.Anything, "no-auth-code-client").Return(&models.Client{Enabled: true, AuthorizationCodeEnabled: false}, nil)
+
+	input := ValidateClientAndRedirectURIInput{ClientId: "no-auth-code-client", RedirectURI: "http://example.com"}
+	err := validator.ValidateClientAndRedirectURI(context.Background(), &input)
+
+	assert.Error(t, err)
+	locErr := err.(*i18n.LocalizedError)
+	assert.Equal(t, i18n.ErrCodeAuthorizeAuthCodeNotEnabled, locErr.Code)
+	assert.Equal(t, "Invalid client_id parameter. The client does not support the authorization code flow.", locErr.EnglishFallback())
+}
+
+func TestValidateClientAndRedirectURI_MissingRedirectURI(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	mockDB.On("GetClientByClientIdentifier", mock.Anything, mock.Anything, "valid-client").Return(&models.Client{Enabled: true, AuthorizationCodeEnabled: true}, nil)
+
+	input := ValidateClientAndRedirectURIInput{ClientId: "valid-client", RedirectURI: ""}
+	err := validator.ValidateClientAndRedirectURI(context.Background(), &input)
+
+	assert.Error(t, err)
+	locErr := err.(*i18n.LocalizedError)
+	assert.Equal(t, i18n.ErrCodeAuthorizeRedirectURIMissing, locErr.Code)
+	assert.Equal(t, "The redirect_uri parameter is missing.", locErr.EnglishFallback())
+}
+
+func TestValidateClientAndRedirectURI_ValidClientAndRedirectURI(t *testing.T) {
+	// The exhaustive loopback matching tables live with the helper in authserver/internal/urlutil. These
+	// cases cover only what a pure-function test cannot: that the validator is wired to it,
+	// and that the flow gate scoping port flexibility to the code flow holds (#41).
+	tests := []struct {
+		name         string
+		registered   string
+		requested    string
+		responseType string
+	}{
+		{
+			name:       "exact match",
+			registered: "http://example.com",
+			requested:  "http://example.com",
+		},
+		{
+			name:         "http loopback accepts any port on a code request",
+			registered:   "http://127.0.0.1/cb",
+			requested:    "http://127.0.0.1:54321/cb",
+			responseType: "code",
+		},
+		{
+			// RFC 6749 section 3.1.2: the endpoint URI "MAY include an
+			// 'application/x-www-form-urlencoded' formatted query component". The
+			// absolute-URI gate must not read a query as anything else.
+			name:       "a query component is permitted",
+			registered: "http://127.0.0.1/cb?a=1",
+			requested:  "http://127.0.0.1/cb?a=1",
+		},
+		{
+			// KEEP THIS. It is the row that catches the absolute-URI gate overshooting
+			// into rejecting a percent-encoded %23, which is an ordinary path character
+			// and not a fragment delimiter. Its value is invisible once the predicate is
+			// right, which is exactly why it is easy to delete as redundant.
+			name:       "a percent-encoded %23 is not a fragment",
+			registered: "http://127.0.0.1/cb%23frag",
+			requested:  "http://127.0.0.1/cb%23frag",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			mockDB := mocks_data.NewDatabase(t)
+			validator := NewAuthorizeValidator(mockDB)
+
+			client := &models.Client{
+				Enabled:                  true,
+				AuthorizationCodeEnabled: true,
+			}
+			mockDB.On("GetClientByClientIdentifier", mock.Anything, mock.Anything, "valid-client").Return(client, nil)
+			mockDB.On("ClientLoadRedirectURIs", mock.Anything, mock.Anything, client).Run(func(args mock.Arguments) {
+				client := args.Get(2).(*models.Client)
+				client.RedirectURIs = []models.RedirectURI{{URI: tc.registered}}
+			}).Return(nil)
+
+			input := ValidateClientAndRedirectURIInput{
+				ClientId:     "valid-client",
+				RedirectURI:  tc.requested,
+				ResponseType: tc.responseType,
+			}
+			err := validator.ValidateClientAndRedirectURI(context.Background(), &input)
+
+			assert.NoError(t, err)
+		})
+	}
+}
+
+func TestValidateClientAndRedirectURI_InvalidRedirectURI(t *testing.T) {
+	// Two distinct rejections are asserted here, which is why every row carries the exact
+	// message it expects rather than the table asserting one string: "not registered" and
+	// "not an absolute URI" are different diagnoses, and telling an administrator a URI is
+	// not registered when it plainly is sends them looking in the wrong place (#122).
+	const notRegistered = "Invalid redirect_uri parameter. The client does not have this redirect URI registered."
+	const notAbsolute = "Invalid redirect_uri parameter. The redirect URI must be an absolute URI: a scheme is required, a fragment is not permitted, percent-escapes must be well formed, and an http or https URI must name a host."
+
+	tests := []struct {
+		name         string
+		registered   string
+		requested    string
+		responseType string
+		wantMessage  string
+	}{
+		{
+			name:        "unregistered URI",
+			registered:  "http://example.com",
+			requested:   "http://invalid.com",
+			wantMessage: notRegistered,
+		},
+		{
+			// Must differ only in port. Pairing it with an unrelated requested URI would
+			// pass even if the scheme and host gates were deleted.
+			name:         "port flexibility is not granted to non-loopback hosts",
+			registered:   "https://example.com/cb",
+			requested:    "https://example.com:8443/cb",
+			responseType: "code",
+			wantMessage:  notRegistered,
+		},
+		{
+			name:         "implicit, token",
+			registered:   "http://127.0.0.1/cb",
+			requested:    "http://127.0.0.1:54321/cb",
+			responseType: "token",
+			wantMessage:  notRegistered,
+		},
+		{
+			name:         "implicit, id_token",
+			registered:   "http://127.0.0.1/cb",
+			requested:    "http://127.0.0.1:54321/cb",
+			responseType: "id_token",
+			wantMessage:  notRegistered,
+		},
+		{
+			// Rejected by ValidateRequest later, so this asserts that *this* function does
+			// not grant flexibility on a parameter it has not validated.
+			name:         "hybrid on an unvalidated parameter",
+			registered:   "http://127.0.0.1/cb",
+			requested:    "http://127.0.0.1:54321/cb",
+			responseType: "code token",
+			wantMessage:  notRegistered,
+		},
+		{
+			// "code foo" and "code code" are accepted as valid by ValidateRequest, which
+			// counts recognised flags and reaches 1. The token-sequence gate is the only
+			// thing standing between them and port flexibility.
+			name:         "unrecognised token alongside code",
+			registered:   "http://127.0.0.1/cb",
+			requested:    "http://127.0.0.1:54321/cb",
+			responseType: "code foo",
+			wantMessage:  notRegistered,
+		},
+		{
+			name:         "duplicate code token",
+			registered:   "http://127.0.0.1/cb",
+			requested:    "http://127.0.0.1:54321/cb",
+			responseType: "code code",
+			wantMessage:  notRegistered,
+		},
+
+		// The absolute-URI gate (#122). EVERY ROW BELOW REGISTERS THE VALUE IT REQUESTS,
+		// and that is the whole difficulty of this seam: pairing a legitimate registered
+		// URI with a hostile requested one produces a case the not-registered branch
+		// refuses anyway, so it would pass with the gate deleted and prove nothing. These
+		// rows are refusable only by the gate.
+		//
+		// The exhaustive table for the predicate lives in authserver/internal/urlutil. These are the thin
+		// proof that this validator consults it, one row per rule the gate enforces.
+		{
+			name:        "scheme-relative, the reported shape",
+			registered:  "//evil.example/cb",
+			requested:   "//evil.example/cb",
+			wantMessage: notAbsolute,
+		},
+		{
+			name:        "path-absolute with no scheme",
+			registered:  "/relative/cb",
+			requested:   "/relative/cb",
+			wantMessage: notAbsolute,
+		},
+		{
+			// Carries a scheme, so it catches an implementation that only tests for one.
+			name:        "fragment",
+			registered:  "http://127.0.0.1/cb#frag",
+			requested:   "http://127.0.0.1/cb#frag",
+			wantMessage: notAbsolute,
+		},
+		{
+			// Varies from the accepted "http://127.0.0.1/cb" by the fragment delimiter
+			// alone. url.URL.Fragment is "" for both, so this is the row that fails an
+			// implementation testing the parsed fragment instead of the raw string.
+			name:        "bare trailing fragment delimiter",
+			registered:  "http://127.0.0.1/cb#",
+			requested:   "http://127.0.0.1/cb#",
+			wantMessage: notAbsolute,
+		},
+		{
+			// Decision 8's sharpest member. This IS a valid RFC 3986 absolute-URI, so the
+			// grammar rule accepts it and only the empty-host rule refuses it: Go parses
+			// it with no host and a browser resolves the emitted Location to
+			// evil.example, on a production https deployment. This row is what proves the
+			// validator inherits the host rule and not merely the grammar one.
+			name:        "https with an empty authority",
+			registered:  "https:///evil.example/cb",
+			requested:   "https:///evil.example/cb",
+			wantMessage: notAbsolute,
+		},
+		{
+			// The single-slash shape, and also the configuration this change knowingly
+			// breaks: on an https deployment a browser resolves it to the named host, so
+			// it delivers codes today over cleartext.
+			name:        "http path-absolute with an empty authority",
+			registered:  "http:/evil.example/cb",
+			requested:   "http:/evil.example/cb",
+			wantMessage: notAbsolute,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			mockDB := mocks_data.NewDatabase(t)
+			validator := NewAuthorizeValidator(mockDB)
+
+			client := &models.Client{
+				Enabled:                  true,
+				AuthorizationCodeEnabled: true,
+			}
+			mockDB.On("GetClientByClientIdentifier", mock.Anything, mock.Anything, "valid-client").Return(client, nil)
+			// Maybe, not a mandatory expectation. mocks_data.NewDatabase registers
+			// AssertExpectations on cleanup, and the absolute-URI gate short-circuits
+			// before this load, so a mandatory expectation would fail every gate row for
+			// the wrong reason.
+			//
+			// This does not weaken those rows. With the gate deleted the load does happen,
+			// the registered value matches the requested one exactly, no error comes back,
+			// and require.Error below fails. Verified by mutation.
+			mockDB.On("ClientLoadRedirectURIs", mock.Anything, mock.Anything, client).Run(func(args mock.Arguments) {
+				client := args.Get(2).(*models.Client)
+				client.RedirectURIs = []models.RedirectURI{{URI: tc.registered}}
+			}).Return(nil).Maybe()
+
+			input := ValidateClientAndRedirectURIInput{
+				ClientId:     "valid-client",
+				RedirectURI:  tc.requested,
+				ResponseType: tc.responseType,
+			}
+			err := validator.ValidateClientAndRedirectURI(context.Background(), &input)
+
+			// require, not assert: on a regression err is nil, and the type assertion
+			// below would panic and take the remaining rows down with it.
+			require.Error(t, err)
+			locErr, ok := err.(*i18n.LocalizedError)
+			require.True(t, ok)
+
+			// The code and the sentence are asserted together because only the catalog
+			// entry ties them, and the handler keys off the code while the page shows the
+			// sentence. A row whose code says "not registered" and whose text says "not
+			// absolute" is the #122 diagnosis-swap this table exists to refuse, and after
+			// #213 that swap can happen in the catalog rather than in the validator.
+			wantCode := i18n.ErrCodeAuthorizeRedirectURINotRegistered
+			if tc.wantMessage == notAbsolute {
+				wantCode = i18n.ErrCodeAuthorizeRedirectURINotAbsolute
+			}
+			assert.Equal(t, wantCode, locErr.Code)
+			assert.Equal(t, tc.wantMessage, locErr.EnglishFallback())
+		})
+	}
+}
+
+func TestValidateRequest_InvalidResponseType(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	input := ValidateRequestInput{
+		ResponseType:        "invalid_type",
+		CodeChallengeMethod: "S256",
+		CodeChallenge:       "valid_challenge",
+	}
+	err := validator.ValidateRequest(&input)
+
+	assert.Error(t, err)
+	customErr := err.(*customerrors.ErrorDetail)
+	assert.Equal(t, "The authorization server does not support this response_type. Supported values: code, token, id_token, id_token token.", customErr.GetDescription())
+}
+
+func TestValidateRequest_ImplicitFlowNotEnabled(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	input := ValidateRequestInput{
+		ResponseType:         "token",
+		ImplicitGrantEnabled: false,
+	}
+	err := validator.ValidateRequest(&input)
+
+	assert.Error(t, err)
+	customErr := err.(*customerrors.ErrorDetail)
+	assert.Contains(t, customErr.GetDescription(), "The client is not authorized to use the implicit grant type.")
+	assert.Contains(t, customErr.GetDescription(), "admin console")
+}
+
+func TestValidateRequest_InvalidCodeChallengeMethod(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	// When PKCE is optional but provided, invalid method should be rejected
+	input := ValidateRequestInput{
+		ResponseType:        "code",
+		CodeChallengeMethod: "plain",
+		CodeChallenge:       "valid_challenge",
+		PKCERequired:        false,
+	}
+	err := validator.ValidateRequest(&input)
+
+	assert.Error(t, err)
+	customErr := err.(*customerrors.ErrorDetail)
+	assert.Equal(t, "Invalid code_challenge_method. Only 'S256' is supported.", customErr.GetDescription())
+}
+
+func TestValidateRequest_InvalidCodeChallengeMethod_PKCERequired(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	// When PKCE is required, missing or invalid method should show different message
+	input := ValidateRequestInput{
+		ResponseType:        "code",
+		CodeChallengeMethod: "plain",
+		CodeChallenge:       "valid_challenge",
+		PKCERequired:        true,
+	}
+	err := validator.ValidateRequest(&input)
+
+	assert.Error(t, err)
+	customErr := err.(*customerrors.ErrorDetail)
+	assert.Equal(t, "PKCE is required. Ensure code_challenge_method is set to 'S256'.", customErr.GetDescription())
+}
+
+func TestValidateRequest_CodeChallengeTooShort(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	// When PKCE is optional but provided, invalid challenge length should be rejected
+	input := ValidateRequestInput{
+		ResponseType:        "code",
+		CodeChallengeMethod: "S256",
+		CodeChallenge:       "short",
+		PKCERequired:        false,
+	}
+	err := validator.ValidateRequest(&input)
+
+	assert.Error(t, err)
+	customErr := err.(*customerrors.ErrorDetail)
+	assert.Equal(t, "The code_challenge parameter is incorrect. It should be 43 to 128 characters long.", customErr.GetDescription())
+}
+
+func TestValidateRequest_CodeChallengeTooShort_PKCERequired(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	// When PKCE is required, invalid challenge length shows different message
+	input := ValidateRequestInput{
+		ResponseType:        "code",
+		CodeChallengeMethod: "S256",
+		CodeChallenge:       "short",
+		PKCERequired:        true,
+	}
+	err := validator.ValidateRequest(&input)
+
+	assert.Error(t, err)
+	customErr := err.(*customerrors.ErrorDetail)
+	assert.Equal(t, "The code_challenge parameter is either missing or incorrect. It should be 43 to 128 characters long.", customErr.GetDescription())
+}
+
+func TestValidateRequest_CodeChallengeTooLong(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	// When PKCE is optional but provided, invalid challenge length should be rejected
+	input := ValidateRequestInput{
+		ResponseType:        "code",
+		CodeChallengeMethod: "S256",
+		CodeChallenge:       string(make([]byte, 129)),
+		PKCERequired:        false,
+	}
+	err := validator.ValidateRequest(&input)
+
+	assert.Error(t, err)
+	customErr := err.(*customerrors.ErrorDetail)
+	assert.Equal(t, "The code_challenge parameter is incorrect. It should be 43 to 128 characters long.", customErr.GetDescription())
+}
+
+func TestValidateRequest_CodeChallengeTooLong_PKCERequired(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	// When PKCE is required, invalid challenge length shows different message
+	input := ValidateRequestInput{
+		ResponseType:        "code",
+		CodeChallengeMethod: "S256",
+		CodeChallenge:       string(make([]byte, 129)),
+		PKCERequired:        true,
+	}
+	err := validator.ValidateRequest(&input)
+
+	assert.Error(t, err)
+	customErr := err.(*customerrors.ErrorDetail)
+	assert.Equal(t, "The code_challenge parameter is either missing or incorrect. It should be 43 to 128 characters long.", customErr.GetDescription())
+}
+
+func TestValidateRequest_InvalidResponseMode(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	input := ValidateRequestInput{
+		ResponseType:        "code",
+		CodeChallengeMethod: "S256",
+		CodeChallenge:       "a_valid_code_challenge_that_meets_length_requirements",
+		ResponseMode:        "invalid_mode",
+	}
+	err := validator.ValidateRequest(&input)
+
+	assert.Error(t, err)
+	customErr := err.(*customerrors.ErrorDetail)
+	assert.Equal(t, "Invalid response_mode parameter. Supported values are: query, fragment, form_post.", customErr.GetDescription())
+}
+
+// IsSupportedResponseMode is the single definition of the set, and it has two callers that must
+// agree: ValidateRequest above, and the authorize handler, which answers an unsupported value with
+// a local 400 instead of a redirect (#213 decision 11). The table lives here, with the set, so
+// neither caller re-tests the rule.
+func TestIsSupportedResponseMode(t *testing.T) {
+	// Absence is supported rather than merely tolerated: response_mode is OPTIONAL, and a request
+	// that omits it takes the default for its response type. A predicate that answered false here
+	// would make the handler refuse almost every authorization request this server receives.
+	assert.True(t, IsSupportedResponseMode(""), "an absent response_mode selects the default")
+
+	for _, mode := range []string{"query", "fragment", "form_post"} {
+		assert.True(t, IsSupportedResponseMode(mode), "%q is implemented and must be accepted", mode)
+	}
+
+	// jwt, query.jwt and friends are JARM (RFC 9101 family) modes this server does not implement,
+	// and they are what a real client is most likely to ask for by mistake. The rest cover the
+	// shapes a typo takes: wrong case, whitespace, a value that merely contains a supported one.
+	for _, mode := range []string{
+		"invalid_mode", "jwt", "query.jwt", "fragment.jwt", "form_post.jwt",
+		"QUERY", "Fragment", "form-post", "formpost", " query", "query ", "query fragment", "web_message",
+	} {
+		assert.False(t, IsSupportedResponseMode(mode), "%q is not implemented and must be refused", mode)
+	}
+}
+
+func TestValidateRequest_ValidInput(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	input := ValidateRequestInput{
+		ResponseType:        "code",
+		CodeChallengeMethod: "S256",
+		CodeChallenge:       "a_valid_code_challenge_that_meets_length_requirements",
+		ResponseMode:        "query",
+	}
+	err := validator.ValidateRequest(&input)
+
+	assert.NoError(t, err)
+}
+
+func TestValidateScopes_MultipleScopesInSingleRequest(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	mockDB.On("GetResourceByResourceIdentifier", mock.Anything, mock.Anything, "resource1").Return(&models.Resource{Id: 1}, nil)
+	mockDB.On("GetPermissionsByResourceId", mock.Anything, mock.Anything, int64(1)).Return([]models.Permission{{PermissionIdentifier: "permission1"}}, nil)
+	mockDB.On("GetResourceByResourceIdentifier", mock.Anything, mock.Anything, "resource2").Return(&models.Resource{Id: 2}, nil)
+	mockDB.On("GetPermissionsByResourceId", mock.Anything, mock.Anything, int64(2)).Return([]models.Permission{{PermissionIdentifier: "permission2"}}, nil)
+
+	scope := "openid profile resource1:permission1 resource2:permission2"
+	err := validator.ValidateScopes(context.Background(), scope)
+
+	assert.NoError(t, err)
+}
+
+func TestValidateScopes_WithLeadingAndTrailingSpaces(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	mockDB.On("GetResourceByResourceIdentifier", mock.Anything, mock.Anything, "resource1").Return(&models.Resource{Id: 1}, nil)
+	mockDB.On("GetResourceByResourceIdentifier", mock.Anything, mock.Anything, "resource1").Return(&models.Resource{Id: 1}, nil)
+	mockDB.On("GetPermissionsByResourceId", mock.Anything, mock.Anything, int64(1)).Return([]models.Permission{{PermissionIdentifier: "permission1"}}, nil)
+
+	scope := "  openid  profile  resource1:permission1  "
+	err := validator.ValidateScopes(context.Background(), scope)
+
+	assert.NoError(t, err)
+}
+
+func TestValidateClientAndRedirectURI_ExtremelyLongClientId(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	longClientId := strings.Repeat("a", 1000)
+	mockDB.On("GetClientByClientIdentifier", mock.Anything, mock.Anything, longClientId).Return(nil, nil)
+
+	input := ValidateClientAndRedirectURIInput{ClientId: longClientId, RedirectURI: "http://example.com"}
+	err := validator.ValidateClientAndRedirectURI(context.Background(), &input)
+
+	assert.Error(t, err)
+	locErr := err.(*i18n.LocalizedError)
+	assert.Equal(t, i18n.ErrCodeAuthorizeClientNotFound, locErr.Code)
+	assert.Equal(t, "Invalid client_id parameter. The client does not exist.", locErr.EnglishFallback())
+}
+
+func TestValidateClientAndRedirectURI_ExtremelyLongRedirectURI(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	client := &models.Client{
+		Enabled:                  true,
+		AuthorizationCodeEnabled: true,
+	}
+	mockDB.On("GetClientByClientIdentifier", mock.Anything, mock.Anything, "valid-client").Return(client, nil)
+	mockDB.On("ClientLoadRedirectURIs", mock.Anything, mock.Anything, client).Run(func(args mock.Arguments) {
+		client := args.Get(2).(*models.Client)
+		client.RedirectURIs = []models.RedirectURI{{URI: "http://example.com"}}
+	}).Return(nil)
+
+	longRedirectURI := "http://example.com/" + strings.Repeat("a", 2000)
+	input := ValidateClientAndRedirectURIInput{ClientId: "valid-client", RedirectURI: longRedirectURI}
+	err := validator.ValidateClientAndRedirectURI(context.Background(), &input)
+
+	assert.Error(t, err)
+	locErr := err.(*i18n.LocalizedError)
+	assert.Equal(t, i18n.ErrCodeAuthorizeRedirectURINotRegistered, locErr.Code)
+	assert.Equal(t, "Invalid redirect_uri parameter. The client does not have this redirect URI registered.", locErr.EnglishFallback())
+}
+
+func TestValidateRequest_EmptyResponseMode(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	input := ValidateRequestInput{
+		ResponseType:        "code",
+		CodeChallengeMethod: "S256",
+		CodeChallenge:       "a_valid_code_challenge_that_meets_length_requirements",
+		ResponseMode:        "",
+	}
+	err := validator.ValidateRequest(&input)
+
+	assert.NoError(t, err)
+}
+
+func TestValidateScopes_MaximumNumberOfScopes(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	// Assuming a theoretical maximum of 100 scopes
+	scopes := make([]string, 100)
+	for i := 0; i < 100; i++ {
+		resourceName := fmt.Sprintf("resource%d", i)
+		permissionName := fmt.Sprintf("permission%d", i)
+		scopes[i] = fmt.Sprintf("%s:%s", resourceName, permissionName)
+
+		mockDB.On("GetResourceByResourceIdentifier", mock.Anything, mock.Anything, resourceName).Return(&models.Resource{Id: int64(i)}, nil)
+		mockDB.On("GetPermissionsByResourceId", mock.Anything, mock.Anything, int64(i)).Return([]models.Permission{{PermissionIdentifier: permissionName}}, nil)
+	}
+
+	scope := strings.Join(scopes, " ")
+	err := validator.ValidateScopes(context.Background(), scope)
+
+	assert.NoError(t, err)
+}
+
+// ============================================================================
+// PKCE Optional Tests - Testing the optional PKCE behavior
+// ============================================================================
+
+func TestValidateRequest_PKCEOptional_NoPKCEParams_Success(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	// When PKCE is optional and no PKCE params provided, should succeed
+	input := ValidateRequestInput{
+		ResponseType:        "code",
+		CodeChallengeMethod: "",
+		CodeChallenge:       "",
+		ResponseMode:        "query",
+		PKCERequired:        false,
+	}
+	err := validator.ValidateRequest(&input)
+
+	assert.NoError(t, err)
+}
+
+func TestValidateRequest_PKCEOptional_ValidPKCEParams_Success(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	// When PKCE is optional and valid PKCE params provided, should succeed
+	input := ValidateRequestInput{
+		ResponseType:        "code",
+		CodeChallengeMethod: "S256",
+		CodeChallenge:       "a_valid_code_challenge_that_meets_length_requirements",
+		ResponseMode:        "query",
+		PKCERequired:        false,
+	}
+	err := validator.ValidateRequest(&input)
+
+	assert.NoError(t, err)
+}
+
+func TestValidateRequest_PKCEOptional_OnlyCodeChallenge_Fails(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	// When PKCE is optional but only code_challenge is provided (partial PKCE),
+	// should fail because pkceProvided is true but method is invalid
+	input := ValidateRequestInput{
+		ResponseType:        "code",
+		CodeChallengeMethod: "",
+		CodeChallenge:       "a_valid_code_challenge_that_meets_length_requirements",
+		ResponseMode:        "query",
+		PKCERequired:        false,
+	}
+	err := validator.ValidateRequest(&input)
+
+	assert.Error(t, err)
+	customErr := err.(*customerrors.ErrorDetail)
+	assert.Equal(t, "Invalid code_challenge_method. Only 'S256' is supported.", customErr.GetDescription())
+}
+
+func TestValidateRequest_PKCEOptional_OnlyCodeChallengeMethod_Fails(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	// When PKCE is optional but only code_challenge_method is provided (partial PKCE),
+	// should fail because pkceProvided is true but challenge is missing/invalid
+	input := ValidateRequestInput{
+		ResponseType:        "code",
+		CodeChallengeMethod: "S256",
+		CodeChallenge:       "",
+		ResponseMode:        "query",
+		PKCERequired:        false,
+	}
+	err := validator.ValidateRequest(&input)
+
+	assert.Error(t, err)
+	customErr := err.(*customerrors.ErrorDetail)
+	assert.Equal(t, "The code_challenge parameter is incorrect. It should be 43 to 128 characters long.", customErr.GetDescription())
+}
+
+func TestValidateRequest_PKCERequired_NoPKCEParams_Fails(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	// When PKCE is required and no PKCE params provided, should fail
+	input := ValidateRequestInput{
+		ResponseType:        "code",
+		CodeChallengeMethod: "",
+		CodeChallenge:       "",
+		ResponseMode:        "query",
+		PKCERequired:        true,
+	}
+	err := validator.ValidateRequest(&input)
+
+	assert.Error(t, err)
+	customErr := err.(*customerrors.ErrorDetail)
+	assert.Equal(t, "PKCE is required. Ensure code_challenge_method is set to 'S256'.", customErr.GetDescription())
+}
+
+func TestValidateRequest_PKCERequired_ValidPKCEParams_Success(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	// When PKCE is required and valid PKCE params provided, should succeed
+	input := ValidateRequestInput{
+		ResponseType:        "code",
+		CodeChallengeMethod: "S256",
+		CodeChallenge:       "a_valid_code_challenge_that_meets_length_requirements",
+		ResponseMode:        "query",
+		PKCERequired:        true,
+	}
+	err := validator.ValidateRequest(&input)
+
+	assert.NoError(t, err)
+}
+
+func TestValidateRequest_CodeChallenge_Exactly43Chars_Success(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	// Boundary test: exactly 43 characters should be valid
+	codeChallenge := strings.Repeat("a", 43)
+	input := ValidateRequestInput{
+		ResponseType:        "code",
+		CodeChallengeMethod: "S256",
+		CodeChallenge:       codeChallenge,
+		ResponseMode:        "query",
+		PKCERequired:        false,
+	}
+	err := validator.ValidateRequest(&input)
+
+	assert.NoError(t, err)
+}
+
+func TestValidateRequest_CodeChallenge_Exactly42Chars_Fails(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	// Boundary test: 42 characters should be invalid (just under minimum)
+	codeChallenge := strings.Repeat("a", 42)
+	input := ValidateRequestInput{
+		ResponseType:        "code",
+		CodeChallengeMethod: "S256",
+		CodeChallenge:       codeChallenge,
+		ResponseMode:        "query",
+		PKCERequired:        false,
+	}
+	err := validator.ValidateRequest(&input)
+
+	assert.Error(t, err)
+	customErr := err.(*customerrors.ErrorDetail)
+	assert.Equal(t, "The code_challenge parameter is incorrect. It should be 43 to 128 characters long.", customErr.GetDescription())
+}
+
+func TestValidateRequest_CodeChallenge_Exactly128Chars_Success(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	// Boundary test: exactly 128 characters should be valid
+	codeChallenge := strings.Repeat("a", 128)
+	input := ValidateRequestInput{
+		ResponseType:        "code",
+		CodeChallengeMethod: "S256",
+		CodeChallenge:       codeChallenge,
+		ResponseMode:        "query",
+		PKCERequired:        false,
+	}
+	err := validator.ValidateRequest(&input)
+
+	assert.NoError(t, err)
+}
+
+func TestValidateRequest_CodeChallenge_Exactly129Chars_Fails(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	// Boundary test: 129 characters should be invalid (just over maximum)
+	codeChallenge := strings.Repeat("a", 129)
+	input := ValidateRequestInput{
+		ResponseType:        "code",
+		CodeChallengeMethod: "S256",
+		CodeChallenge:       codeChallenge,
+		ResponseMode:        "query",
+		PKCERequired:        false,
+	}
+	err := validator.ValidateRequest(&input)
+
+	assert.Error(t, err)
+	customErr := err.(*customerrors.ErrorDetail)
+	assert.Equal(t, "The code_challenge parameter is incorrect. It should be 43 to 128 characters long.", customErr.GetDescription())
+}
+
+func TestValidateRequest_ValidResponseModes(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	validModes := []string{"query", "fragment", "form_post"}
+
+	for _, mode := range validModes {
+		t.Run(fmt.Sprintf("ResponseMode_%s", mode), func(t *testing.T) {
+			input := ValidateRequestInput{
+				ResponseType:        "code",
+				CodeChallengeMethod: "S256",
+				CodeChallenge:       "a_valid_code_challenge_that_meets_length_requirements",
+				ResponseMode:        mode,
+				PKCERequired:        false,
+			}
+			err := validator.ValidateRequest(&input)
+
+			assert.NoError(t, err)
+		})
+	}
+}
+
+// ============================================================================
+// Implicit Flow Tests
+// ============================================================================
+
+func TestValidateRequest_ImplicitFlow_ResponseTypeToken_Success(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	input := ValidateRequestInput{
+		ResponseType:         "token",
+		ImplicitGrantEnabled: true,
+		Scope:                "openid",
+	}
+	err := validator.ValidateRequest(&input)
+
+	assert.NoError(t, err)
+}
+
+func TestValidateRequest_ImplicitFlow_ResponseTypeIdToken_Success(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	input := ValidateRequestInput{
+		ResponseType:         "id_token",
+		ImplicitGrantEnabled: true,
+		Scope:                "openid",
+		Nonce:                "test-nonce-123",
+	}
+	err := validator.ValidateRequest(&input)
+
+	assert.NoError(t, err)
+}
+
+func TestValidateRequest_ImplicitFlow_ResponseTypeIdTokenToken_Success(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	input := ValidateRequestInput{
+		ResponseType:         "id_token token",
+		ImplicitGrantEnabled: true,
+		Scope:                "openid",
+		Nonce:                "test-nonce-123",
+	}
+	err := validator.ValidateRequest(&input)
+
+	assert.NoError(t, err)
+}
+
+func TestValidateRequest_ImplicitFlow_ResponseTypeTokenIdToken_OrderIndependent(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	// Test that "token id_token" works the same as "id_token token"
+	input := ValidateRequestInput{
+		ResponseType:         "token id_token",
+		ImplicitGrantEnabled: true,
+		Scope:                "openid",
+		Nonce:                "test-nonce-123",
+	}
+	err := validator.ValidateRequest(&input)
+
+	assert.NoError(t, err)
+}
+
+func TestValidateRequest_ImplicitFlow_IdToken_RequiresOpenIdScope(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	input := ValidateRequestInput{
+		ResponseType:         "id_token",
+		ImplicitGrantEnabled: true,
+		Scope:                "profile email", // Missing "openid" scope
+		Nonce:                "test-nonce-123",
+	}
+	err := validator.ValidateRequest(&input)
+
+	assert.Error(t, err)
+	customErr := err.(*customerrors.ErrorDetail)
+	assert.Equal(t, "invalid_request", customErr.GetCode())
+	assert.Equal(t, "The 'openid' scope is required when requesting an id_token.", customErr.GetDescription())
+}
+
+func TestValidateRequest_ImplicitFlow_IdTokenToken_RequiresOpenIdScope(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	input := ValidateRequestInput{
+		ResponseType:         "id_token token",
+		ImplicitGrantEnabled: true,
+		Scope:                "profile", // Missing "openid" scope
+		Nonce:                "test-nonce-123",
+	}
+	err := validator.ValidateRequest(&input)
+
+	assert.Error(t, err)
+	customErr := err.(*customerrors.ErrorDetail)
+	assert.Equal(t, "The 'openid' scope is required when requesting an id_token.", customErr.GetDescription())
+}
+
+func TestValidateRequest_ImplicitFlow_IdToken_RequiresNonce(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	input := ValidateRequestInput{
+		ResponseType:         "id_token",
+		ImplicitGrantEnabled: true,
+		Scope:                "openid",
+		Nonce:                "", // Missing nonce
+	}
+	err := validator.ValidateRequest(&input)
+
+	assert.Error(t, err)
+	customErr := err.(*customerrors.ErrorDetail)
+	assert.Equal(t, "invalid_request", customErr.GetCode())
+	assert.Equal(t, "The 'nonce' parameter is required for implicit flow when requesting an id_token.", customErr.GetDescription())
+}
+
+func TestValidateRequest_ImplicitFlow_IdTokenToken_RequiresNonce(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	input := ValidateRequestInput{
+		ResponseType:         "id_token token",
+		ImplicitGrantEnabled: true,
+		Scope:                "openid",
+		Nonce:                "", // Missing nonce
+	}
+	err := validator.ValidateRequest(&input)
+
+	assert.Error(t, err)
+	customErr := err.(*customerrors.ErrorDetail)
+	assert.Equal(t, "The 'nonce' parameter is required for implicit flow when requesting an id_token.", customErr.GetDescription())
+}
+
+func TestValidateRequest_ImplicitFlow_Token_DoesNotRequireNonce(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	// response_type=token does NOT require nonce (only id_token does)
+	input := ValidateRequestInput{
+		ResponseType:         "token",
+		ImplicitGrantEnabled: true,
+		Scope:                "openid",
+		Nonce:                "", // No nonce - should still work for token-only
+	}
+	err := validator.ValidateRequest(&input)
+
+	assert.NoError(t, err)
+}
+
+func TestValidateRequest_ImplicitFlow_NoPKCERequired(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	// Implicit flow should NOT require PKCE (PKCE is for authorization code flow only)
+	input := ValidateRequestInput{
+		ResponseType:         "token",
+		ImplicitGrantEnabled: true,
+		Scope:                "openid",
+		PKCERequired:         true, // Even if PKCE is "required", it shouldn't affect implicit flow
+		// No CodeChallenge or CodeChallengeMethod provided
+	}
+	err := validator.ValidateRequest(&input)
+
+	assert.NoError(t, err)
+}
+
+func TestValidateRequest_ImplicitFlow_ClientNotEnabled(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	testCases := []struct {
+		name         string
+		responseType string
+	}{
+		{"token", "token"},
+		{"id_token", "id_token"},
+		{"id_token token", "id_token token"},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			input := ValidateRequestInput{
+				ResponseType:         tc.responseType,
+				ImplicitGrantEnabled: false,
+				Scope:                "openid",
+				Nonce:                "test-nonce",
+			}
+			err := validator.ValidateRequest(&input)
+
+			assert.Error(t, err)
+			customErr := err.(*customerrors.ErrorDetail)
+			assert.Equal(t, "unauthorized_client", customErr.GetCode())
+			assert.Contains(t, customErr.GetDescription(), "The client is not authorized to use the implicit grant type.")
+			assert.Contains(t, customErr.GetDescription(), "admin console")
+		})
+	}
+}
+
+func TestValidateRequest_UnsupportedResponseTypeCombination_CodeToken(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	// "code token" is a hybrid flow - not supported
+	input := ValidateRequestInput{
+		ResponseType:         "code token",
+		ImplicitGrantEnabled: true,
+	}
+	err := validator.ValidateRequest(&input)
+
+	assert.Error(t, err)
+	customErr := err.(*customerrors.ErrorDetail)
+	assert.Equal(t, "unsupported_response_type", customErr.GetCode())
+	assert.Contains(t, customErr.GetDescription(), "Supported values: code, token, id_token, id_token token")
+}
+
+func TestValidateRequest_UnsupportedResponseTypeCombination_CodeIdToken(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	// "code id_token" is a hybrid flow - not supported
+	input := ValidateRequestInput{
+		ResponseType:         "code id_token",
+		ImplicitGrantEnabled: true,
+	}
+	err := validator.ValidateRequest(&input)
+
+	assert.Error(t, err)
+	customErr := err.(*customerrors.ErrorDetail)
+	assert.Equal(t, "unsupported_response_type", customErr.GetCode())
+}
+
+func TestValidateRequest_UnsupportedResponseTypeCombination_CodeIdTokenToken(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	// "code id_token token" is a hybrid flow - not supported
+	input := ValidateRequestInput{
+		ResponseType:         "code id_token token",
+		ImplicitGrantEnabled: true,
+	}
+	err := validator.ValidateRequest(&input)
+
+	assert.Error(t, err)
+	customErr := err.(*customerrors.ErrorDetail)
+	assert.Equal(t, "unsupported_response_type", customErr.GetCode())
+}
+
+func TestValidateRequest_MissingResponseType(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	input := ValidateRequestInput{
+		ResponseType: "",
+	}
+	err := validator.ValidateRequest(&input)
+
+	assert.Error(t, err)
+	customErr := err.(*customerrors.ErrorDetail)
+	assert.Equal(t, "invalid_request", customErr.GetCode())
+	assert.Equal(t, "The response_type parameter is missing.", customErr.GetDescription())
+}
+
+func TestValidateRequest_AllSupportedResponseTypes(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	testCases := []struct {
+		name           string
+		responseType   string
+		isImplicitFlow bool
+		requiresNonce  bool
+	}{
+		{"code", "code", false, false},
+		{"token", "token", true, false},
+		{"id_token", "id_token", true, true},
+		{"id_token token", "id_token token", true, true},
+		{"token id_token", "token id_token", true, true}, // Order independence
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			input := ValidateRequestInput{
+				ResponseType:         tc.responseType,
+				ImplicitGrantEnabled: true,
+				Scope:                "openid",
+				Nonce:                "test-nonce",
+			}
+			if !tc.isImplicitFlow {
+				// For code flow, provide PKCE
+				input.CodeChallengeMethod = "S256"
+				input.CodeChallenge = "a_valid_code_challenge_that_meets_length_requirements"
+			}
+
+			err := validator.ValidateRequest(&input)
+			assert.NoError(t, err, "response_type=%s should be valid", tc.responseType)
+		})
+	}
+}
+
+func TestValidateClientAndRedirectURI_ImplicitFlow_DoesNotRequireAuthCodeEnabled(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	client := &models.Client{
+		Id:                       1,
+		ClientIdentifier:         "implicit-only-client",
+		Enabled:                  true,
+		AuthorizationCodeEnabled: false, // Auth code disabled
+		RedirectURIs: []models.RedirectURI{
+			{ClientId: 1, URI: "https://example.com/callback"},
+		},
+	}
+
+	mockDB.On("GetClientByClientIdentifier", mock.Anything, mock.Anything, "implicit-only-client").Return(client, nil)
+	mockDB.On("ClientLoadRedirectURIs", mock.Anything, mock.Anything, client).Return(nil)
+
+	// For implicit flow, AuthorizationCodeEnabled is not required
+	input := ValidateClientAndRedirectURIInput{
+		ClientId:     "implicit-only-client",
+		RedirectURI:  "https://example.com/callback",
+		ResponseType: "token", // Implicit flow
+	}
+	err := validator.ValidateClientAndRedirectURI(context.Background(), &input)
+
+	assert.NoError(t, err)
+	mockDB.AssertExpectations(t)
+}
+
+func TestValidateClientAndRedirectURI_AuthCodeFlow_RequiresAuthCodeEnabled(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	client := &models.Client{
+		Id:                       1,
+		ClientIdentifier:         "implicit-only-client",
+		Enabled:                  true,
+		AuthorizationCodeEnabled: false, // Auth code disabled
+	}
+
+	mockDB.On("GetClientByClientIdentifier", mock.Anything, mock.Anything, "implicit-only-client").Return(client, nil)
+
+	// For auth code flow, AuthorizationCodeEnabled IS required
+	input := ValidateClientAndRedirectURIInput{
+		ClientId:     "implicit-only-client",
+		RedirectURI:  "https://example.com/callback",
+		ResponseType: "code", // Authorization code flow
+	}
+	err := validator.ValidateClientAndRedirectURI(context.Background(), &input)
+
+	assert.Error(t, err)
+	locErr := err.(*i18n.LocalizedError)
+	assert.Equal(t, i18n.ErrCodeAuthorizeAuthCodeNotEnabled, locErr.Code)
+	assert.Contains(t, locErr.EnglishFallback(), "does not support the authorization code flow")
+	mockDB.AssertExpectations(t)
+}
+
+// ============================================================================
+// ValidatePrompt Tests - OIDC prompt parameter validation
+// ============================================================================
+
+func TestValidatePrompt_EmptyString(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	result, err := validator.ValidatePrompt("")
+
+	assert.NoError(t, err)
+	assert.Equal(t, "", result)
+}
+
+func TestValidatePrompt_WhitespaceOnly(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	result, err := validator.ValidatePrompt("   ")
+
+	assert.NoError(t, err)
+	assert.Equal(t, "", result)
+}
+
+func TestValidatePrompt_SingleValue_None(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	result, err := validator.ValidatePrompt("none")
+
+	assert.NoError(t, err)
+	assert.Equal(t, "none", result)
+}
+
+func TestValidatePrompt_SingleValue_Login(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	result, err := validator.ValidatePrompt("login")
+
+	assert.NoError(t, err)
+	assert.Equal(t, "login", result)
+}
+
+func TestValidatePrompt_SingleValue_Consent(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	result, err := validator.ValidatePrompt("consent")
+
+	assert.NoError(t, err)
+	assert.Equal(t, "consent", result)
+}
+
+func TestValidatePrompt_MultipleValues_LoginConsent(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	result, err := validator.ValidatePrompt("login consent")
+
+	assert.NoError(t, err)
+	assert.Equal(t, "login consent", result)
+}
+
+func TestValidatePrompt_MultipleSpaces(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	result, err := validator.ValidatePrompt("login  consent")
+
+	assert.NoError(t, err)
+	assert.Equal(t, "login consent", result)
+}
+
+func TestValidatePrompt_LeadingTrailingSpaces(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	result, err := validator.ValidatePrompt("  login  ")
+
+	assert.NoError(t, err)
+	assert.Equal(t, "login", result)
+}
+
+func TestValidatePrompt_Duplicates(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	result, err := validator.ValidatePrompt("login login")
+
+	assert.NoError(t, err)
+	assert.Equal(t, "login", result)
+}
+
+func TestValidatePrompt_DuplicatesWithMultiple(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	result, err := validator.ValidatePrompt("login consent login")
+
+	assert.NoError(t, err)
+	assert.Equal(t, "login consent", result)
+}
+
+func TestValidatePrompt_InvalidValue(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	result, err := validator.ValidatePrompt("foo")
+
+	assert.Error(t, err)
+	customErr := err.(*customerrors.ErrorDetail)
+	assert.Equal(t, "invalid_request", customErr.GetCode())
+	assert.Equal(t, "Invalid prompt value: foo", customErr.GetDescription())
+	assert.Equal(t, "", result)
+}
+
+func TestValidatePrompt_CaseSensitive_Uppercase(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	result, err := validator.ValidatePrompt("LOGIN")
+
+	assert.Error(t, err)
+	customErr := err.(*customerrors.ErrorDetail)
+	assert.Equal(t, "invalid_request", customErr.GetCode())
+	assert.Equal(t, "Invalid prompt value: LOGIN", customErr.GetDescription())
+	assert.Equal(t, "", result)
+}
+
+func TestValidatePrompt_CaseSensitive_MixedCase(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	result, err := validator.ValidatePrompt("Login")
+
+	assert.Error(t, err)
+	customErr := err.(*customerrors.ErrorDetail)
+	assert.Equal(t, "invalid_request", customErr.GetCode())
+	assert.Equal(t, "Invalid prompt value: Login", customErr.GetDescription())
+	assert.Equal(t, "", result)
+}
+
+func TestValidatePrompt_SelectAccountNotImplemented(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	result, err := validator.ValidatePrompt("select_account")
+
+	assert.Error(t, err)
+	customErr := err.(*customerrors.ErrorDetail)
+	assert.Equal(t, "invalid_request", customErr.GetCode())
+	assert.Equal(t, "Invalid prompt value: select_account", customErr.GetDescription())
+	assert.Equal(t, "", result)
+}
+
+func TestValidatePrompt_ConflictNoneWithLogin(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	result, err := validator.ValidatePrompt("none login")
+
+	assert.Error(t, err)
+	customErr := err.(*customerrors.ErrorDetail)
+	assert.Equal(t, "invalid_request", customErr.GetCode())
+	assert.Equal(t, "prompt=none cannot be combined with other values", customErr.GetDescription())
+	assert.Equal(t, "", result)
+}
+
+func TestValidatePrompt_ConflictNoneWithConsent(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	result, err := validator.ValidatePrompt("none consent")
+
+	assert.Error(t, err)
+	customErr := err.(*customerrors.ErrorDetail)
+	assert.Equal(t, "invalid_request", customErr.GetCode())
+	assert.Equal(t, "prompt=none cannot be combined with other values", customErr.GetDescription())
+	assert.Equal(t, "", result)
+}
+
+func TestValidatePrompt_ConflictNoneWithLoginConsent(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	result, err := validator.ValidatePrompt("none login consent")
+
+	assert.Error(t, err)
+	customErr := err.(*customerrors.ErrorDetail)
+	assert.Equal(t, "invalid_request", customErr.GetCode())
+	assert.Equal(t, "prompt=none cannot be combined with other values", customErr.GetDescription())
+	assert.Equal(t, "", result)
+}
+
+func TestValidatePrompt_ConflictLoginNone_OrderMatters(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	// Order shouldn't matter for conflict detection
+	result, err := validator.ValidatePrompt("login none")
+
+	assert.Error(t, err)
+	customErr := err.(*customerrors.ErrorDetail)
+	assert.Equal(t, "invalid_request", customErr.GetCode())
+	assert.Equal(t, "prompt=none cannot be combined with other values", customErr.GetDescription())
+	assert.Equal(t, "", result)
+}
+
+func TestValidatePrompt_InvalidValueInCombination(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	result, err := validator.ValidatePrompt("login foo")
+
+	assert.Error(t, err)
+	customErr := err.(*customerrors.ErrorDetail)
+	assert.Equal(t, "invalid_request", customErr.GetCode())
+	assert.Equal(t, "Invalid prompt value: foo", customErr.GetDescription())
+	assert.Equal(t, "", result)
+}
+
+func TestValidateUnsupportedRequestParameters_HasRequest(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	err := validator.ValidateUnsupportedRequestParameters(&ValidateUnsupportedRequestParametersInput{
+		HasRequest: true,
+	})
+
+	assert.Error(t, err)
+	customErr := err.(*customerrors.ErrorDetail)
+	assert.Equal(t, "request_not_supported", customErr.GetCode())
+	assert.Equal(t, "The request parameter is not supported.", customErr.GetDescription())
+	assert.Equal(t, 400, customErr.GetHttpStatusCode())
+}
+
+func TestValidateUnsupportedRequestParameters_HasRequestURI(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	err := validator.ValidateUnsupportedRequestParameters(&ValidateUnsupportedRequestParametersInput{
+		HasRequestURI: true,
+	})
+
+	assert.Error(t, err)
+	customErr := err.(*customerrors.ErrorDetail)
+	assert.Equal(t, "request_uri_not_supported", customErr.GetCode())
+	assert.Equal(t, "The request_uri parameter is not supported.", customErr.GetDescription())
+	assert.Equal(t, 400, customErr.GetHttpStatusCode())
+}
+
+func TestValidateUnsupportedRequestParameters_BothFalse(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	err := validator.ValidateUnsupportedRequestParameters(&ValidateUnsupportedRequestParametersInput{})
+
+	assert.NoError(t, err)
+}
+
+func TestValidateUnsupportedRequestParameters_BothTrue_RequestWins(t *testing.T) {
+	// When both parameters are present, request_not_supported is returned (checked first).
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewAuthorizeValidator(mockDB)
+
+	err := validator.ValidateUnsupportedRequestParameters(&ValidateUnsupportedRequestParametersInput{
+		HasRequest:    true,
+		HasRequestURI: true,
+	})
+
+	assert.Error(t, err)
+	customErr := err.(*customerrors.ErrorDetail)
+	assert.Equal(t, "request_not_supported", customErr.GetCode())
+}

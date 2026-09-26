@@ -1,0 +1,78 @@
+package middleware
+
+import (
+	"context"
+	"log/slog"
+	"net/http"
+
+	"github.com/leodip/goiabada/adminconsole/internal/cache"
+	"github.com/leodip/goiabada/adminconsole/internal/constants"
+	"github.com/leodip/goiabada/core/errs"
+	"github.com/leodip/goiabada/core/i18n"
+)
+
+// MiddlewareSettingsCache adds settings to the request context by fetching from the cache
+func MiddlewareSettingsCache(settingsCache *cache.SettingsCache) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Fetch settings from cache (auto-refreshes if expired)
+			publicSettings, err := settingsCache.Get(r.Context())
+			if err != nil {
+				// The detail goes to the log rather than to the browser. It names the auth
+				// server's address and whatever the transport failed with, which the operator
+				// needs and the person looking at the page cannot act on, and until now it went
+				// only to the browser and was never logged at all.
+				//
+				// The error value, not err.Error(): slog's default handler renders it with %+v,
+				// so the core/errs stack it carries reaches the record. This site logged the
+				// text instead, to keep the volume down when the auth server is down and the
+				// cache, which does not cache a failure, produces one of these per request. That
+				// traded the one thing a 500 is logged for -- where in the cache's paths it
+				// failed -- against a line length, and left the console the only surface in the
+				// tree whose 500 record had no frames (#279 decisions 9 and 17).
+				//
+				// ErrorContext with no request_id attribute: the installed handler reads
+				// chi's request id off the context and appends it, so the correlation is
+				// the same and no call site can spell the key differently (#320 decision 2).
+				slog.ErrorContext(r.Context(), "unable to fetch settings from the auth server", "error", err)
+				http.Error(w, i18n.T(r.Context(), "adminconsole.error.settings_unavailable"), http.StatusInternalServerError)
+				return
+			}
+
+			// The issuer has one writer, the auth server that stamps it into the iss
+			// claim, so refuse to serve a request rather than guess it. The JWKS token parser
+			// in oauthclient compares an ID token's iss with this value exactly and refuses an
+			// empty one outright, so an expected issuer of "" would refuse every sign-in and
+			// sign every administrator out, locking them out of the console with nothing but
+			// a log line to say why, which is the thing this check exists to end (#285,
+			// #427). The only live route here is an auth server too old to serve the
+			// field: an absent settings
+			// row already answers 500 on its side, and the settings API refuses to store
+			// an issuer shorter than three characters.
+			//
+			// Both refusals answer in plain text rather than through the error page every
+			// other 500 in this module renders: that page reads settings off the context for
+			// its layout, and settings are the thing that is missing here.
+			//
+			// They are localized, which they could not be until i18n.MiddlewareLocale was
+			// moved ahead of this middleware on the application branch. Server.initMiddleware
+			// records why that reorder is safe.
+			if publicSettings.Issuer == "" {
+				// Decision 9's shape needs an error value to carry a stack, and this arm refuses
+				// a successful response rather than handling a failure, so it raises its own.
+				// Without it this is the one 500 in the tree logged with nothing to locate it by.
+				slog.ErrorContext(r.Context(), "unable to read the auth server's issuer",
+					"error", errs.New("the auth server did not report an issuer; it may be running an older version"))
+				http.Error(w, i18n.T(r.Context(), "adminconsole.error.issuer_missing"), http.StatusInternalServerError)
+				return
+			}
+
+			// The decoded response goes on the context as it stands. It used to be copied into a
+			// models.Settings first, a persistence model with 32 fields of which four were ever
+			// filled and the other 28 sat at their zero values, so a reader that reached for one
+			// got a plausible answer that had never come from anywhere (#350).
+			ctx := context.WithValue(r.Context(), constants.ContextKeySettings, publicSettings)
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	}
+}

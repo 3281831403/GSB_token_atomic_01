@@ -1,0 +1,195 @@
+package adminclienthandlers
+
+import (
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"sort"
+	"strconv"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/leodip/goiabada/adminconsole/internal/constants"
+	"github.com/leodip/goiabada/adminconsole/internal/handlers"
+	"github.com/leodip/goiabada/adminconsole/internal/oauthclient"
+	"github.com/leodip/goiabada/core/api"
+	coreconstants "github.com/leodip/goiabada/core/constants"
+	"github.com/leodip/goiabada/core/errs"
+	"github.com/leodip/goiabada/core/sessionstore"
+)
+
+// clientRedirectURIsAPI is what the redirect URIs page needs: the client, the global switches it
+// reads against, and the write.
+type clientRedirectURIsAPI interface {
+	GetClientById(ctx context.Context, accessToken string, clientId int64) (*api.ClientResponse, error)
+	GetSettingsGeneral(ctx context.Context, accessToken string) (*api.SettingsGeneralResponse, error)
+	UpdateClientRedirectURIs(ctx context.Context, accessToken string, clientId int64, request *api.UpdateClientRedirectURIsRequest) (*api.ClientResponse, error)
+}
+
+func HandleAdminClientRedirectURIsGet(
+	httpHelper handlers.HttpHelper,
+	httpSession sessionstore.Store,
+	apiClient clientRedirectURIsAPI,
+) http.HandlerFunc {
+
+	return func(w http.ResponseWriter, r *http.Request) {
+
+		idStr := chi.URLParam(r, "clientId")
+		if len(idStr) == 0 {
+			httpHelper.NotFound(w, r)
+			return
+		}
+
+		id, err := strconv.ParseInt(idStr, 10, 64)
+		if err != nil {
+			httpHelper.NotFound(w, r)
+			return
+		}
+		// Get JWT info from context to extract access token
+		jwtInfo, ok := r.Context().Value(constants.ContextKeyJwtInfo).(oauthclient.JwtInfo)
+		if !ok {
+			httpHelper.InternalServerError(w, r, errs.New("no JWT info found in context"))
+			return
+		}
+
+		clientResp, err := apiClient.GetClientById(r.Context(), jwtInfo.TokenResponse.AccessToken, id)
+		if err != nil {
+			handlers.HandleAPIError(httpHelper, w, r, err)
+			return
+		}
+		if clientResp == nil {
+			httpHelper.NotFound(w, r)
+			return
+		}
+
+		// The page is gated on whether the client redirects at all, not on the authorization
+		// code flow alone, so an implicit-only client can manage the one setting that makes it
+		// work (#250). Implicit is a three-state setting, per-client over a global default, and
+		// resolving it here rather than in the template keeps the template to one condition and
+		// keeps the inheritance rule in one place. The auth server's own gate on
+		// PUT /api/v1/admin/clients/{id}/redirect-uris asks the same question.
+		settingsResp, err := apiClient.GetSettingsGeneral(r.Context(), jwtInfo.TokenResponse.AccessToken)
+		if err != nil {
+			handlers.HandleAPIError(httpHelper, w, r, err)
+			return
+		}
+
+		implicitEnabled := settingsResp.ImplicitFlowEnabled
+		if clientResp.ImplicitGrantEnabled != nil {
+			implicitEnabled = *clientResp.ImplicitGrantEnabled
+		}
+
+		adminClientRedirectURIs := struct {
+			ClientId              int64
+			ClientIdentifier      string
+			CanManageRedirectURIs bool
+			RedirectURIs          map[int64]string
+			IsSystemLevelClient   bool
+		}{
+			ClientId:              clientResp.Id,
+			ClientIdentifier:      clientResp.ClientIdentifier,
+			CanManageRedirectURIs: clientResp.AuthorizationCodeEnabled || implicitEnabled,
+			IsSystemLevelClient:   clientResp.IsSystemLevelClient,
+		}
+
+		sort.Slice(clientResp.RedirectURIs, func(i, j int) bool {
+			return clientResp.RedirectURIs[i].URI < clientResp.RedirectURIs[j].URI
+		})
+
+		adminClientRedirectURIs.RedirectURIs = make(map[int64]string)
+		for _, redirectURI := range clientResp.RedirectURIs {
+			adminClientRedirectURIs.RedirectURIs[redirectURI.Id] = redirectURI.URI
+		}
+
+		sess, err := httpSession.Get(r, coreconstants.AdminConsoleSessionName)
+		if err != nil {
+			httpHelper.InternalServerError(w, r, err)
+			return
+		}
+
+		_, savedSuccessfully := sess.TakeFlash("savedSuccessfully")
+		if savedSuccessfully {
+			err = httpSession.Save(r, w, sess)
+			if err != nil {
+				httpHelper.InternalServerError(w, r, err)
+				return
+			}
+		}
+
+		bind := map[string]interface{}{
+			"client":            adminClientRedirectURIs,
+			"savedSuccessfully": savedSuccessfully,
+		}
+
+		err = httpHelper.RenderTemplate(w, r, "/layouts/menu_layout.html", "/admin_clients_redirect_uris.html", bind)
+		if err != nil {
+			httpHelper.InternalServerError(w, r, err)
+			return
+		}
+	}
+}
+
+func HandleAdminClientRedirectURIsPost(
+	httpHelper handlers.HttpHelper,
+	httpSession sessionstore.Store,
+	apiClient clientRedirectURIsAPI,
+) http.HandlerFunc {
+
+	return func(w http.ResponseWriter, r *http.Request) {
+
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			handlers.JsonBadRequestBody(httpHelper, w, r)
+			return
+		}
+
+		var data RedirectURIsPostInput
+		err = json.Unmarshal(body, &data)
+		if err != nil {
+			handlers.JsonBadRequestBody(httpHelper, w, r)
+			return
+		}
+
+		// Get JWT info from context to extract access token
+		jwtInfo, ok := r.Context().Value(constants.ContextKeyJwtInfo).(oauthclient.JwtInfo)
+		if !ok {
+			httpHelper.JsonError(w, r, errs.New("no JWT info found in context"))
+			return
+		}
+
+		// Build API request and call auth server
+		req := &api.UpdateClientRedirectURIsRequest{
+			RedirectURIs: data.RedirectURIs,
+		}
+		_, err = apiClient.UpdateClientRedirectURIs(r.Context(), jwtInfo.TokenResponse.AccessToken, data.ClientId, req)
+		if err != nil {
+			// Not JsonError directly: the API refuses a redirect URI with a 400 whose
+			// description names the offending value, and that sentence is the only thing
+			// telling the administrator which of their URIs was rejected and why. Handed
+			// to JsonError as a plain error it becomes a generic 500 and the sentence goes
+			// to the log instead of the screen (#122).
+			handlers.HandleAPIErrorJson(httpHelper, w, r, err)
+			return
+		}
+
+		sess, err := httpSession.Get(r, coreconstants.AdminConsoleSessionName)
+		if err != nil {
+			httpHelper.JsonError(w, r, err)
+			return
+		}
+
+		sess.SetFlash("savedSuccessfully", "true")
+		err = httpSession.Save(r, w, sess)
+		if err != nil {
+			httpHelper.JsonError(w, r, err)
+			return
+		}
+
+		result := struct {
+			Success bool
+		}{
+			Success: true,
+		}
+		httpHelper.EncodeJson(w, r, result)
+	}
+}

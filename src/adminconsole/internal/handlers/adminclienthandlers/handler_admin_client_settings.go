@@ -1,0 +1,250 @@
+package adminclienthandlers
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"strconv"
+	"strings"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/leodip/goiabada/adminconsole/internal/config"
+	"github.com/leodip/goiabada/adminconsole/internal/constants"
+	"github.com/leodip/goiabada/adminconsole/internal/handlers"
+	"github.com/leodip/goiabada/adminconsole/internal/oauthclient"
+	"github.com/leodip/goiabada/core/api"
+	coreconstants "github.com/leodip/goiabada/core/constants"
+	"github.com/leodip/goiabada/core/errs"
+	"github.com/leodip/goiabada/core/sessionstore"
+)
+
+// clientSettingsAPI is what the client settings page needs: the client, and the write.
+type clientSettingsAPI interface {
+	GetClientById(ctx context.Context, accessToken string, clientId int64) (*api.ClientResponse, error)
+	UpdateClient(ctx context.Context, accessToken string, clientId int64, request *api.UpdateClientSettingsRequest) (*api.ClientResponse, error)
+}
+
+func HandleAdminClientSettingsGet(
+	httpHelper handlers.HttpHelper,
+	httpSession sessionstore.Store,
+	apiClient clientSettingsAPI,
+) http.HandlerFunc {
+
+	return func(w http.ResponseWriter, r *http.Request) {
+
+		idStr := chi.URLParam(r, "clientId")
+		if len(idStr) == 0 {
+			httpHelper.NotFound(w, r)
+			return
+		}
+
+		id, err := strconv.ParseInt(idStr, 10, 64)
+		if err != nil {
+			httpHelper.NotFound(w, r)
+			return
+		}
+		// Get JWT info from context to extract access token
+		jwtInfo, ok := r.Context().Value(constants.ContextKeyJwtInfo).(oauthclient.JwtInfo)
+		if !ok {
+			httpHelper.InternalServerError(w, r, errs.New("no JWT info found in context"))
+			return
+		}
+
+		clientResp, err := apiClient.GetClientById(r.Context(), jwtInfo.TokenResponse.AccessToken, id)
+		if err != nil {
+			handlers.HandleAPIError(httpHelper, w, r, err)
+			return
+		}
+		if clientResp == nil {
+			httpHelper.NotFound(w, r)
+			return
+		}
+
+		adminClientSettings := struct {
+			ClientId                 int64
+			ClientIdentifier         string
+			Description              string
+			WebsiteURL               string
+			DisplayName              string
+			Enabled                  bool
+			ConsentRequired          bool
+			ShowLogo                 bool
+			ShowDisplayName          bool
+			ShowDescription          bool
+			ShowWebsiteURL           bool
+			AuthorizationCodeEnabled bool
+			DefaultAcrLevel          string
+			IsSystemLevelClient      bool
+		}{
+			ClientId:                 clientResp.Id,
+			ClientIdentifier:         clientResp.ClientIdentifier,
+			Description:              clientResp.Description,
+			WebsiteURL:               clientResp.WebsiteURL,
+			DisplayName:              clientResp.DisplayName,
+			Enabled:                  clientResp.Enabled,
+			ConsentRequired:          clientResp.ConsentRequired,
+			ShowLogo:                 clientResp.ShowLogo,
+			ShowDisplayName:          clientResp.ShowDisplayName,
+			ShowDescription:          clientResp.ShowDescription,
+			ShowWebsiteURL:           clientResp.ShowWebsiteURL,
+			AuthorizationCodeEnabled: clientResp.AuthorizationCodeEnabled,
+			DefaultAcrLevel:          clientResp.DefaultAcrLevel,
+			IsSystemLevelClient:      clientResp.IsSystemLevelClient,
+		}
+
+		sess, err := httpSession.Get(r, coreconstants.AdminConsoleSessionName)
+		if err != nil {
+			httpHelper.InternalServerError(w, r, err)
+			return
+		}
+
+		_, savedSuccessfully := sess.TakeFlash("savedSuccessfully")
+		if savedSuccessfully {
+			err = httpSession.Save(r, w, sess)
+			if err != nil {
+				httpHelper.InternalServerError(w, r, err)
+				return
+			}
+		}
+
+		bind := map[string]interface{}{
+			"client":            adminClientSettings,
+			"savedSuccessfully": savedSuccessfully,
+		}
+
+		err = httpHelper.RenderTemplate(w, r, "/layouts/menu_layout.html", "/admin_clients_settings.html", bind)
+		if err != nil {
+			httpHelper.InternalServerError(w, r, err)
+			return
+		}
+	}
+}
+
+func HandleAdminClientSettingsPost(
+	httpHelper handlers.HttpHelper,
+	httpSession sessionstore.Store,
+	apiClient clientSettingsAPI,
+) http.HandlerFunc {
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		idStr := chi.URLParam(r, "clientId")
+		if len(idStr) == 0 {
+			httpHelper.NotFound(w, r)
+			return
+		}
+
+		id, err := strconv.ParseInt(idStr, 10, 64)
+		if err != nil {
+			httpHelper.NotFound(w, r)
+			return
+		}
+
+		enabled := r.FormValue("enabled") == "on"
+		consentRequired := r.FormValue("consentRequired") == "on"
+		showLogo := r.FormValue("showLogo") == "on"
+		showDisplayName := r.FormValue("showDisplayName") == "on"
+		showDescription := r.FormValue("showDescription") == "on"
+		showWebsiteURL := r.FormValue("showWebsiteUrl") == "on"
+
+		// Get JWT info from context to extract access token
+		jwtInfo, ok := r.Context().Value(constants.ContextKeyJwtInfo).(oauthclient.JwtInfo)
+		if !ok {
+			httpHelper.InternalServerError(w, r, errs.New("no JWT info found in context"))
+			return
+		}
+
+		clientResp, err := apiClient.GetClientById(r.Context(), jwtInfo.TokenResponse.AccessToken, id)
+		if err != nil {
+			handlers.HandleAPIError(httpHelper, w, r, err)
+			return
+		}
+		if clientResp == nil {
+			httpHelper.NotFound(w, r)
+			return
+		}
+
+		isSystemLevelClient := clientResp.IsSystemLevelClient
+
+		adminClientSettings := struct {
+			ClientId                 int64
+			ClientIdentifier         string
+			Description              string
+			WebsiteURL               string
+			DisplayName              string
+			Enabled                  bool
+			ConsentRequired          bool
+			ShowLogo                 bool
+			ShowDisplayName          bool
+			ShowDescription          bool
+			ShowWebsiteURL           bool
+			AuthorizationCodeEnabled bool
+			DefaultAcrLevel          string
+			IsSystemLevelClient      bool
+		}{
+			ClientId:                 id,
+			ClientIdentifier:         r.FormValue("clientIdentifier"),
+			Description:              r.FormValue("description"),
+			WebsiteURL:               r.FormValue("websiteUrl"),
+			DisplayName:              r.FormValue("displayName"),
+			Enabled:                  enabled,
+			ConsentRequired:          consentRequired,
+			ShowLogo:                 showLogo,
+			ShowDisplayName:          showDisplayName,
+			ShowDescription:          showDescription,
+			ShowWebsiteURL:           showWebsiteURL,
+			AuthorizationCodeEnabled: clientResp.AuthorizationCodeEnabled,
+			DefaultAcrLevel:          r.FormValue("defaultAcrLevel"),
+			IsSystemLevelClient:      isSystemLevelClient,
+		}
+
+		renderError := func(message string) {
+			bind := map[string]interface{}{
+				"client": adminClientSettings,
+				"error":  message,
+			}
+
+			renderErr := httpHelper.RenderTemplate(w, r, "/layouts/menu_layout.html", "/admin_clients_settings.html", bind)
+			if renderErr != nil {
+				httpHelper.InternalServerError(w, r, renderErr)
+			}
+		}
+
+		// Build API request
+		updateReq := &api.UpdateClientSettingsRequest{
+			ClientIdentifier: strings.TrimSpace(adminClientSettings.ClientIdentifier),
+			Description:      strings.TrimSpace(adminClientSettings.Description),
+			WebsiteURL:       strings.TrimSpace(adminClientSettings.WebsiteURL),
+			DisplayName:      strings.TrimSpace(adminClientSettings.DisplayName),
+			Enabled:          adminClientSettings.Enabled,
+			ConsentRequired:  adminClientSettings.ConsentRequired,
+			ShowLogo:         adminClientSettings.ShowLogo,
+			ShowDisplayName:  adminClientSettings.ShowDisplayName,
+			ShowDescription:  adminClientSettings.ShowDescription,
+			ShowWebsiteURL:   adminClientSettings.ShowWebsiteURL,
+		}
+		if clientResp.AuthorizationCodeEnabled {
+			updateReq.DefaultAcrLevel = r.FormValue("defaultAcrLevel")
+		}
+
+		_, err = apiClient.UpdateClient(r.Context(), jwtInfo.TokenResponse.AccessToken, id, updateReq)
+		if err != nil {
+			handlers.HandleAPIErrorWithCallback(httpHelper, w, r, err, renderError)
+			return
+		}
+
+		sess, err := httpSession.Get(r, coreconstants.AdminConsoleSessionName)
+		if err != nil {
+			httpHelper.InternalServerError(w, r, err)
+			return
+		}
+
+		sess.SetFlash("savedSuccessfully", "true")
+		err = httpSession.Save(r, w, sess)
+		if err != nil {
+			httpHelper.InternalServerError(w, r, err)
+			return
+		}
+
+		http.Redirect(w, r, fmt.Sprintf("%v/admin/clients/%v/settings", config.GetAdminConsole().BaseURL, id), http.StatusFound)
+	}
+}

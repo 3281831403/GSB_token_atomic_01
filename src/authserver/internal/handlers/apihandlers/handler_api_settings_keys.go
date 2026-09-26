@@ -1,0 +1,184 @@
+package apihandlers
+
+import (
+	"context"
+	"database/sql"
+	"encoding/base64"
+	"errors"
+	"net/http"
+	"strconv"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/leodip/goiabada/authserver/internal/audit"
+	"github.com/leodip/goiabada/authserver/internal/models"
+	"github.com/leodip/goiabada/authserver/internal/signingkeys"
+	"github.com/leodip/goiabada/core/api"
+	"github.com/leodip/goiabada/core/errs"
+)
+
+// settingsKeysDatabase is what the signing key endpoints need: the key rows they list and delete.
+//
+// It embeds the rotator's port because rotating a key is signingkeys.SigningKeyRotator's job, not
+// this endpoint's.
+type settingsKeysDatabase interface {
+	signingkeys.RotationDatabase
+
+	DeleteKeyPair(ctx context.Context, tx *sql.Tx, keyPairId int64) error
+	GetAllSigningKeys(ctx context.Context, tx *sql.Tx) ([]models.KeyPair, error)
+	GetKeyPairById(ctx context.Context, tx *sql.Tx, keyPairId int64) (*models.KeyPair, error)
+}
+
+// HandleAPISettingsKeysGet - GET /api/v1/admin/settings/keys
+func HandleAPISettingsKeysGet(
+	database settingsKeysDatabase,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		allSigningKeys, err := database.GetAllSigningKeys(r.Context(), nil)
+		if err != nil {
+			writeInternalServerError(w, r, err)
+			return
+		}
+
+		// Map keys
+		mapped := make([]api.SettingsSigningKeyResponse, 0, len(allSigningKeys))
+		for _, k := range allSigningKeys {
+			var createdAt *time.Time
+			if k.CreatedAt.Valid {
+				t := k.CreatedAt.Time
+				createdAt = &t
+			}
+			mapped = append(mapped, api.SettingsSigningKeyResponse{
+				Id:               k.Id,
+				CreatedAt:        createdAt,
+				State:            k.State,
+				KeyIdentifier:    k.KeyIdentifier,
+				Type:             k.Type,
+				Algorithm:        k.Algorithm,
+				PublicKeyASN1DER: base64.StdEncoding.EncodeToString(k.PublicKeyASN1_DER),
+				PublicKeyPEM:     string(k.PublicKeyPEM),
+				PublicKeyJWK:     string(k.PublicKeyJWK),
+			})
+		}
+
+		// Order: next, current, then all previous
+		ordered := make([]api.SettingsSigningKeyResponse, 0, len(mapped))
+		for _, v := range mapped {
+			if v.State == models.KeyStateNext.String() {
+				ordered = append(ordered, v)
+				break
+			}
+		}
+		for _, v := range mapped {
+			if v.State == models.KeyStateCurrent.String() {
+				ordered = append(ordered, v)
+				break
+			}
+		}
+		for _, v := range mapped {
+			if v.State == models.KeyStatePrevious.String() {
+				ordered = append(ordered, v)
+			}
+		}
+
+		resp := api.GetSettingsKeysResponse{Keys: ordered}
+		writeJSON(w, r, http.StatusOK, resp)
+	}
+}
+
+// HandleAPISettingsKeysRotatePost - POST /api/v1/admin/settings/keys/rotate
+//
+// The transition itself lives in signingkeys.SigningKeyRotator, which takes it as one transaction.
+// This used to be five unsynchronised writes here, and the delete of the previous key ran
+// before the check that a next key even existed, so a rotation that was about to be refused
+// had already destroyed the key still signing live tokens (#251).
+func HandleAPISettingsKeysRotatePost(
+	database settingsKeysDatabase,
+	auditLogger AuditLogger,
+) http.HandlerFunc {
+
+	rotator := signingkeys.NewSigningKeyRotator(database)
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		err := rotator.Rotate(r.Context())
+
+		switch {
+		case err == nil:
+			// Audited here and only here, so the log carries exactly one entry per rotation
+			// that actually happened.
+			auditLogger.Log(r.Context(), audit.AuditRotatedKeys, map[string]interface{}{
+				"loggedInUser": callerSubject(r),
+			})
+
+			writeJSON(w, r, http.StatusOK, api.SuccessResponse{Success: true})
+
+		case errors.Is(err, signingkeys.ErrRotationInProgress):
+			// 409 rather than 200: this call rotated nothing. Reporting success would have the
+			// admin console announce one rotation twice, and would invite a caller to believe
+			// it holds a key it never created. Retrying is wrong for the same reason, which is
+			// what the REST API page now says.
+			writeJSONError(w, "Another key rotation is in progress", "ROTATION_IN_PROGRESS",
+				http.StatusConflict)
+
+		case errors.Is(err, signingkeys.ErrKeySetIncomplete):
+			// A 500 that keeps its own error_code, because the console routes on it and the
+			// OpenAPI text names it: the generic writer would flatten it to
+			// INTERNAL_SERVER_ERROR. It still owes what every other 500 here writes, one
+			// structured record with the stack and the same request id on the wire, which is
+			// what this writer adds and what the bare 4xx envelope it used could not (#279).
+			writeInternalServerErrorWithCode(w, r,
+				errs.Wrap(err, "unable to rotate the signing keys"),
+				"Expected current and next keys to exist", "KEY_SET_INCOMPLETE")
+
+		default:
+			writeInternalServerError(w, r, errs.Wrap(err, "failed to rotate signing keys"))
+		}
+	}
+}
+
+// HandleAPISettingsKeyDelete - DELETE /api/v1/admin/settings/keys/{id}
+func HandleAPISettingsKeyDelete(
+	database settingsKeysDatabase,
+	auditLogger AuditLogger,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		idStr := chi.URLParam(r, "id")
+		id, err := strconv.ParseInt(idStr, 10, 64)
+		if err != nil || id <= 0 {
+			writeJSONError(w, "Invalid key ID", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		kp, err := database.GetKeyPairById(r.Context(), nil, id)
+		if err != nil {
+			writeInternalServerError(w, r, err)
+			return
+		}
+		if kp == nil {
+			writeJSONError(w, "Key not found", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		keyState, err := models.KeyStateFromString(kp.State)
+		if err != nil {
+			writeInternalServerError(w, r, err)
+			return
+		}
+		if keyState != models.KeyStatePrevious {
+			writeJSONError(w, "Only a previous key can be revoked", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		if err := database.DeleteKeyPair(r.Context(), nil, kp.Id); err != nil {
+			writeInternalServerError(w, r, err)
+			return
+		}
+
+		auditLogger.Log(r.Context(), audit.AuditRevokedKey, map[string]interface{}{
+			"loggedInUser": callerSubject(r),
+			"keyId":        kp.KeyIdentifier,
+		})
+
+		writeJSON(w, r, http.StatusOK, api.SuccessResponse{Success: true})
+	}
+}

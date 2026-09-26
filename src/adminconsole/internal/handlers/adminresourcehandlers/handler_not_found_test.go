@@ -1,0 +1,138 @@
+package adminresourcehandlers
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/stretchr/testify/mock"
+
+	"github.com/leodip/goiabada/adminconsole/internal/apiclient"
+	mocks_handlerhelpers "github.com/leodip/goiabada/adminconsole/internal/handlerhelpers/mocks"
+	"github.com/leodip/goiabada/adminconsole/internal/handlertest"
+	"github.com/leodip/goiabada/core/api"
+)
+
+// Decision 11 at this handler group's seam. Every one of these rows answered the 500 page before
+// #279: a mistyped id, a link whose id the router never bound, a bookmark to something an
+// administrator deleted last week. Each spent a stack and a request id telling the reader the
+// server had broken, and RFC 9110 section 15.5.5 has the answer -- 404 "indicates that the origin
+// server did not find a current representation for the target resource".
+//
+// The last two rows are what keeps the change narrow. A missing JWT context is an invariant the
+// JWT middleware holds, and a 500 from the API is a server fault: both stay 500, and a sweep that
+// turned every InternalServerError in this file into a NotFound would fail here.
+//
+// notFoundResourceApiClient answers the one call the handler makes before it decides, and embeds the
+// interface so any other method the handler reaches for panics rather than returning a helpful
+// zero value.
+type notFoundResourceApiClient struct {
+	apiclient.ApiClient
+	entity *api.ResourceResponse
+	err    error
+}
+
+func (c *notFoundResourceApiClient) GetResourceById(_ context.Context, accessToken string, id int64) (*api.ResourceResponse, error) {
+	return c.entity, c.err
+}
+
+func TestResource_StaleOrMalformedUrlAnswers404(t *testing.T) {
+	const routePattern = "/admin/resources/{resourceId}/permissions"
+
+	// present, gone and broken stand for the three answers the API can give this handler.
+	present := &api.ResourceResponse{Id: 42}
+	gone := &apiclient.APIError{Code: "NOT_FOUND", Message: "Resource not found", StatusCode: http.StatusNotFound}
+	broken := &apiclient.APIError{Code: "INTERNAL_SERVER_ERROR", Message: "the database is on fire", StatusCode: http.StatusInternalServerError}
+
+	testCases := []struct {
+		name string
+		// target is the URL. When routed is false the handler is called without a chi route
+		// context, which is how an unbound URL parameter reads from inside chi.URLParam.
+		target       string
+		routed       bool
+		withJwt      bool
+		entity       *api.ResourceResponse
+		apiErr       error
+		wantNotFound bool
+	}{
+		{
+			name:         "an id that does not parse",
+			target:       "/admin/resources/not-a-number/permissions",
+			routed:       true,
+			withJwt:      true,
+			entity:       present,
+			wantNotFound: true,
+		},
+		{
+			name:         "an id the router never bound",
+			target:       "/admin/resources/42/permissions",
+			routed:       false,
+			withJwt:      true,
+			entity:       present,
+			wantNotFound: true,
+		},
+		{
+			name:         "an entity the API says is gone",
+			target:       "/admin/resources/42/permissions",
+			routed:       true,
+			withJwt:      true,
+			apiErr:       gone,
+			wantNotFound: true,
+		},
+		{
+			name:         "an entity the API returns as nil without an error",
+			target:       "/admin/resources/42/permissions",
+			routed:       true,
+			withJwt:      true,
+			wantNotFound: true,
+		},
+		{
+			name:    "no JWT info in context, which is a middleware invariant and stays a 500",
+			target:  "/admin/resources/42/permissions",
+			routed:  true,
+			withJwt: false,
+			entity:  present,
+		},
+		{
+			name:    "a 500 from the API, which is a server fault and stays a 500",
+			target:  "/admin/resources/42/permissions",
+			routed:  true,
+			withJwt: true,
+			apiErr:  broken,
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			httpHelper := mocks_handlerhelpers.NewHttpHelper(t)
+			if testCase.wantNotFound {
+				httpHelper.On("NotFound", mock.Anything, mock.Anything).Return().Once()
+			} else {
+				httpHelper.On("InternalServerError", mock.Anything, mock.Anything, mock.Anything).
+					Return().Once()
+			}
+
+			var opts []handlertest.Option
+			if testCase.withJwt {
+				opts = append(opts, handlertest.WithAccessToken())
+			}
+			req := handlertest.Request(http.MethodGet, testCase.target, opts...)
+
+			apiClient := &notFoundResourceApiClient{entity: testCase.entity, err: testCase.apiErr}
+			handler := HandleAdminResourcePermissionsGet(httpHelper, nil, apiClient)
+			w := httptest.NewRecorder()
+
+			if testCase.routed {
+				router := chi.NewRouter()
+				router.Get(routePattern, handler)
+				router.ServeHTTP(w, req)
+			} else {
+				handler.ServeHTTP(w, req)
+			}
+
+			httpHelper.AssertExpectations(t)
+		})
+	}
+}

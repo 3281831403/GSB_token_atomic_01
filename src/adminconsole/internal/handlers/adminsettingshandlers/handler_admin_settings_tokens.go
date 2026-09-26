@@ -1,0 +1,168 @@
+package adminsettingshandlers
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"strconv"
+
+	"github.com/leodip/goiabada/core/errs"
+	"github.com/leodip/goiabada/core/sessionstore"
+
+	"github.com/leodip/goiabada/adminconsole/internal/config"
+	"github.com/leodip/goiabada/adminconsole/internal/constants"
+	"github.com/leodip/goiabada/adminconsole/internal/handlers"
+	"github.com/leodip/goiabada/adminconsole/internal/oauthclient"
+	"github.com/leodip/goiabada/core/api"
+	coreconstants "github.com/leodip/goiabada/core/constants"
+)
+
+// settingsTokensAPI is what the token settings page needs: the settings, and the write.
+type settingsTokensAPI interface {
+	GetSettingsTokens(ctx context.Context, accessToken string) (*api.SettingsTokensResponse, error)
+	UpdateSettingsTokens(ctx context.Context, accessToken string, request *api.UpdateSettingsTokensRequest) (*api.SettingsTokensResponse, error)
+}
+
+func HandleAdminSettingsTokensGet(
+	httpHelper handlers.HttpHelper,
+	httpSession sessionstore.Store,
+	apiClient settingsTokensAPI,
+) http.HandlerFunc {
+
+	return func(w http.ResponseWriter, r *http.Request) {
+
+		// Get access token
+		jwtInfo, ok := r.Context().Value(constants.ContextKeyJwtInfo).(oauthclient.JwtInfo)
+		if !ok {
+			httpHelper.InternalServerError(w, r, errs.New("no JWT info found in context"))
+			return
+		}
+
+		// Fetch settings from API
+		apiResp, err := apiClient.GetSettingsTokens(r.Context(), jwtInfo.TokenResponse.AccessToken)
+		if err != nil {
+			handlers.HandleAPIError(httpHelper, w, r, err)
+			return
+		}
+
+		settingsInfo := SettingsTokenGet{
+			TokenExpirationInSeconds:                apiResp.TokenExpirationInSeconds,
+			RefreshTokenOfflineIdleTimeoutInSeconds: apiResp.RefreshTokenOfflineIdleTimeoutInSeconds,
+			RefreshTokenOfflineMaxLifetimeInSeconds: apiResp.RefreshTokenOfflineMaxLifetimeInSeconds,
+			IncludeOpenIDConnectClaimsInAccessToken: apiResp.IncludeOpenIDConnectClaimsInAccessToken,
+			IncludeOpenIDConnectClaimsInIdToken:     apiResp.IncludeOpenIDConnectClaimsInIdToken,
+		}
+
+		sess, err := httpSession.Get(r, coreconstants.AdminConsoleSessionName)
+		if err != nil {
+			httpHelper.InternalServerError(w, r, err)
+			return
+		}
+
+		_, savedSuccessfully := sess.TakeFlash("savedSuccessfully")
+		if savedSuccessfully {
+			err = httpSession.Save(r, w, sess)
+			if err != nil {
+				httpHelper.InternalServerError(w, r, err)
+				return
+			}
+		}
+
+		bind := map[string]interface{}{
+			"settings":          settingsInfo,
+			"savedSuccessfully": savedSuccessfully,
+		}
+
+		err = httpHelper.RenderTemplate(w, r, "/layouts/menu_layout.html", "/admin_settings_tokens.html", bind)
+		if err != nil {
+			httpHelper.InternalServerError(w, r, err)
+			return
+		}
+	}
+}
+
+func HandleAdminSettingsTokensPost(
+	httpHelper handlers.HttpHelper,
+	httpSession sessionstore.Store,
+	apiClient settingsTokensAPI,
+) http.HandlerFunc {
+
+	return func(w http.ResponseWriter, r *http.Request) {
+
+		// Get access token
+		jwtInfo, ok := r.Context().Value(constants.ContextKeyJwtInfo).(oauthclient.JwtInfo)
+		if !ok {
+			httpHelper.InternalServerError(w, r, errs.New("no JWT info found in context"))
+			return
+		}
+
+		settingsInfo := SettingsTokenPost{
+			TokenExpirationInSeconds:                r.FormValue("tokenExpirationInSeconds"),
+			RefreshTokenOfflineIdleTimeoutInSeconds: r.FormValue("refreshTokenOfflineIdleTimeoutInSeconds"),
+			RefreshTokenOfflineMaxLifetimeInSeconds: r.FormValue("refreshTokenOfflineMaxLifetimeInSeconds"),
+			IncludeOpenIDConnectClaimsInAccessToken: r.FormValue("includeOpenIDConnectClaimsInAccessToken") == "on",
+			IncludeOpenIDConnectClaimsInIdToken:     r.FormValue("includeOpenIDConnectClaimsInIdToken") == "on",
+		}
+
+		renderError := func(message string) {
+			bind := map[string]interface{}{
+				"settings": settingsInfo,
+				"error":    message,
+			}
+
+			err := httpHelper.RenderTemplate(w, r, "/layouts/menu_layout.html", "/admin_settings_tokens.html", bind)
+			if err != nil {
+				httpHelper.InternalServerError(w, r, err)
+			}
+		}
+
+		// Prepare request with ints; invalid input becomes 0 to trigger server-side validation
+		tokenExp := 0
+		if v := settingsInfo.TokenExpirationInSeconds; len(v) > 0 {
+			if p, err := strconv.Atoi(v); err == nil {
+				tokenExp = p
+			}
+		}
+		idle := 0
+		if v := settingsInfo.RefreshTokenOfflineIdleTimeoutInSeconds; len(v) > 0 {
+			if p, err := strconv.Atoi(v); err == nil {
+				idle = p
+			}
+		}
+		maxlife := 0
+		if v := settingsInfo.RefreshTokenOfflineMaxLifetimeInSeconds; len(v) > 0 {
+			if p, err := strconv.Atoi(v); err == nil {
+				maxlife = p
+			}
+		}
+
+		updateReq := &api.UpdateSettingsTokensRequest{
+			TokenExpirationInSeconds:                tokenExp,
+			RefreshTokenOfflineIdleTimeoutInSeconds: idle,
+			RefreshTokenOfflineMaxLifetimeInSeconds: maxlife,
+			IncludeOpenIDConnectClaimsInAccessToken: settingsInfo.IncludeOpenIDConnectClaimsInAccessToken,
+			IncludeOpenIDConnectClaimsInIdToken:     settingsInfo.IncludeOpenIDConnectClaimsInIdToken,
+		}
+
+		_, err := apiClient.UpdateSettingsTokens(r.Context(), jwtInfo.TokenResponse.AccessToken, updateReq)
+		if err != nil {
+			handlers.HandleAPIErrorWithCallback(httpHelper, w, r, err, renderError)
+			return
+		}
+
+		sess, err := httpSession.Get(r, coreconstants.AdminConsoleSessionName)
+		if err != nil {
+			httpHelper.InternalServerError(w, r, err)
+			return
+		}
+
+		sess.SetFlash("savedSuccessfully", "true")
+		err = httpSession.Save(r, w, sess)
+		if err != nil {
+			httpHelper.InternalServerError(w, r, err)
+			return
+		}
+
+		http.Redirect(w, r, fmt.Sprintf("%v/admin/settings/tokens", config.GetAdminConsole().BaseURL), http.StatusFound)
+	}
+}

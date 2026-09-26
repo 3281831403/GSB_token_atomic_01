@@ -1,0 +1,323 @@
+package urlutil
+
+import (
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+)
+
+// TestIsLoopbackHost is the single source of truth for loopback host cases. The malformed
+// bracket and non-numeric port rows are not reachable through RedirectURIMatches today,
+// which only ever passes url.URL.Hostname(); they are here because decision 9 exports this
+// predicate for reuse in #105's DCR validation, where the caller may pass Host instead.
+func TestIsLoopbackHost(t *testing.T) {
+	tests := []struct {
+		host string
+		want bool
+	}{
+		// IPv4 literal
+		{"127.0.0.1", true},
+		{"127.0.0.1:8080", true},
+
+		// IPv6 literal, bracketed or not
+		{"::1", true},
+		{"[::1]", true},
+		{"[::1]:9999", true},
+		{"[::1]:", true}, // an empty port is still a port
+		{"[::1]:80", true},
+
+		// localhost is a deliberate extension beyond RFC 8252 section 7.3 (decision 1)
+		{"localhost", true},
+		{"localhost:3000", true},
+		{"localhost:", true},
+
+		// host case is not meaningful (decision 10)
+		{"LOCALHOST", true},
+		{"LocalHost:3000", true},
+
+		// matching is exact after folding, never a prefix
+		{"localhost.attacker.com", false},
+		{"localhost.attacker.com:9", false},
+		{"LOCALHOST.ATTACKER.COM", false}, // folding does not weaken the gate
+		{"127.0.0.1.evil.tld", false},
+		{"localhost-evil.example.net", false},
+
+		// plainly not loopback
+		{"example.com", false},
+		{"127.0.0.2", false},
+		{"127.0.0.1.", false},
+		{"", false},
+
+		// brackets are matched explicitly, not trimmed as a cutset (decision 14)
+		{"[[::1]]", false},
+		{"[[localhost]]", false},
+		{"[localhost]", false},
+		// survives the obvious fix to decision 14: net.SplitHostPort strips the brackets
+		// itself and hands back "localhost", so the bracket check must come first
+		{"[localhost]:3000", false},
+		{"[127.0.0.1]", false}, // IPv4 is not bracketed
+		{"]::1[", false},       // unbalanced
+		{"[::1", false},        // unbalanced
+		{"[::1]x", false},      // bad suffix after the bracket
+		{"[::1]:evil", false},
+		{"[::2]", false}, // a different address
+
+		// only a numeric port is stripped (decision 15). The mirror image of
+		// "[localhost]:3000": fixing only one branch leaves the two disagreeing about the
+		// same input shape.
+		{"localhost:evil", false},
+		{"localhost:80x", false},
+		{"127.0.0.1:http", false}, // service names are legal to net.Dial
+		{"127.0.0.1:https", false},
+		{"localhost:+80", false}, // signed is not numeric
+		{"localhost:-1", false},
+
+		{"::1:80", false}, // unbracketed IPv6 cannot carry a port
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.host, func(t *testing.T) {
+			assert.Equal(t, tc.want, IsLoopbackHost(tc.host))
+		})
+	}
+}
+
+// TestIsAbsoluteRedirectURI owns the absolute-URI rule from RFC 6749 section 3.1.2 and the
+// empty-host rule that closes the gap between that grammar and where a browser actually
+// navigates (#122). Every call site consumes the predicate rather than repeating it: DCR
+// registration (#105), authorization-time validation and the admin API, so the exhaustive
+// table lives here and each caller carries only a thin accept/reject pair.
+func TestIsAbsoluteRedirectURI(t *testing.T) {
+	tests := []struct {
+		uri  string
+		want bool
+	}{
+		// absolute, with an authority
+		{"http://127.0.0.1/cb", true},
+		{"http://127.0.0.1:9000/cb", true},
+		{"https://app.example.com/callback", true},
+		{"http://[::1]:9000/cb", true},
+
+		// absolute, private-use schemes for native apps.
+		//
+		// KEEP THESE. The hostless rows are the conformance boundary of the empty-host rule
+		// below, not decoration: RFC 8252 section 7.1's complete example of a native-app
+		// redirect URI is "com.example.app:/oauth2redirect/example-provider", one slash and
+		// no authority. Anyone "simplifying" that rule into a bare u.Host == "" test refuses
+		// every one of these and breaks every native and MCP client. These rows are the only
+		// thing that catches it mechanically.
+		{"myapp://callback", true},
+		{"myapp:/cb", true},
+		{"com.example.app:/oauth", true},
+		{"org.example.app.oauth://redirect", true},
+
+		// RFC 8252's own example redirect URIs, quoted verbatim from the document: section
+		// 7.1 (private-use scheme), 7.2 (claimed https) and 7.3 (loopback IPv4 and IPv6).
+		// Refusing any of these is non-conformance, which is why they are asserted as
+		// themselves rather than paraphrased into a shorter host.
+		{"com.example.app:/oauth2redirect/example-provider", true},
+		{"https://app.example.com/oauth2redirect/example-provider", true},
+		{"http://127.0.0.1:51004/oauth2redirect/example-provider", true},
+		{"http://[::1]:61023/oauth2redirect/example-provider", true},
+
+		// a query is explicitly permitted by the production
+		{"http://127.0.0.1/cb?a=1", true},
+		{"http://127.0.0.1/cb?a=1&b=2", true},
+
+		// not absolute: no scheme. The first is the code-exfiltration case, since it is
+		// emitted as a protocol-relative Location.
+		{"//evil.example/cb", false},
+		{"//evil.example:8443/cb", false},
+		{"/relative/cb", false},
+		{"relative/cb", false},
+		{"", false},
+
+		// http and https with no host. Every one of these IS a valid absolute-URI, so the
+		// grammar rule accepts them all and only the empty-host rule refuses them: Go parses
+		// them with Host == "" and a user agent re-reads them as an authority, delivering the
+		// authorization code to evil.example (#122). One row per parser shape rather than one
+		// representative, because they reach Host == "" by different routes: path-absolute,
+		// opaque, empty authority, and backslashes a browser folds to slashes.
+		{"http:/evil.example/cb", false},
+		{"http:evil.example/cb", false},
+		{"http:///evil.example/cb", false},
+		{"http:////evil.example/cb", false},
+		{"https:/evil.example/cb", false},
+		{"https:evil.example/cb", false},
+		{"https:///evil.example/cb", false},
+		{`http:\\evil.example\cb`, false},
+		{`http:\/evil.example/cb`, false},
+		{`https:\\evil.example\cb`, false},
+
+		// the same family with the scheme cased. url.Parse lowercases the scheme, so these
+		// reach the rule as "http" and "https"; an implementation comparing the raw scheme
+		// passes every row above and fails exactly these two. A user agent lowercases the
+		// scheme too, so without them the rule is evaded by pressing shift.
+		{"HTTP:///evil.example/cb", false},
+		{"HttpS:///evil.example/cb", false},
+
+		// a fragment is not permitted. Each of these has a non-empty scheme, so each one
+		// passes a scheme-only test: they are the rows that catch that mistake.
+		{"http://127.0.0.1/cb#frag", false},
+		{"https://app.example.com/cb#frag", false},
+		{"http://127.0.0.1/cb?a=1#f", false},
+		{"myapp://callback#f", false},
+		{"http://127.0.0.1/cb#", false}, // an empty fragment is still a fragment delimiter
+
+		// a percent-encoded %23 is not a fragment delimiter
+		{"http://127.0.0.1/cb%23frag", true},
+
+		// well-formed escapes stay accepted, including an encoded percent and an encoded
+		// space. These are the rows that catch the escape check being over-tightened.
+		{"http://127.0.0.1/cb?q=100%25", true},
+		{"http://127.0.0.1/cb?q=a%20b", true},
+		{"myapp://cb/%3Cscript%3E", true},
+		{"x:%41", true},
+
+		// malformed escapes. url.Parse does not validate these in an opaque URI, so without
+		// the PathUnescape check they were reported as absolute URIs.
+		{"x:%zz", false},                  // not hex
+		{"x:%2", false},                   // truncated
+		{"http://127.0.0.1/cb%", false},   // bare percent
+		{"http://127.0.0.1/cb%zz", false}, // not hex, hierarchical form
+		{"myapp://cb%2", false},           // truncated, hierarchical form
+
+		// Documented limits rather than assertions of correctness: this is a form check, not
+		// a grammar validator. Both violate RFC 3986 and both are reported as absolute URIs.
+		// See the doc comment. If either becomes a problem, the fix is real pchar validation,
+		// which has to be position-aware because "[" is legal in an authority.
+		{"x:[", true},
+		{"x:你好", true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.uri, func(t *testing.T) {
+			assert.Equal(t, tc.want, IsAbsoluteRedirectURI(tc.uri))
+		})
+	}
+}
+
+// TestRedirectURIMatches pins that the port is the only component permitted to differ.
+// Flow gating is not covered here: RedirectURIMatches is flow agnostic and the caller owns
+// that decision (decision 12), so those cases live with the authorization validator.
+func TestRedirectURIMatches(t *testing.T) {
+	tests := []struct {
+		name       string
+		registered string
+		requested  string
+		want       bool
+	}{
+		// port flexibility, the point of the exercise
+		{"identical", "http://127.0.0.1/callback", "http://127.0.0.1/callback", true},
+		{"port added", "http://127.0.0.1/callback", "http://127.0.0.1:12345/callback", true},
+		{"port changed", "http://127.0.0.1:8080/callback", "http://127.0.0.1:54321/callback", true},
+		{"port removed", "http://127.0.0.1:8080/cb", "http://127.0.0.1/cb", true},
+		{"ipv6", "http://[::1]/callback", "http://[::1]:9999/callback", true},
+		{"localhost", "http://localhost/cb", "http://localhost:3000/cb", true}, // pins decision 1
+		{"default port is still port variance", "http://127.0.0.1/cb", "http://127.0.0.1:80/cb", true},
+		{"host case consistent on both sides", "http://LOCALHOST/cb", "http://LOCALHOST:3000/cb", true}, // pins decision 10
+		{"empty port is still a port", "http://[::1]/cb", "http://[::1]:/cb", true},
+
+		// exact equality still governs everything else
+		{"custom scheme exact", "com.example.app:/oauth", "com.example.app:/oauth", true},
+		{"https matches exactly", "https://127.0.0.1:8443/cb", "https://127.0.0.1:8443/cb", true},
+
+		// only the port may differ (decision 6)
+		{"path differs", "http://127.0.0.1/cb", "http://127.0.0.1:9/other", false},
+		{"scheme differs", "http://127.0.0.1:8080/cb", "https://127.0.0.1:8080/cb", false},
+		// the row that failed under this spec's original parse-and-render design. Keep it:
+		// it fails the moment anyone reintroduces url.URL.String().
+		{"scheme case", "http://127.0.0.1/cb", "HTTP://127.0.0.1:9000/cb", false},
+		{"scheme case, no port change", "http://127.0.0.1/cb", "HtTp://127.0.0.1/cb", false},
+		{"escaping must not be normalised", "http://127.0.0.1/c b", "http://127.0.0.1:9/c%20b", false},
+		{"hex case", "http://127.0.0.1/c%2Fb", "http://127.0.0.1:9/c%2fb", false},
+		{"query added", "http://127.0.0.1/cb", "http://127.0.0.1:9/cb?injected=evil", false},
+		{"query dropped", "http://127.0.0.1/cb?a=1", "http://127.0.0.1:9/cb", false},
+		{"empty query added", "http://127.0.0.1/cb", "http://127.0.0.1:9/cb?", false},
+		{"fragment added", "http://127.0.0.1/cb", "http://127.0.0.1:9/cb#f", false},
+		{"userinfo added", "http://127.0.0.1/cb", "http://user@127.0.0.1:9/cb", false},
+		{"double slash", "http://127.0.0.1/cb", "http://127.0.0.1:9//cb", false},
+		{"host case differs between the two", "http://LOCALHOST/cb", "http://localhost:3000/cb", false},
+		{"v4 is not v6", "http://127.0.0.1/cb", "http://[::1]:9/cb", false},
+
+		// the registered side must be a loopback host
+		{"not loopback", "https://example.com/cb", "https://example.com:8080/cb", false},
+		{"#105 interaction", "http://localhost.attacker.com/cb", "http://localhost.attacker.com:9/cb", false},
+
+		// the registered side must be http (decision 11)
+		{"https ip literal", "https://127.0.0.1/cb", "https://127.0.0.1:9000/cb", false},
+		{"https localhost", "https://localhost/cb", "https://localhost:8443/cb", false},
+		{"custom scheme on a loopback host", "custom://127.0.0.1/cb", "custom://127.0.0.1:9000/cb", false},
+		{"any other scheme", "ftp://127.0.0.1/cb", "ftp://127.0.0.1:2121/cb", false},
+
+		// a bracketed authority may be followed only by an empty suffix or :digits
+		// (decision 13). Dropping whatever followed the bracket accepted all five.
+		{"bad port after bracket", "http://[::1]/cb", "http://[::1]:evil/cb", false},
+		{"suffix after the bracket", "http://[::1]/cb", "http://[::1].attacker/cb", false},
+		{"double colon", "http://[::1]/cb", "http://[::1]::443/cb", false},
+		{"trailing character", "http://[::1]/cb", "http://[::1]x/cb", false},
+		{"userinfo smuggling", "http://[::1]/cb", "http://[::1]:80@evil.com/cb", false},
+
+		// decision 15 through the matcher
+		{"non-numeric port", "http://localhost/cb", "http://localhost:evil/cb", false},
+		{"service name as a port", "http://127.0.0.1/cb", "http://127.0.0.1:http/cb", false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, RedirectURIMatches(tc.registered, tc.requested))
+		})
+	}
+}
+
+func TestRedirectURIIsRegistered(t *testing.T) {
+	tests := []struct {
+		name       string
+		registered []string
+		requested  string
+		flag       bool
+		want       bool
+	}{
+		// the list, which is what this function adds over RedirectURIMatches
+		{"exact hit", []string{"https://a.example/cb"}, "https://a.example/cb", false, true},
+		{"exact hit, second entry", []string{"https://a.example/cb", "https://b.example/cb"}, "https://b.example/cb", false, true},
+		{"exact miss", []string{"https://a.example/cb"}, "https://evil.example/cb", false, false},
+		{"near miss on a trusted value", []string{"https://trusted.example/cb"}, "https://trusted.example.attacker.com/cb", false, false},
+		{"empty registered list", []string{}, "https://a.example/cb", false, false},
+		{"empty registered list, flag on", []string{}, "http://127.0.0.1:5000/cb", true, false},
+		{"empty requested against a populated list", []string{"https://a.example/cb"}, "", true, false},
+
+		// the flag, which is decision 7: the flow gate is the caller's parameter and not a
+		// rule read inside urlutil. Keep this pair. The two rows differ in the flag and in
+		// nothing else, so reading the flow inside the function breaks them and nothing else
+		// in the suite.
+		{"loopback, flag on", []string{"http://127.0.0.1/cb"}, "http://127.0.0.1:54321/cb", true, true},
+		{"loopback, flag off", []string{"http://127.0.0.1/cb"}, "http://127.0.0.1:54321/cb", false, false},
+
+		// one accept and one reject through RedirectURIMatches is all this table owns of its
+		// behaviour: the exhaustive matching table is TestRedirectURIMatches, directly above,
+		// and owning it twice means two places to update.
+		{"https loopback, flag on", []string{"https://127.0.0.1/cb"}, "https://127.0.0.1:8443/cb", true, false},
+		{"non-loopback host, flag on", []string{"https://example.com/cb"}, "https://example.com:8443/cb", true, false},
+
+		// Keep this row. It is the one a per-entry reading of the flag passes and a "the list
+		// contains a loopback entry, so relax" reading fails. It is the residual the loop
+		// shape makes possible.
+		{"flexibility does not leak across entries", []string{"https://example.com/cb", "http://127.0.0.1/cb"}, "https://example.com:8443/cb", true, false},
+		{"the loopback entry later in the list still matches", []string{"https://example.com/cb", "http://127.0.0.1/cb"}, "http://127.0.0.1:9/cb", true, true},
+
+		// url.Parse("http://127.0.0.1/%zz") fails with invalid URL escape "%zz", so the
+		// flexible arm can never match it. Keep the pair. The second row looks like a mistake
+		// beside the first and is not: a client that registered a URI url.Parse rejects must
+		// still be able to redeem that exact string, and the first row is what shows that
+		// beyond exact equality such a value matches nothing.
+		{"unparseable registered value, flag on", []string{"http://127.0.0.1/%zz"}, "http://127.0.0.1:9/%zz", true, false},
+		{"unparseable registered value, exact equality still wins", []string{"http://127.0.0.1/%zz"}, "http://127.0.0.1/%zz", true, true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, RedirectURIIsRegistered(tc.registered, tc.requested, tc.flag))
+		})
+	}
+}

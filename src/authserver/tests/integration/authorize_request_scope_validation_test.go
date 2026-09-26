@@ -1,0 +1,997 @@
+package integrationtests
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"net/url"
+	"testing"
+
+	"github.com/PuerkitoBio/goquery"
+	"github.com/leodip/goiabada/authserver/internal/config"
+	"github.com/leodip/goiabada/authserver/internal/models"
+	"github.com/leodip/goiabada/authserver/internal/testutil/fake"
+	"github.com/leodip/goiabada/core/constants"
+	"github.com/stretchr/testify/assert"
+)
+
+func TestAuthorize_ValidateRequest_ResponseTypeIsMissing(t *testing.T) {
+	client := &models.Client{
+		ClientIdentifier:         "test-client-" + fake.LetterN(8),
+		Enabled:                  true,
+		AuthorizationCodeEnabled: true,
+	}
+
+	err := database.CreateClient(context.Background(), nil, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	redirectUri := &models.RedirectURI{
+		ClientId: client.Id,
+		URI:      fake.URL(),
+	}
+
+	err = database.CreateRedirectURI(context.Background(), nil, redirectUri)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	destUrl := config.GetAuthServer().BaseURL + "/auth/authorize/?client_id=" + client.ClientIdentifier +
+		"&redirect_uri=" + redirectUri.URI
+
+	httpClient := createAuthenticatedHttpClient(t)
+
+	resp, err := httpClient.Get(destUrl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusFound, resp.StatusCode)
+
+	redirectLocation, err := url.Parse(resp.Header.Get("Location"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	errorCode := redirectLocation.Query().Get("error")
+	errorDescription := redirectLocation.Query().Get("error_description")
+
+	assert.Equal(t, "invalid_request", errorCode)
+	assert.Equal(t, "The response_type parameter is missing.", errorDescription)
+}
+
+func TestAuthorize_ValidateRequest_ResponseTypeIsInvalid(t *testing.T) {
+	client := &models.Client{
+		ClientIdentifier:         "test-client-" + fake.LetterN(8),
+		Enabled:                  true,
+		AuthorizationCodeEnabled: true,
+	}
+
+	err := database.CreateClient(context.Background(), nil, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	redirectUri := &models.RedirectURI{
+		ClientId: client.Id,
+		URI:      fake.URL(),
+	}
+
+	err = database.CreateRedirectURI(context.Background(), nil, redirectUri)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	destUrl := config.GetAuthServer().BaseURL + "/auth/authorize/?client_id=" + client.ClientIdentifier +
+		"&redirect_uri=" + redirectUri.URI + "&response_type=invalid"
+
+	httpClient := createAuthenticatedHttpClient(t)
+
+	resp, err := httpClient.Get(destUrl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusFound, resp.StatusCode)
+
+	redirectLocation, err := url.Parse(resp.Header.Get("Location"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	errorCode := redirectLocation.Query().Get("error")
+	errorDescription := redirectLocation.Query().Get("error_description")
+
+	assert.Equal(t, "unsupported_response_type", errorCode)
+	assert.Equal(t, "The authorization server does not support this response_type. Supported values: code, token, id_token, id_token token.", errorDescription)
+}
+
+func TestAuthorize_ValidateRequest_CodeChallengeMethodIsMissing(t *testing.T) {
+	pkceRequired := true
+	client := &models.Client{
+		ClientIdentifier:         "test-client-" + fake.LetterN(8),
+		Enabled:                  true,
+		AuthorizationCodeEnabled: true,
+		PKCERequired:             &pkceRequired,
+	}
+
+	err := database.CreateClient(context.Background(), nil, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	redirectUri := &models.RedirectURI{
+		ClientId: client.Id,
+		URI:      fake.URL(),
+	}
+
+	err = database.CreateRedirectURI(context.Background(), nil, redirectUri)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	destUrl := config.GetAuthServer().BaseURL + "/auth/authorize/?client_id=" + client.ClientIdentifier +
+		"&redirect_uri=" + redirectUri.URI + "&response_type=code"
+
+	httpClient := createAuthenticatedHttpClient(t)
+
+	resp, err := httpClient.Get(destUrl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusFound, resp.StatusCode)
+
+	redirectLocation, err := url.Parse(resp.Header.Get("Location"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	errorCode := redirectLocation.Query().Get("error")
+	errorDescription := redirectLocation.Query().Get("error_description")
+
+	assert.Equal(t, "invalid_request", errorCode)
+	assert.Equal(t, "PKCE is required. Ensure code_challenge_method is set to 'S256'.", errorDescription)
+}
+
+func TestAuthorize_ValidateRequest_CodeChallengeMethodIsInvalid(t *testing.T) {
+	pkceRequired := true
+	client := &models.Client{
+		ClientIdentifier:         "test-client-" + fake.LetterN(8),
+		Enabled:                  true,
+		AuthorizationCodeEnabled: true,
+		PKCERequired:             &pkceRequired,
+	}
+
+	err := database.CreateClient(context.Background(), nil, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	redirectUri := &models.RedirectURI{
+		ClientId: client.Id,
+		URI:      fake.URL(),
+	}
+
+	err = database.CreateRedirectURI(context.Background(), nil, redirectUri)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	destUrl := config.GetAuthServer().BaseURL + "/auth/authorize/?client_id=" + client.ClientIdentifier +
+		"&redirect_uri=" + redirectUri.URI + "&response_type=code" + "&code_challenge_method=invalid"
+
+	httpClient := createAuthenticatedHttpClient(t)
+
+	resp, err := httpClient.Get(destUrl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusFound, resp.StatusCode)
+
+	redirectLocation, err := url.Parse(resp.Header.Get("Location"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	errorCode := redirectLocation.Query().Get("error")
+	errorDescription := redirectLocation.Query().Get("error_description")
+
+	assert.Equal(t, "invalid_request", errorCode)
+	assert.Equal(t, "PKCE is required. Ensure code_challenge_method is set to 'S256'.", errorDescription)
+}
+
+func TestAuthorize_ValidateRequest_CodeChallengeIsMissing(t *testing.T) {
+	pkceRequired := true
+	client := &models.Client{
+		ClientIdentifier:         "test-client-" + fake.LetterN(8),
+		Enabled:                  true,
+		AuthorizationCodeEnabled: true,
+		PKCERequired:             &pkceRequired,
+	}
+
+	err := database.CreateClient(context.Background(), nil, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	redirectUri := &models.RedirectURI{
+		ClientId: client.Id,
+		URI:      fake.URL(),
+	}
+
+	err = database.CreateRedirectURI(context.Background(), nil, redirectUri)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	destUrl := config.GetAuthServer().BaseURL + "/auth/authorize/?client_id=" + client.ClientIdentifier +
+		"&redirect_uri=" + redirectUri.URI + "&response_type=code" + "&code_challenge_method=S256"
+
+	httpClient := createAuthenticatedHttpClient(t)
+
+	resp, err := httpClient.Get(destUrl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusFound, resp.StatusCode)
+
+	redirectLocation, err := url.Parse(resp.Header.Get("Location"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	errorCode := redirectLocation.Query().Get("error")
+	errorDescription := redirectLocation.Query().Get("error_description")
+
+	assert.Equal(t, "invalid_request", errorCode)
+	assert.Equal(t, "The code_challenge parameter is either missing or incorrect. It should be 43 to 128 characters long.", errorDescription)
+}
+
+func TestAuthorize_ValidateRequest_CodeChallengeInvalid(t *testing.T) {
+	testCases := []struct {
+		codeChallenge string
+	}{
+		// less than 43
+		{codeChallenge: fake.LetterN(42)},
+
+		// more than 128
+		{codeChallenge: fake.LetterN(129)},
+	}
+
+	for _, testCase := range testCases {
+		pkceRequired := true
+		client := &models.Client{
+			ClientIdentifier:         "test-client-" + fake.LetterN(8),
+			Enabled:                  true,
+			AuthorizationCodeEnabled: true,
+			PKCERequired:             &pkceRequired,
+		}
+
+		err := database.CreateClient(context.Background(), nil, client)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		redirectUri := &models.RedirectURI{
+			ClientId: client.Id,
+			URI:      fake.URL(),
+		}
+
+		err = database.CreateRedirectURI(context.Background(), nil, redirectUri)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		destUrl := config.GetAuthServer().BaseURL + "/auth/authorize/?client_id=" + client.ClientIdentifier +
+			"&redirect_uri=" + redirectUri.URI + "&response_type=code" + "&code_challenge_method=S256" +
+			"&code_challenge=" + testCase.codeChallenge
+
+		httpClient := createAuthenticatedHttpClient(t)
+
+		resp, err := httpClient.Get(destUrl)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+
+		assert.Equal(t, http.StatusFound, resp.StatusCode)
+
+		redirectLocation, err := url.Parse(resp.Header.Get("Location"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		errorCode := redirectLocation.Query().Get("error")
+		errorDescription := redirectLocation.Query().Get("error_description")
+
+		assert.Equal(t, "invalid_request", errorCode)
+		assert.Equal(t, "The code_challenge parameter is either missing or incorrect. It should be 43 to 128 characters long.", errorDescription)
+	}
+}
+
+// This assertion was rewritten rather than kept, and it is the only one in #213 that was. It read
+// 302 with error=invalid_request in the query, and OIDC Core 1.0 section 3.1.2.6 ends with an
+// explicit exception to the rule that produces such a redirect: "If the Response Mode value is not
+// supported, the Authorization Server returns an HTTP response code of 400 (Bad Request) without
+// Error Response parameters, since understanding the Response Mode is necessary to know how to
+// return those parameters." The old assertion pinned behaviour the specification contradicts
+// (#213 decision 11).
+//
+// Deliberately driven by a browser that already holds a session, because that is what shows this is
+// not the deferral reaching another case: authentication changes nothing here. The redirect is
+// withdrawn from this failure altogether, for every request, not postponed.
+func TestAuthorize_ValidateRequest_InvalidResponseMode(t *testing.T) {
+	client := &models.Client{
+		ClientIdentifier:         "test-client-" + fake.LetterN(8),
+		Enabled:                  true,
+		AuthorizationCodeEnabled: true,
+	}
+
+	err := database.CreateClient(context.Background(), nil, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	redirectUri := &models.RedirectURI{
+		ClientId: client.Id,
+		URI:      fake.URL(),
+	}
+
+	err = database.CreateRedirectURI(context.Background(), nil, redirectUri)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	destUrl := config.GetAuthServer().BaseURL + "/auth/authorize/?client_id=" + client.ClientIdentifier +
+		"&redirect_uri=" + redirectUri.URI +
+		"&response_type=code" +
+		"&code_challenge_method=S256" +
+		"&code_challenge=" + fake.LetterN(43) +
+		"&response_mode=invalid"
+
+	httpClient := createAuthenticatedHttpClient(t)
+
+	resp, err := httpClient.Get(destUrl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	assert.Empty(t, resp.Header.Get("Location"),
+		"the response carries no error parameters, so it carries no redirect either")
+
+	doc, err := goquery.NewDocumentFromReader(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The same sentence the error_description used to carry, so an integrator who reads it in a
+	// redirect from an older build recognises it on the page.
+	errorMsg := doc.Find("p#errorMsg").Text()
+	assert.Equal(t, "Invalid response_mode parameter. Supported values are: query, fragment, form_post.", errorMsg)
+}
+
+// The half of the same rule that #213 itself introduced: without this branch a logged-out visitor
+// would have been shown a password form and then redirected, so the change would have put a
+// credential prompt in front of a redirect that should never be emitted at all.
+//
+// Asserting the absence of a Location header is the point. A 400 that also redirects would satisfy
+// the status assertion above while still handing the browser to a client-chosen host, and a redirect
+// to /auth/level1 would mean the error was parked instead of answered.
+func TestAuthorize_ValidateRequest_InvalidResponseMode_NoSessionIsNotAskedToLogIn(t *testing.T) {
+	client := &models.Client{
+		ClientIdentifier:         "test-client-" + fake.LetterN(8),
+		Enabled:                  true,
+		AuthorizationCodeEnabled: true,
+	}
+
+	err := database.CreateClient(context.Background(), nil, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	redirectUri := &models.RedirectURI{
+		ClientId: client.Id,
+		URI:      fake.URL(),
+	}
+
+	err = database.CreateRedirectURI(context.Background(), nil, redirectUri)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	destUrl := config.GetAuthServer().BaseURL + "/auth/authorize/?client_id=" + client.ClientIdentifier +
+		"&redirect_uri=" + redirectUri.URI +
+		"&response_type=code" +
+		"&code_challenge_method=S256" +
+		"&code_challenge=" + fake.LetterN(43) +
+		"&response_mode=invalid"
+
+	// Cookieless: no session, and no prompt parameter, which is the combination every other
+	// validation failure defers.
+	httpClient := createHttpClient(t)
+
+	resp, err := httpClient.Get(destUrl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	assert.Empty(t, resp.Header.Get("Location"),
+		"neither the client nor the login page: this failure is answered where it is found")
+
+	doc, err := goquery.NewDocumentFromReader(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	errorMsg := doc.Find("p#errorMsg").Text()
+	assert.Equal(t, "Invalid response_mode parameter. Supported values are: query, fragment, form_post.", errorMsg)
+}
+
+// The message is new text on a page that renders in the visitor's locale, so it is pinned the way
+// the seven client and redirect_uri messages are: one condition requested with ui_locales, asserting
+// the Portuguese sentence. Without it, a handler that hardcoded the English string would pass every
+// other assertion in this file (#213).
+//
+// The title is not re-asserted here. It is the same key the client and redirect_uri page uses and
+// TestAuthorize_ValidateClientAndRedirectURI_RendersInTheRequestedLocale already owns it.
+func TestAuthorize_ValidateRequest_InvalidResponseMode_RendersInTheRequestedLocale(t *testing.T) {
+	client := &models.Client{
+		ClientIdentifier:         "test-client-" + fake.LetterN(8),
+		Enabled:                  true,
+		AuthorizationCodeEnabled: true,
+	}
+
+	err := database.CreateClient(context.Background(), nil, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	redirectUri := &models.RedirectURI{
+		ClientId: client.Id,
+		URI:      fake.URL(),
+	}
+
+	err = database.CreateRedirectURI(context.Background(), nil, redirectUri)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	destUrl := config.GetAuthServer().BaseURL + "/auth/authorize/?client_id=" + client.ClientIdentifier +
+		"&redirect_uri=" + redirectUri.URI +
+		"&response_type=code" +
+		"&code_challenge_method=S256" +
+		"&code_challenge=" + fake.LetterN(43) +
+		"&response_mode=invalid" +
+		"&ui_locales=pt-BR"
+
+	httpClient := createHttpClient(t)
+
+	resp, err := httpClient.Get(destUrl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+
+	doc, err := goquery.NewDocumentFromReader(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	errorMsg := doc.Find("p#errorMsg").Text()
+	assert.Equal(t, "Parâmetro response_mode inválido. Os valores aceitos são: query, fragment, form_post.", errorMsg,
+		"the message did not render in pt-BR; the handler is not localizing it")
+}
+
+func TestAuthorize_ValidateRequest_QueryResponseMode(t *testing.T) {
+	client := &models.Client{
+		ClientIdentifier:         "test-client-" + fake.LetterN(8),
+		Enabled:                  true,
+		AuthorizationCodeEnabled: true,
+	}
+
+	err := database.CreateClient(context.Background(), nil, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	redirectUri := &models.RedirectURI{
+		ClientId: client.Id,
+		URI:      fake.URL(),
+	}
+
+	err = database.CreateRedirectURI(context.Background(), nil, redirectUri)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	destUrl := config.GetAuthServer().BaseURL + "/auth/authorize/?client_id=" + client.ClientIdentifier +
+		"&redirect_uri=" + redirectUri.URI +
+		"&response_type=code" +
+		"&code_challenge_method=S256" +
+		"&code_challenge=" + fake.LetterN(43) +
+		"&response_mode=query" +
+		"&scope=invalid_scope" // to prevent full authorize execution
+
+	httpClient := createAuthenticatedHttpClient(t)
+
+	resp, err := httpClient.Get(destUrl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusFound, resp.StatusCode)
+
+	redirectLocation, err := url.Parse(resp.Header.Get("Location"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	errorCode := redirectLocation.Query().Get("error")
+	errorDescription := redirectLocation.Query().Get("error_description")
+
+	assert.Equal(t, "invalid_scope", errorCode)
+	assert.Contains(t, errorDescription, "Invalid scope format")
+}
+
+func TestAuthorize_ValidateRequest_FragmentResponseMode(t *testing.T) {
+	client := &models.Client{
+		ClientIdentifier:         "test-client-" + fake.LetterN(8),
+		Enabled:                  true,
+		AuthorizationCodeEnabled: true,
+	}
+
+	err := database.CreateClient(context.Background(), nil, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	redirectUri := &models.RedirectURI{
+		ClientId: client.Id,
+		URI:      fake.URL(),
+	}
+
+	err = database.CreateRedirectURI(context.Background(), nil, redirectUri)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	destUrl := config.GetAuthServer().BaseURL + "/auth/authorize/?client_id=" + client.ClientIdentifier +
+		"&redirect_uri=" + redirectUri.URI +
+		"&response_type=code" +
+		"&code_challenge_method=S256" +
+		"&code_challenge=" + fake.LetterN(43) +
+		"&response_mode=fragment" +
+		"&scope=invalid_scope" // to prevent full authorize execution
+
+	httpClient := createAuthenticatedHttpClient(t)
+
+	resp, err := httpClient.Get(destUrl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusFound, resp.StatusCode)
+
+	redirectLocation, err := url.Parse(resp.Header.Get("Location"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fragment, _ := url.ParseQuery(redirectLocation.Fragment)
+	errorCode := fragment.Get("error")
+	errorDescription := fragment.Get("error_description")
+
+	assert.Equal(t, "invalid_scope", errorCode)
+	assert.Contains(t, errorDescription, "Invalid scope format")
+}
+
+func TestAuthorize_ValidateRequest_FormPostResponseMode(t *testing.T) {
+	client := &models.Client{
+		ClientIdentifier:         "test-client-" + fake.LetterN(8),
+		Enabled:                  true,
+		AuthorizationCodeEnabled: true,
+	}
+
+	err := database.CreateClient(context.Background(), nil, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	redirectUri := &models.RedirectURI{
+		ClientId: client.Id,
+		URI:      fake.URL(),
+	}
+
+	err = database.CreateRedirectURI(context.Background(), nil, redirectUri)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	destUrl := config.GetAuthServer().BaseURL + "/auth/authorize/?client_id=" + client.ClientIdentifier +
+		"&redirect_uri=" + redirectUri.URI +
+		"&response_type=code" +
+		"&code_challenge_method=S256" +
+		"&code_challenge=" + fake.LetterN(43) +
+		"&response_mode=form_post" +
+		"&scope=invalid_scope" // to prevent full authorize execution
+
+	httpClient := createAuthenticatedHttpClient(t)
+
+	resp, err := httpClient.Get(destUrl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+	doc, err := goquery.NewDocumentFromReader(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	formAction, exists := doc.Find("form").Attr("action")
+	assert.True(t, exists, "Form action should exist")
+	assert.Equal(t, redirectUri.URI, formAction, "Form action should match redirect URI")
+
+	errorValue := doc.Find("input[name='error']").AttrOr("value", "")
+	assert.Equal(t, "invalid_scope", errorValue, "Error value should be 'invalid_scope'")
+
+	errorDescription := doc.Find("input[name='error_description']").AttrOr("value", "")
+	assert.Contains(t, errorDescription, "Invalid scope format", "Error description should contain 'Invalid scope format'")
+}
+
+func TestAuthorize_ValidateScopes_ScopeIsMissing(t *testing.T) {
+	client := &models.Client{
+		ClientIdentifier:         "test-client-" + fake.LetterN(8),
+		Enabled:                  true,
+		AuthorizationCodeEnabled: true,
+	}
+
+	err := database.CreateClient(context.Background(), nil, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	redirectUri := &models.RedirectURI{
+		ClientId: client.Id,
+		URI:      fake.URL(),
+	}
+
+	err = database.CreateRedirectURI(context.Background(), nil, redirectUri)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	destUrl := config.GetAuthServer().BaseURL + "/auth/authorize/?client_id=" + client.ClientIdentifier +
+		"&redirect_uri=" + redirectUri.URI +
+		"&response_type=code" +
+		"&code_challenge_method=S256" +
+		"&code_challenge=" + fake.LetterN(43)
+
+	httpClient := createAuthenticatedHttpClient(t)
+
+	resp, err := httpClient.Get(destUrl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusFound, resp.StatusCode)
+
+	redirectLocation, err := url.Parse(resp.Header.Get("Location"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	errorCode := redirectLocation.Query().Get("error")
+	errorDescription := redirectLocation.Query().Get("error_description")
+
+	assert.Equal(t, "invalid_scope", errorCode)
+	assert.Contains(t, errorDescription, "The 'scope' parameter is missing")
+}
+
+func TestAuthorize_ValidateScopes_UserInfoShouldNotBeIncluded(t *testing.T) {
+	client := &models.Client{
+		ClientIdentifier:         "test-client-" + fake.LetterN(8),
+		Enabled:                  true,
+		AuthorizationCodeEnabled: true,
+	}
+
+	err := database.CreateClient(context.Background(), nil, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	redirectUri := &models.RedirectURI{
+		ClientId: client.Id,
+		URI:      fake.URL(),
+	}
+
+	err = database.CreateRedirectURI(context.Background(), nil, redirectUri)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	userInfoScope := fmt.Sprintf("%v:%v", constants.AuthServerResourceIdentifier, constants.UserinfoPermissionIdentifier)
+
+	baseUrl := config.GetAuthServer().BaseURL + "/auth/authorize/"
+	params := url.Values{}
+	params.Add("client_id", client.ClientIdentifier)
+	params.Add("redirect_uri", redirectUri.URI)
+	params.Add("response_type", "code")
+	params.Add("code_challenge_method", "S256")
+	params.Add("code_challenge", fake.LetterN(43))
+	params.Add("scope", "openid profile "+userInfoScope)
+
+	destUrl := baseUrl + "?" + params.Encode()
+
+	httpClient := createAuthenticatedHttpClient(t)
+
+	resp, err := httpClient.Get(destUrl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusFound, resp.StatusCode)
+
+	redirectLocation, err := url.Parse(resp.Header.Get("Location"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	errorCode := redirectLocation.Query().Get("error")
+	errorDescription := redirectLocation.Query().Get("error_description")
+
+	assert.Equal(t, "invalid_scope", errorCode)
+	assert.Contains(t, errorDescription, "The 'authserver:userinfo' scope is automatically included in the access token")
+}
+
+func TestAuthorize_ValidateScopes_InvalidScope(t *testing.T) {
+	client := &models.Client{
+		ClientIdentifier:         "test-client-" + fake.LetterN(8),
+		Enabled:                  true,
+		AuthorizationCodeEnabled: true,
+	}
+
+	err := database.CreateClient(context.Background(), nil, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	redirectUri := &models.RedirectURI{
+		ClientId: client.Id,
+		URI:      fake.URL(),
+	}
+
+	err = database.CreateRedirectURI(context.Background(), nil, redirectUri)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	testCases := []struct {
+		name  string
+		scope string
+	}{
+		{
+			name:  "Invalid single scope",
+			scope: "my_scope",
+		},
+		{
+			name:  "Invalid complex scope",
+			scope: "my_resource:my_scope:something",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			destUrl := config.GetAuthServer().BaseURL + "/auth/authorize/?client_id=" + client.ClientIdentifier +
+				"&redirect_uri=" + url.QueryEscape(redirectUri.URI) +
+				"&response_type=code" +
+				"&code_challenge_method=S256" +
+				"&code_challenge=" + fake.LetterN(43) +
+				"&scope=" + url.QueryEscape(tc.scope)
+
+			httpClient := createAuthenticatedHttpClient(t)
+
+			resp, err := httpClient.Get(destUrl)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = resp.Body.Close() }()
+
+			assert.Equal(t, http.StatusFound, resp.StatusCode)
+
+			redirectLocation, err := url.Parse(resp.Header.Get("Location"))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			errorCode := redirectLocation.Query().Get("error")
+			errorDescription := redirectLocation.Query().Get("error_description")
+
+			assert.Equal(t, "invalid_scope", errorCode)
+			assert.Contains(t, errorDescription, "Invalid scope format")
+		})
+	}
+}
+
+func TestAuthorize_ValidateScopes_ResourceDoesNotExist(t *testing.T) {
+	client := &models.Client{
+		ClientIdentifier:         "test-client-" + fake.LetterN(8),
+		Enabled:                  true,
+		AuthorizationCodeEnabled: true,
+	}
+
+	err := database.CreateClient(context.Background(), nil, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	redirectUri := &models.RedirectURI{
+		ClientId: client.Id,
+		URI:      fake.URL(),
+	}
+
+	err = database.CreateRedirectURI(context.Background(), nil, redirectUri)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	nonExistentResource := "non_existent_resource"
+	scope := fmt.Sprintf("%s:read", nonExistentResource)
+
+	destUrl := config.GetAuthServer().BaseURL + "/auth/authorize/?client_id=" + client.ClientIdentifier +
+		"&redirect_uri=" + url.QueryEscape(redirectUri.URI) +
+		"&response_type=code" +
+		"&code_challenge_method=S256" +
+		"&code_challenge=" + fake.LetterN(43) +
+		"&scope=" + url.QueryEscape(scope)
+
+	httpClient := createAuthenticatedHttpClient(t)
+
+	resp, err := httpClient.Get(destUrl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusFound, resp.StatusCode)
+
+	redirectLocation, err := url.Parse(resp.Header.Get("Location"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	errorCode := redirectLocation.Query().Get("error")
+	errorDescription := redirectLocation.Query().Get("error_description")
+
+	assert.Equal(t, "invalid_scope", errorCode)
+	assert.Contains(t, errorDescription, fmt.Sprintf("Invalid scope: '%s:read'. Could not find a resource with identifier '%s'", nonExistentResource, nonExistentResource))
+}
+
+func TestAuthorize_ValidateScopes_ResourceDoesNotHavePermissionAssociated(t *testing.T) {
+	client := &models.Client{
+		ClientIdentifier:         "test-client-" + fake.LetterN(8),
+		Enabled:                  true,
+		AuthorizationCodeEnabled: true,
+	}
+
+	err := database.CreateClient(context.Background(), nil, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	redirectUri := &models.RedirectURI{
+		ClientId: client.Id,
+		URI:      fake.URL(),
+	}
+
+	err = database.CreateRedirectURI(context.Background(), nil, redirectUri)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resource := &models.Resource{
+		ResourceIdentifier: "test-resource-" + fake.LetterN(8),
+		Description:        "Test Resource",
+	}
+
+	err = database.CreateResource(context.Background(), nil, resource)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	nonExistentPermission := "non_existent_permission"
+	scope := fmt.Sprintf("%s:%s", resource.ResourceIdentifier, nonExistentPermission)
+
+	destUrl := config.GetAuthServer().BaseURL + "/auth/authorize/?client_id=" + client.ClientIdentifier +
+		"&redirect_uri=" + url.QueryEscape(redirectUri.URI) +
+		"&response_type=code" +
+		"&code_challenge_method=S256" +
+		"&code_challenge=" + fake.LetterN(43) +
+		"&scope=" + url.QueryEscape(scope)
+
+	httpClient := createAuthenticatedHttpClient(t)
+
+	resp, err := httpClient.Get(destUrl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusFound, resp.StatusCode)
+
+	redirectLocation, err := url.Parse(resp.Header.Get("Location"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	errorCode := redirectLocation.Query().Get("error")
+	errorDescription := redirectLocation.Query().Get("error_description")
+
+	assert.Equal(t, "invalid_scope", errorCode)
+	assert.Contains(t, errorDescription, fmt.Sprintf("Scope '%s:%s' is invalid. The resource identified by '%s' does not have a permission with identifier '%s'", resource.ResourceIdentifier, nonExistentPermission, resource.ResourceIdentifier, nonExistentPermission))
+}
+
+// TestAuthorize_ValidateScopes_EmojiScope_FormPostDescriptionIsConformed proves the authorization
+// endpoint's error_description carries no byte RFC 6749 forbids, on the response mode where a filter
+// applied to the wrong branch would show.
+//
+// RFC 6749 Appendix A.8 gives error-description = 1*NQSCHAR (%x20-21 / %x23-5B / %x5D-7E), and the
+// same production governs 4.1.2.1, 4.2.2.1 and 5.2 alike. form_post is chosen because the query and
+// fragment modes share one parameter slice while this branch builds a bind map of its own, so a
+// conform applied one level too low would pass on two modes and fail here. The scope keeps ASCII on
+// both sides of the offending rune, which is what proves the filter replaces rather than drops and
+// still names the scope that was refused (#213).
+//
+// Thin on purpose: the character set is owned by TestConformErrorDescription in
+// src/core/customerrors, and what is left here is that the filter is on this wire path.
+//
+// It drives an authenticated browser where its neighbours in this file are cookieless. That changes
+// nothing today, since the validations run above the session lookup, and it keeps the case correct
+// once #213 moves them: written cookieless, this row would be one more test for the ordering change
+// to retrofit, and it would be retrofitted by the very change it exists to be independent of.
+func TestAuthorize_ValidateScopes_EmojiScope_FormPostDescriptionIsConformed(t *testing.T) {
+	httpClient, client, redirectUri, _ := createSessionWithAcrLevel1(t)
+
+	destUrl := config.GetAuthServer().BaseURL + "/auth/authorize/?client_id=" + client.ClientIdentifier +
+		"&redirect_uri=" + url.QueryEscape(redirectUri.URI) +
+		"&response_type=code" +
+		"&code_challenge_method=S256" +
+		"&code_challenge=" + fake.LetterN(43) +
+		"&response_mode=form_post" +
+		"&scope=" + url.QueryEscape("emoji💣scope")
+
+	resp, err := httpClient.Get(destUrl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+	doc, err := goquery.NewDocumentFromReader(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	errorValue := doc.Find("input[name='error']").AttrOr("value", "")
+	assert.Equal(t, "invalid_scope", errorValue)
+
+	errorDescription := doc.Find("input[name='error_description']").AttrOr("value", "")
+	assert.Equal(t,
+		"Invalid scope format: 'emoji?scope'. Scopes must adhere to the resource-identifier:permission-identifier format. For instance: backend-service:create-product.",
+		errorDescription)
+}

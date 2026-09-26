@@ -1,0 +1,312 @@
+package main
+
+import (
+	"io"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"testing"
+)
+
+// The two variables the admin console stopped reading. The client id is the compile-time
+// constant `admin-console-client` and the issuer comes from the auth server's public
+// settings, so a deployment artifact that sets either is asking an operator for a value
+// they cannot choose, and the admin console now refuses to start when the issuer one is
+// present at all (#285).
+//
+// These generators are pure and their output is what an operator pastes into a server, so
+// a reintroduced line here ships silently: nothing else in the repository reads what they
+// produce. Before this file the module had no tests at all, and `go test ./...` reported
+// `[no test files]` with the removed lines restored.
+var removedAdminConsoleVars = []string{
+	"GOIABADA_ADMINCONSOLE_OAUTH_CLIENT_ID",
+	"GOIABADA_ADMINCONSOLE_ISSUER",
+}
+
+// testConfig is a fully populated wizard answer set. Every field carries a distinguishable
+// value so a generator that emitted the wrong one would still be visible in a failure.
+func testConfig() *Config {
+	return &Config{
+		DeploymentType:      "2",
+		DBType:              "postgres",
+		DBImage:             "postgres:17",
+		DBPort:              "5432",
+		DBHost:              "goiabada-db",
+		DBName:              "goiabada",
+		DBUsername:          "goiabada-user",
+		DBPassword:          "db-password",
+		AuthServerURL:       "https://auth.example.com",
+		AdminConsoleURL:     "https://admin.example.com",
+		AdminEmail:          "admin@example.com",
+		AdminPassword:       "admin-password",
+		AuthSessionAuthKey:  "auth-session-auth-key",
+		AuthSessionEncKey:   "auth-session-enc-key",
+		AdminSessionAuthKey: "admin-session-auth-key",
+		AdminSessionEncKey:  "admin-session-enc-key",
+		AESEncryptionKey:    "aes-encryption-key",
+		OAuthClientSecret:   "oauth-client-secret",
+		K8sNamespace:        "goiabada",
+	}
+}
+
+func TestGeneratedOutputsOmitTheRemovedAdminConsoleVars(t *testing.T) {
+	config := testConfig()
+
+	// Each case names a line the generator must still emit. Absence alone would pass
+	// against a generator that returned nothing, which is the way this test could go
+	// quietly false as the wizard changes.
+	testCases := []struct {
+		name         string
+		generated    string
+		stillEmitted string
+	}{
+		{
+			name:         "admin console compose service",
+			generated:    generateAdminConsoleService(config),
+			stillEmitted: "GOIABADA_ADMINCONSOLE_OAUTH_CLIENT_SECRET=oauth-client-secret",
+		},
+		{
+			name:         "whole compose file",
+			generated:    generateDockerCompose(config),
+			stillEmitted: "goiabada-adminconsole:",
+		},
+		{
+			name:         "env file for native binaries",
+			generated:    generateEnvFile(config),
+			stillEmitted: `export GOIABADA_ADMINCONSOLE_OAUTH_CLIENT_SECRET="oauth-client-secret"`,
+		},
+		{
+			name:         "kubernetes manifests",
+			generated:    generateKubernetesManifests(config),
+			stillEmitted: "GOIABADA_ADMINCONSOLE_BASEURL: \"https://admin.example.com\"",
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			for _, removed := range removedAdminConsoleVars {
+				if strings.Contains(testCase.generated, removed) {
+					t.Errorf("output sets %s, which the admin console no longer reads", removed)
+				}
+			}
+			if !strings.Contains(testCase.generated, testCase.stillEmitted) {
+				t.Errorf("output does not contain %q, so the absence checks above proved nothing",
+					testCase.stillEmitted)
+			}
+		})
+	}
+}
+
+// The two files beside main.go are outputs of a wizard run, committed into the source
+// directory and kept in step with the generators by hand. Nothing regenerates them, so
+// they drift on their own schedule.
+func TestCommittedOutputsOmitTheRemovedAdminConsoleVars(t *testing.T) {
+	// Each case names a line the artifact must still carry, chosen from the admin console
+	// block the removed line was deleted from. Absence alone, or absence beside the
+	// generated-by banner, passes against a file truncated to that banner, which is no
+	// longer deployable and no longer evidence of anything.
+	testCases := []struct {
+		name         string
+		stillPresent string
+	}{
+		{
+			name:         "docker-compose.yml",
+			stillPresent: "- GOIABADA_ADMINCONSOLE_LISTEN_PORT_HTTP=9091",
+		},
+		{
+			name:         "goiabada-k8s.yaml",
+			stillPresent: `GOIABADA_ADMINCONSOLE_BASEURL: "https://admin.goiabada.dev"`,
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			contents, err := os.ReadFile(testCase.name)
+			if err != nil {
+				t.Fatalf("reading %s: %v", testCase.name, err)
+			}
+			for _, removed := range removedAdminConsoleVars {
+				if strings.Contains(string(contents), removed) {
+					t.Errorf("%s sets %s, which the admin console no longer reads", testCase.name, removed)
+				}
+			}
+			if !strings.Contains(string(contents), "# Generated by goiabada-setup") {
+				t.Errorf("%s lost its generated-by banner, so this file is no longer the wizard's output",
+					testCase.name)
+			}
+			if !strings.Contains(string(contents), testCase.stillPresent) {
+				t.Errorf("%s does not contain %q, so the absence checks above proved nothing",
+					testCase.name, testCase.stillPresent)
+			}
+		})
+	}
+}
+
+// Every file the wizard writes carries the admin password, the session keys and the AES key, and
+// each was written 0644 (#426). The existing-file case is the one os.WriteFile alone gets wrong: it
+// applies its mode only when it creates the file, so a re-run over an earlier 0644 output would
+// leave the new secrets world-readable. The file staged beside the destination must not outlive
+// the write either, since it holds the same secrets.
+func TestWritePrivateFile_LeavesTheFileReadableByItsOwnerAlone(t *testing.T) {
+	testCases := []struct {
+		name         string
+		existingMode os.FileMode
+	}{
+		{name: "a new file"},
+		{name: "an existing 0644 file", existingMode: 0644},
+		{name: "an existing 0666 file", existingMode: 0666},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "goiabada.env")
+			if testCase.existingMode != 0 {
+				if err := os.WriteFile(path, []byte("yesterday's secrets, and more of them"), 0600); err != nil {
+					t.Fatal(err)
+				}
+				// Set apart from the write, so the umask cannot narrow the mode being overwritten.
+				if err := os.Chmod(path, testCase.existingMode); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			if err := writePrivateFile(path, "today's secrets"); err != nil {
+				t.Fatalf("writePrivateFile: %v", err)
+			}
+
+			info, err := os.Stat(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := info.Mode().Perm(); got != 0600 {
+				t.Errorf("mode is %v, want -rw-------", got)
+			}
+			contents, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(contents) != "today's secrets" {
+				t.Errorf("contents are %q, want the new content alone", contents)
+			}
+			entries, err := os.ReadDir(filepath.Dir(path))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(entries) != 1 || entries[0].Name() != "goiabada.env" {
+				t.Errorf("the directory holds %v, want goiabada.env alone", entryNames(entries))
+			}
+		})
+	}
+}
+
+// Narrowing a file does not revoke a descriptor opened while it was readable, so a re-run that
+// wrote into an earlier run's 0644 output and then chmodded it would hand the new secrets to any
+// account that had opened the old file (#426). The new content has to land in a new inode, and
+// the old descriptor must go on reading what it could already read. Run over each of the three
+// files the wizard generates, with its real content.
+func TestWritePrivateFile_AnEarlierReaderDoesNotSeeTheNewSecrets(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows refuses to replace a file another handle holds open, so the write fails rather than leaks")
+	}
+	config := testConfig()
+
+	for _, deploymentType := range []string{"1", "3", "4"} {
+		filename, content := generatedConfiguration(deploymentType, config)
+		t.Run(filename, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), filename)
+			const yesterday = "yesterday's secrets"
+			if err := os.WriteFile(path, []byte(yesterday), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(path, 0644); err != nil {
+				t.Fatal(err)
+			}
+			earlierReader, err := os.Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = earlierReader.Close() }()
+
+			if err = writePrivateFile(path, content); err != nil {
+				t.Fatalf("writePrivateFile: %v", err)
+			}
+
+			seen, err := io.ReadAll(earlierReader)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(seen) != yesterday {
+				t.Errorf("the earlier reader sees %d bytes that are not the earlier content, want %q alone", len(seen), yesterday)
+			}
+			written, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(written) != content {
+				t.Errorf("%s does not carry the generated content", filename)
+			}
+		})
+	}
+}
+
+// A write that cannot replace its destination leaves no staged copy of the secrets behind. A
+// directory standing at the destination path is a replace every platform refuses.
+func TestWritePrivateFile_LeavesNothingBehindWhenTheReplaceFails(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, "goiabada.env"), 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := writePrivateFile(filepath.Join(dir, "goiabada.env"), "today's secrets"); err == nil {
+		t.Fatal("writePrivateFile replaced a directory, want an error")
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "goiabada.env" || !entries[0].IsDir() {
+		t.Errorf("the directory holds %v, want the goiabada.env directory alone", entryNames(entries))
+	}
+}
+
+func entryNames(entries []os.DirEntry) []string {
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		names = append(names, entry.Name())
+	}
+	return names
+}
+
+// main has one write, of whatever this returns, so each deployment type reaching writePrivateFile
+// comes down to each type's file coming from here.
+func TestGeneratedConfiguration_NamesEachDeploymentTypesFile(t *testing.T) {
+	config := testConfig()
+
+	testCases := []struct {
+		deploymentType string
+		wantFilename   string
+		wantContent    string
+	}{
+		{deploymentType: "1", wantFilename: "docker-compose.yml", wantContent: generateDockerCompose(config)},
+		{deploymentType: "2", wantFilename: "docker-compose.yml", wantContent: generateDockerCompose(config)},
+		{deploymentType: "3", wantFilename: "goiabada-k8s.yaml", wantContent: generateKubernetesManifests(config)},
+		{deploymentType: "4", wantFilename: "goiabada.env", wantContent: generateEnvFile(config)},
+	}
+
+	for _, testCase := range testCases {
+		t.Run("type "+testCase.deploymentType, func(t *testing.T) {
+			filename, content := generatedConfiguration(testCase.deploymentType, config)
+			if filename != testCase.wantFilename {
+				t.Errorf("file name is %q, want %q", filename, testCase.wantFilename)
+			}
+			if content != testCase.wantContent {
+				t.Errorf("content is not %s's generator output", testCase.wantFilename)
+			}
+			if !strings.Contains(content, "admin-password") {
+				t.Errorf("content carries no admin password, so it is not the file whose mode matters")
+			}
+		})
+	}
+}

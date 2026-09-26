@@ -1,0 +1,202 @@
+package accounthandlers
+
+import (
+	"context"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/leodip/goiabada/adminconsole/internal/config"
+	"github.com/leodip/goiabada/adminconsole/internal/constants"
+	"github.com/leodip/goiabada/adminconsole/internal/handlers"
+	"github.com/leodip/goiabada/adminconsole/internal/oauthclient"
+	"github.com/leodip/goiabada/core/api"
+	coreconstants "github.com/leodip/goiabada/core/constants"
+	"github.com/leodip/goiabada/core/errs"
+	"github.com/leodip/goiabada/core/gender"
+	"github.com/leodip/goiabada/core/locales"
+	"github.com/leodip/goiabada/core/sessionstore"
+	"github.com/leodip/goiabada/core/timezones"
+)
+
+// accountProfileAPI is what the account profile page needs: the profile it renders from, and the
+// write.
+type accountProfileAPI interface {
+	GetAccountProfile(ctx context.Context, accessToken string) (*api.UserResponse, error)
+	UpdateAccountProfile(ctx context.Context, accessToken string, request *api.UpdateUserProfileRequest) (*api.UserResponse, error)
+}
+
+func HandleAccountProfileGet(
+	httpHelper handlers.HttpHelper,
+	httpSession sessionstore.Store,
+	apiClient accountProfileAPI,
+) http.HandlerFunc {
+
+	timezones := timezones.Get()
+	locales := locales.Get()
+
+	return func(w http.ResponseWriter, r *http.Request) {
+
+		// Get JWT info to extract access token
+		jwtInfo, ok := r.Context().Value(constants.ContextKeyJwtInfo).(oauthclient.JwtInfo)
+		if !ok {
+			httpHelper.InternalServerError(w, r, errs.New("no JWT info found in context"))
+			return
+		}
+
+		user, err := apiClient.GetAccountProfile(r.Context(), jwtInfo.TokenResponse.AccessToken)
+		if err != nil {
+			handlers.HandleAPIError(httpHelper, w, r, err)
+			return
+		}
+
+		sess, err := httpSession.Get(r, coreconstants.AdminConsoleSessionName)
+		if err != nil {
+			httpHelper.InternalServerError(w, r, err)
+			return
+		}
+
+		_, savedSuccessfully := sess.TakeFlash("savedSuccessfully")
+		if savedSuccessfully {
+			err = httpSession.Save(r, w, sess)
+			if err != nil {
+				httpHelper.InternalServerError(w, r, err)
+				return
+			}
+		}
+
+		bind := map[string]interface{}{
+			"user":              user,
+			"timezones":         timezones,
+			"locales":           locales,
+			"savedSuccessfully": savedSuccessfully,
+		}
+
+		err = httpHelper.RenderTemplate(w, r, "/layouts/menu_layout.html", "/account_profile.html", bind)
+		if err != nil {
+			httpHelper.InternalServerError(w, r, err)
+			return
+		}
+	}
+}
+
+func HandleAccountProfilePost(
+	httpHelper handlers.HttpHelper,
+	httpSession sessionstore.Store,
+	apiClient accountProfileAPI,
+) http.HandlerFunc {
+
+	timezones := timezones.Get()
+	locales := locales.Get()
+
+	return func(w http.ResponseWriter, r *http.Request) {
+
+		// Get access token
+		jwtInfo, ok := r.Context().Value(constants.ContextKeyJwtInfo).(oauthclient.JwtInfo)
+		if !ok {
+			httpHelper.InternalServerError(w, r, errs.New("no JWT info found in context"))
+			return
+		}
+
+		// Load current profile (for successful render or error rebound)
+		user, err := apiClient.GetAccountProfile(r.Context(), jwtInfo.TokenResponse.AccessToken)
+		if err != nil {
+			handlers.HandleAPIError(httpHelper, w, r, err)
+			return
+		}
+
+		zoneInfoValue := r.FormValue("zoneInfo")
+		zoneInfoCountryName := ""
+		zoneInfo := ""
+
+		if zoneInfoValue != "" {
+			zoneInfoParts := strings.Split(zoneInfoValue, "___")
+			if len(zoneInfoParts) != 2 {
+				httpHelper.InternalServerError(w, r, errs.New("invalid zoneInfo"))
+				return
+			}
+			zoneInfoCountryName = zoneInfoParts[0]
+			zoneInfo = zoneInfoParts[1]
+		}
+
+		// Build API request
+		request := &api.UpdateUserProfileRequest{
+			Username:            strings.TrimSpace(r.FormValue("username")),
+			GivenName:           strings.TrimSpace(r.FormValue("givenName")),
+			MiddleName:          strings.TrimSpace(r.FormValue("middleName")),
+			FamilyName:          strings.TrimSpace(r.FormValue("familyName")),
+			Nickname:            strings.TrimSpace(r.FormValue("nickname")),
+			Website:             strings.TrimSpace(r.FormValue("website")),
+			Gender:              r.FormValue("gender"),
+			DateOfBirth:         strings.TrimSpace(r.FormValue("dateOfBirth")),
+			ZoneInfoCountryName: zoneInfoCountryName,
+			ZoneInfo:            zoneInfo,
+			Locale:              r.FormValue("locale"),
+		}
+
+		// Call API to update
+		updatedUser, err := apiClient.UpdateAccountProfile(r.Context(), jwtInfo.TokenResponse.AccessToken, request)
+		if err != nil {
+			// Render validation error retaining input
+			handlers.HandleAPIErrorWithCallback(httpHelper, w, r, err, func(errorMessage string) {
+				// reflect submitted values onto user for display
+				user.Username = request.Username
+				user.GivenName = request.GivenName
+				user.MiddleName = request.MiddleName
+				user.FamilyName = request.FamilyName
+				user.Nickname = request.Nickname
+				user.Website = request.Website
+				user.ZoneInfoCountryName = request.ZoneInfoCountryName
+				user.ZoneInfo = request.ZoneInfo
+				user.Locale = request.Locale
+
+				if len(request.Gender) > 0 {
+					if i, parseErr := strconv.Atoi(request.Gender); parseErr == nil {
+						user.Gender = gender.Gender(i).String()
+					}
+				} else {
+					user.Gender = ""
+				}
+
+				if len(request.DateOfBirth) > 0 {
+					layout := "2006-01-02"
+					if parsed, parseErr := time.Parse(layout, request.DateOfBirth); parseErr == nil {
+						user.BirthDate = &parsed
+					}
+				} else {
+					user.BirthDate = nil
+				}
+
+				bind := map[string]interface{}{
+					"user":      user,
+					"timezones": timezones,
+					"locales":   locales,
+					"error":     errorMessage,
+				}
+
+				if renderErr := httpHelper.RenderTemplate(w, r, "/layouts/menu_layout.html", "/account_profile.html", bind); renderErr != nil {
+					httpHelper.InternalServerError(w, r, renderErr)
+					return
+				}
+			})
+			return
+		}
+
+		sess, err := httpSession.Get(r, coreconstants.AdminConsoleSessionName)
+		if err != nil {
+			httpHelper.InternalServerError(w, r, err)
+			return
+		}
+		sess.SetFlash("savedSuccessfully", "true")
+		err = httpSession.Save(r, w, sess)
+		if err != nil {
+			httpHelper.InternalServerError(w, r, err)
+			return
+		}
+
+		_ = updatedUser // we don't need it here besides success confirmation
+
+		http.Redirect(w, r, config.GetAdminConsole().BaseURL+"/account/profile", http.StatusFound)
+	}
+}

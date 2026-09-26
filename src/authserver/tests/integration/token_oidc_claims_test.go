@@ -1,0 +1,423 @@
+package integrationtests
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"net/http"
+	"net/url"
+	"testing"
+
+	"github.com/leodip/goiabada/authserver/internal/config"
+	"github.com/leodip/goiabada/authserver/internal/encryption"
+	"github.com/leodip/goiabada/authserver/internal/models"
+	"github.com/leodip/goiabada/authserver/internal/passwordhash"
+	"github.com/leodip/goiabada/authserver/internal/testutil/fake"
+	"github.com/leodip/goiabada/core/gender"
+	"github.com/leodip/goiabada/core/oauth"
+	"github.com/stretchr/testify/assert"
+)
+
+// ============================================================================
+// IncludeOpenIDConnectClaimsInIdToken setting tests
+// These tests verify the behavior of the setting that controls whether
+// OIDC scope-based claims (email, profile, address, phone) are included
+// in the ID token or only available via /userinfo endpoint
+// ============================================================================
+
+func TestToken_IdToken_OIDCClaims_GlobalDisabled(t *testing.T) {
+	// Get settings and disable the global setting
+	settings, err := database.GetSettingsById(context.Background(), nil, 1)
+	assert.NoError(t, err)
+
+	originalValue := settings.IncludeOpenIDConnectClaimsInIdToken
+	settings.IncludeOpenIDConnectClaimsInIdToken = false
+	err = database.UpdateSettings(context.Background(), nil, settings)
+	assert.NoError(t, err)
+
+	// Restore original value after test
+	defer func() {
+		settings.IncludeOpenIDConnectClaimsInIdToken = originalValue
+		_ = database.UpdateSettings(context.Background(), nil, settings)
+	}()
+
+	clientSecret := fake.LetterN(32)
+	httpClient, code := createAuthCodeWithUserProfile(t, clientSecret, "openid profile email")
+
+	destUrl := config.GetAuthServer().BaseURL + "/auth/token/"
+
+	formData := url.Values{
+		"grant_type":    {"authorization_code"},
+		"client_id":     {code.Client.ClientIdentifier},
+		"code":          {code.Code},
+		"redirect_uri":  {code.RedirectURI},
+		"code_verifier": {"code-verifier"},
+		"client_secret": {clientSecret},
+	}
+
+	data := postToTokenEndpoint(t, httpClient, destUrl, formData)
+
+	// Verify we got tokens
+	assert.NotNil(t, data["access_token"])
+	assert.NotNil(t, data["id_token"])
+
+	// Decode ID token
+	idToken := data["id_token"].(string)
+	idClaims := decodeJWTPayload(t, idToken)
+
+	// Core OIDC claims should ALWAYS be present
+	assert.NotNil(t, idClaims["sub"], "sub claim must always be present")
+	assert.NotNil(t, idClaims["iss"], "iss claim must always be present")
+	assert.NotNil(t, idClaims["aud"], "aud claim must always be present")
+	assert.NotNil(t, idClaims["iat"], "iat claim must always be present")
+	assert.NotNil(t, idClaims["exp"], "exp claim must always be present")
+
+	// OIDC scope-based claims should NOT be present when setting is disabled
+	assert.Nil(t, idClaims["email"], "email claim should NOT be in ID token when setting is disabled")
+	assert.Nil(t, idClaims["email_verified"], "email_verified claim should NOT be in ID token when setting is disabled")
+	assert.Nil(t, idClaims["name"], "name claim should NOT be in ID token when setting is disabled")
+	assert.Nil(t, idClaims["given_name"], "given_name claim should NOT be in ID token when setting is disabled")
+	assert.Nil(t, idClaims["family_name"], "family_name claim should NOT be in ID token when setting is disabled")
+	assert.Nil(t, idClaims["middle_name"], "middle_name claim should NOT be in ID token when setting is disabled")
+	assert.Nil(t, idClaims["nickname"], "nickname claim should NOT be in ID token when setting is disabled")
+	assert.Nil(t, idClaims["profile"], "profile claim should NOT be in ID token when setting is disabled")
+	assert.Nil(t, idClaims["picture"], "picture claim should NOT be in ID token when setting is disabled")
+	assert.Nil(t, idClaims["website"], "website claim should NOT be in ID token when setting is disabled")
+	assert.Nil(t, idClaims["gender"], "gender claim should NOT be in ID token when setting is disabled")
+	assert.Nil(t, idClaims["birthdate"], "birthdate claim should NOT be in ID token when setting is disabled")
+	assert.Nil(t, idClaims["zoneinfo"], "zoneinfo claim should NOT be in ID token when setting is disabled")
+	assert.Nil(t, idClaims["locale"], "locale claim should NOT be in ID token when setting is disabled")
+	assert.Nil(t, idClaims["phone_number"], "phone_number claim should NOT be in ID token when setting is disabled")
+	assert.Nil(t, idClaims["phone_number_verified"], "phone_number_verified claim should NOT be in ID token when setting is disabled")
+	assert.Nil(t, idClaims["address"], "address claim should NOT be in ID token when setting is disabled")
+
+	// But OIDC scope-based claims SHOULD be available via /userinfo
+	accessToken := data["access_token"].(string)
+	userinfoUrl := config.GetAuthServer().BaseURL + "/userinfo"
+	req, err := http.NewRequest("GET", userinfoUrl, nil)
+	assert.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+
+	userinfoResp, err := httpClient.Do(req)
+	assert.NoError(t, err)
+	defer func() { _ = userinfoResp.Body.Close() }()
+
+	assert.Equal(t, http.StatusOK, userinfoResp.StatusCode)
+
+	var userinfo map[string]interface{}
+	err = json.NewDecoder(userinfoResp.Body).Decode(&userinfo)
+	assert.NoError(t, err)
+	assert.NotNil(t, userinfo["email"], "email claim should be available via /userinfo")
+	assert.NotNil(t, userinfo["email_verified"], "email_verified claim should be available via /userinfo")
+	assert.NotNil(t, userinfo["name"], "name claim should be available via /userinfo")
+	assert.NotNil(t, userinfo["given_name"], "given_name claim should be available via /userinfo")
+}
+
+func TestToken_IdToken_OIDCClaims_GlobalEnabled(t *testing.T) {
+	// Get settings and ensure the global setting is enabled
+	settings, err := database.GetSettingsById(context.Background(), nil, 1)
+	assert.NoError(t, err)
+
+	originalValue := settings.IncludeOpenIDConnectClaimsInIdToken
+	settings.IncludeOpenIDConnectClaimsInIdToken = true
+	err = database.UpdateSettings(context.Background(), nil, settings)
+	assert.NoError(t, err)
+
+	// Restore original value after test
+	defer func() {
+		settings.IncludeOpenIDConnectClaimsInIdToken = originalValue
+		_ = database.UpdateSettings(context.Background(), nil, settings)
+	}()
+
+	clientSecret := fake.LetterN(32)
+	httpClient, code := createAuthCodeWithUserProfile(t, clientSecret, "openid profile email")
+
+	destUrl := config.GetAuthServer().BaseURL + "/auth/token/"
+
+	formData := url.Values{
+		"grant_type":    {"authorization_code"},
+		"client_id":     {code.Client.ClientIdentifier},
+		"code":          {code.Code},
+		"redirect_uri":  {code.RedirectURI},
+		"code_verifier": {"code-verifier"},
+		"client_secret": {clientSecret},
+	}
+
+	data := postToTokenEndpoint(t, httpClient, destUrl, formData)
+
+	// Verify we got tokens
+	assert.NotNil(t, data["access_token"])
+	assert.NotNil(t, data["id_token"])
+
+	// Decode ID token
+	idToken := data["id_token"].(string)
+	idClaims := decodeJWTPayload(t, idToken)
+
+	// Core OIDC claims should ALWAYS be present
+	assert.NotNil(t, idClaims["sub"], "sub claim must always be present")
+	assert.NotNil(t, idClaims["iss"], "iss claim must always be present")
+	assert.NotNil(t, idClaims["aud"], "aud claim must always be present")
+	assert.NotNil(t, idClaims["iat"], "iat claim must always be present")
+	assert.NotNil(t, idClaims["exp"], "exp claim must always be present")
+
+	// OIDC scope-based claims SHOULD be present when setting is enabled
+	assert.NotNil(t, idClaims["email"], "email claim should be in ID token when setting is enabled")
+	assert.NotNil(t, idClaims["email_verified"], "email_verified claim should be in ID token when setting is enabled")
+	assert.NotNil(t, idClaims["name"], "name claim should be in ID token when setting is enabled")
+	assert.NotNil(t, idClaims["given_name"], "given_name claim should be in ID token when setting is enabled")
+	assert.NotNil(t, idClaims["family_name"], "family_name claim should be in ID token when setting is enabled")
+	assert.NotNil(t, idClaims["middle_name"], "middle_name claim should be in ID token when setting is enabled")
+}
+
+func TestToken_IdToken_OIDCClaims_ClientOverride_On(t *testing.T) {
+	// Get settings and disable the global setting
+	settings, err := database.GetSettingsById(context.Background(), nil, 1)
+	assert.NoError(t, err)
+
+	originalValue := settings.IncludeOpenIDConnectClaimsInIdToken
+	settings.IncludeOpenIDConnectClaimsInIdToken = false // Global disabled
+	err = database.UpdateSettings(context.Background(), nil, settings)
+	assert.NoError(t, err)
+
+	// Restore original value after test
+	defer func() {
+		settings.IncludeOpenIDConnectClaimsInIdToken = originalValue
+		_ = database.UpdateSettings(context.Background(), nil, settings)
+	}()
+
+	clientSecret := fake.LetterN(32)
+	httpClient, code := createAuthCodeWithUserProfile(t, clientSecret, "openid profile email")
+
+	// Set client-level override to "on"
+	originalClientSetting := code.Client.IncludeOpenIDConnectClaimsInIdToken
+	code.Client.IncludeOpenIDConnectClaimsInIdToken = "on"
+	err = database.UpdateClient(context.Background(), nil, &code.Client)
+	assert.NoError(t, err)
+	defer func() {
+		code.Client.IncludeOpenIDConnectClaimsInIdToken = originalClientSetting
+		_ = database.UpdateClient(context.Background(), nil, &code.Client)
+	}()
+
+	destUrl := config.GetAuthServer().BaseURL + "/auth/token/"
+
+	formData := url.Values{
+		"grant_type":    {"authorization_code"},
+		"client_id":     {code.Client.ClientIdentifier},
+		"code":          {code.Code},
+		"redirect_uri":  {code.RedirectURI},
+		"code_verifier": {"code-verifier"},
+		"client_secret": {clientSecret},
+	}
+
+	data := postToTokenEndpoint(t, httpClient, destUrl, formData)
+
+	// Verify we got tokens
+	assert.NotNil(t, data["access_token"])
+	assert.NotNil(t, data["id_token"])
+
+	// Decode ID token
+	idToken := data["id_token"].(string)
+	idClaims := decodeJWTPayload(t, idToken)
+
+	// OIDC scope-based claims SHOULD be present because client override is "on"
+	assert.NotNil(t, idClaims["email"], "email claim should be in ID token when client override is 'on'")
+	assert.NotNil(t, idClaims["email_verified"], "email_verified claim should be in ID token when client override is 'on'")
+	assert.NotNil(t, idClaims["name"], "name claim should be in ID token when client override is 'on'")
+	assert.NotNil(t, idClaims["given_name"], "given_name claim should be in ID token when client override is 'on'")
+}
+
+func TestToken_IdToken_OIDCClaims_ClientOverride_Off(t *testing.T) {
+	// Get settings and enable the global setting
+	settings, err := database.GetSettingsById(context.Background(), nil, 1)
+	assert.NoError(t, err)
+
+	originalValue := settings.IncludeOpenIDConnectClaimsInIdToken
+	settings.IncludeOpenIDConnectClaimsInIdToken = true // Global enabled
+	err = database.UpdateSettings(context.Background(), nil, settings)
+	assert.NoError(t, err)
+
+	// Restore original value after test
+	defer func() {
+		settings.IncludeOpenIDConnectClaimsInIdToken = originalValue
+		_ = database.UpdateSettings(context.Background(), nil, settings)
+	}()
+
+	clientSecret := fake.LetterN(32)
+	httpClient, code := createAuthCodeWithUserProfile(t, clientSecret, "openid profile email")
+
+	// Set client-level override to "off"
+	originalClientSetting := code.Client.IncludeOpenIDConnectClaimsInIdToken
+	code.Client.IncludeOpenIDConnectClaimsInIdToken = "off"
+	err = database.UpdateClient(context.Background(), nil, &code.Client)
+	assert.NoError(t, err)
+	defer func() {
+		code.Client.IncludeOpenIDConnectClaimsInIdToken = originalClientSetting
+		_ = database.UpdateClient(context.Background(), nil, &code.Client)
+	}()
+
+	destUrl := config.GetAuthServer().BaseURL + "/auth/token/"
+
+	formData := url.Values{
+		"grant_type":    {"authorization_code"},
+		"client_id":     {code.Client.ClientIdentifier},
+		"code":          {code.Code},
+		"redirect_uri":  {code.RedirectURI},
+		"code_verifier": {"code-verifier"},
+		"client_secret": {clientSecret},
+	}
+
+	data := postToTokenEndpoint(t, httpClient, destUrl, formData)
+
+	// Verify we got tokens
+	assert.NotNil(t, data["access_token"])
+	assert.NotNil(t, data["id_token"])
+
+	// Decode ID token
+	idToken := data["id_token"].(string)
+	idClaims := decodeJWTPayload(t, idToken)
+
+	// OIDC scope-based claims should NOT be present because client override is "off"
+	assert.Nil(t, idClaims["email"], "email claim should NOT be in ID token when client override is 'off'")
+	assert.Nil(t, idClaims["email_verified"], "email_verified claim should NOT be in ID token when client override is 'off'")
+	assert.Nil(t, idClaims["name"], "name claim should NOT be in ID token when client override is 'off'")
+	assert.Nil(t, idClaims["given_name"], "given_name claim should NOT be in ID token when client override is 'off'")
+}
+
+// createAuthCodeWithUserProfile creates a user with full profile data and completes auth code flow
+func createAuthCodeWithUserProfile(t *testing.T, clientSecret string, scope string) (*http.Client, *models.Code) {
+	clientSecretEncrypted, err := encryption.EncryptData(clientSecret)
+	assert.NoError(t, err)
+
+	client := &models.Client{
+		ClientIdentifier:         "test-client-" + fake.LetterN(8),
+		Enabled:                  true,
+		AuthorizationCodeEnabled: true,
+		IsPublic:                 false,
+		ConsentRequired:          false,
+		DefaultAcrLevel:          models.AcrLevel2Optional,
+		ClientSecretEncrypted:    clientSecretEncrypted,
+	}
+
+	err = database.CreateClient(context.Background(), nil, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	redirectUri := &models.RedirectURI{
+		ClientId: client.Id,
+		URI:      fake.URL(),
+	}
+
+	err = database.CreateRedirectURI(context.Background(), nil, redirectUri)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	password := fake.Password(8)
+	passwordHashed, err := passwordhash.Hash(password)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The gender column is 16 characters and the claim is echoed back verbatim,
+	// so the fixture picks one of the two strings gender.Gender.String() returns
+	// rather than a generated run (#272).
+	genderValue := gender.GenderFemale.String()
+	if fake.Bool() {
+		genderValue = gender.GenderMale.String()
+	}
+
+	// Create user with full profile data.
+	//
+	// ZoneInfo and Locale are the two profile fields ProfileValidator checks
+	// against a fixed repository list, so both carry a value from those lists
+	// rather than a generated run: a profile the server would refuse at its own
+	// API is a weaker thing for the claim assertions to run against. Nothing
+	// below asserts on either value, only that the claim carries what was
+	// stored (#272).
+	user := &models.User{
+		Subject:             fake.UUID(),
+		Enabled:             true,
+		Email:               fake.Email(),
+		EmailVerified:       true,
+		PasswordHash:        passwordHashed,
+		GivenName:           fake.FirstName(),
+		FamilyName:          fake.LastName(),
+		MiddleName:          fake.MiddleName(),
+		Nickname:            fake.Username(),
+		Website:             fake.URL(),
+		Gender:              genderValue,
+		BirthDate:           sql.NullTime{Time: fake.Date(), Valid: true},
+		ZoneInfo:            "America/New_York",
+		Locale:              "en-US",
+		PhoneNumber:         fake.DigitN(10),
+		PhoneNumberVerified: true,
+		AddressLine1:        "Street " + fake.LetterN(8),
+		AddressLine2:        fake.DigitN(3),
+		AddressLocality:     "City" + fake.LetterN(6),
+		AddressRegion:       "State" + fake.LetterN(6),
+		AddressPostalCode:   fake.DigitN(5),
+		AddressCountry:      "US",
+	}
+
+	err = database.CreateUser(context.Background(), nil, user)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	codeVerifier := "code-verifier"
+	requestCodeChallenge := oauth.GeneratePKCECodeChallenge(codeVerifier)
+	requestState := fake.LetterN(8)
+	requestNonce := fake.LetterN(8)
+
+	destUrl := config.GetAuthServer().BaseURL + "/auth/authorize/?client_id=" + client.ClientIdentifier +
+		"&redirect_uri=" + url.QueryEscape(redirectUri.URI) +
+		"&response_type=code" +
+		"&code_challenge_method=S256" +
+		"&code_challenge=" + requestCodeChallenge +
+		"&scope=" + url.QueryEscape(scope) +
+		"&state=" + requestState +
+		"&nonce=" + requestNonce
+
+	httpClient := createHttpClient(t)
+
+	resp, err := httpClient.Get(destUrl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation := assertRedirect(t, resp, "/auth/level1")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/pwd")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	resp = authenticateWithPassword(t, httpClient, redirectLocation, resp, user.Email, password)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/level1completed")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/level2")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/completed")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/issue")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	codeVal, stateVal := getCodeAndStateFromUrl(t, resp)
+	assert.Equal(t, requestState, stateVal)
+
+	code := loadCodeFromDatabase(t, codeVal)
+	code.Code = codeVal
+	return httpClient, code
+}

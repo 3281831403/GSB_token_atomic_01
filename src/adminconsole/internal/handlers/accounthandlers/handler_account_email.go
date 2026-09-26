@@ -1,0 +1,149 @@
+package accounthandlers
+
+import (
+	"context"
+	"net/http"
+	"strings"
+
+	"github.com/leodip/goiabada/adminconsole/internal/config"
+	"github.com/leodip/goiabada/adminconsole/internal/constants"
+	"github.com/leodip/goiabada/adminconsole/internal/handlers"
+	"github.com/leodip/goiabada/adminconsole/internal/oauthclient"
+	"github.com/leodip/goiabada/core/api"
+	coreconstants "github.com/leodip/goiabada/core/constants"
+	"github.com/leodip/goiabada/core/errs"
+	"github.com/leodip/goiabada/core/sessionstore"
+)
+
+// accountEmailAPI is what the account email page needs: the profile it renders from, and the
+// email write.
+type accountEmailAPI interface {
+	GetAccountProfile(ctx context.Context, accessToken string) (*api.UserResponse, error)
+	UpdateAccountEmail(ctx context.Context, accessToken string, request *api.UpdateAccountEmailRequest) (*api.UserResponse, error)
+}
+
+func HandleAccountEmailGet(
+	httpHelper handlers.HttpHelper,
+	httpSession sessionstore.Store,
+	apiClient accountEmailAPI,
+) http.HandlerFunc {
+
+	return func(w http.ResponseWriter, r *http.Request) {
+
+		// Get JWT info to extract access token
+		jwtInfo, ok := r.Context().Value(constants.ContextKeyJwtInfo).(oauthclient.JwtInfo)
+		if !ok {
+			httpHelper.InternalServerError(w, r, errs.New("no JWT info found in context"))
+			return
+		}
+
+		user, err := apiClient.GetAccountProfile(r.Context(), jwtInfo.TokenResponse.AccessToken)
+		if err != nil {
+			handlers.HandleAPIError(httpHelper, w, r, err)
+			return
+		}
+
+		sess, err := httpSession.Get(r, coreconstants.AdminConsoleSessionName)
+		if err != nil {
+			httpHelper.InternalServerError(w, r, err)
+			return
+		}
+
+		_, savedSuccessfully := sess.TakeFlash("savedSuccessfully")
+		if savedSuccessfully {
+			err = httpSession.Save(r, w, sess)
+			if err != nil {
+				httpHelper.InternalServerError(w, r, err)
+				return
+			}
+		}
+
+		settings := r.Context().Value(constants.ContextKeySettings).(*api.PublicSettingsResponse)
+
+		bind := map[string]interface{}{
+			"savedSuccessfully": savedSuccessfully,
+			"email":             user.Email,
+			"emailVerified":     user.EmailVerified,
+			"emailConfirmation": "",
+			"smtpEnabled":       settings.SMTPEnabled,
+		}
+
+		err = httpHelper.RenderTemplate(w, r, "/layouts/menu_layout.html", "/account_email.html", bind)
+		if err != nil {
+			httpHelper.InternalServerError(w, r, err)
+			return
+		}
+	}
+}
+
+func HandleAccountEmailPost(
+	httpHelper handlers.HttpHelper,
+	httpSession sessionstore.Store,
+	apiClient accountEmailAPI,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+
+		// Get JWT info and current user for re-render on error
+		jwtInfo, ok := r.Context().Value(constants.ContextKeyJwtInfo).(oauthclient.JwtInfo)
+		if !ok {
+			httpHelper.InternalServerError(w, r, errs.New("no JWT info found in context"))
+			return
+		}
+
+		user, err := apiClient.GetAccountProfile(r.Context(), jwtInfo.TokenResponse.AccessToken)
+		if err != nil {
+			handlers.HandleAPIError(httpHelper, w, r, err)
+			return
+		}
+
+		email := strings.ToLower(strings.TrimSpace(r.FormValue("email")))
+		emailConfirmation := strings.ToLower(strings.TrimSpace(r.FormValue("emailConfirmation")))
+
+		// UI-level confirmation check
+		if email != emailConfirmation {
+			bind := map[string]interface{}{
+				"user":              user,
+				"email":             email,
+				"emailVerified":     user.EmailVerified,
+				"emailConfirmation": emailConfirmation,
+				"error":             "The email and email confirmation entries must be identical.",
+			}
+			if renderErr := httpHelper.RenderTemplate(w, r, "/layouts/menu_layout.html", "/account_email.html", bind); renderErr != nil {
+				httpHelper.InternalServerError(w, r, renderErr)
+			}
+			return
+		}
+
+		req := &api.UpdateAccountEmailRequest{Email: email}
+		_, err = apiClient.UpdateAccountEmail(r.Context(), jwtInfo.TokenResponse.AccessToken, req)
+		if err != nil {
+			handlers.HandleAPIErrorWithCallback(httpHelper, w, r, err, func(errorMessage string) {
+				bind := map[string]interface{}{
+					"user":              user,
+					"email":             email,
+					"emailVerified":     user.EmailVerified,
+					"emailConfirmation": emailConfirmation,
+					"error":             errorMessage,
+				}
+				if renderErr := httpHelper.RenderTemplate(w, r, "/layouts/menu_layout.html", "/account_email.html", bind); renderErr != nil {
+					httpHelper.InternalServerError(w, r, renderErr)
+				}
+			})
+			return
+		}
+
+		sess, err := httpSession.Get(r, coreconstants.AdminConsoleSessionName)
+		if err != nil {
+			httpHelper.InternalServerError(w, r, err)
+			return
+		}
+
+		sess.SetFlash("savedSuccessfully", "true")
+		if err := httpSession.Save(r, w, sess); err != nil {
+			httpHelper.InternalServerError(w, r, err)
+			return
+		}
+
+		http.Redirect(w, r, config.GetAdminConsole().BaseURL+"/account/email", http.StatusFound)
+	}
+}

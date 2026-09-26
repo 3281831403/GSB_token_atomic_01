@@ -1,0 +1,129 @@
+package handlers
+
+import (
+	"bytes"
+	"context"
+	"database/sql"
+	"net/http"
+	"time"
+
+	"github.com/leodip/goiabada/authserver/internal/ceremony"
+	"github.com/leodip/goiabada/authserver/internal/emaildelivery"
+	"github.com/leodip/goiabada/authserver/internal/issuance"
+	"github.com/leodip/goiabada/authserver/internal/models"
+	"github.com/leodip/goiabada/core/oauth"
+
+	"github.com/leodip/goiabada/authserver/internal/protocolvalidation"
+)
+
+type HttpHelper interface {
+	InternalServerError(w http.ResponseWriter, r *http.Request, err error)
+	NotFound(w http.ResponseWriter, r *http.Request)
+	RenderTemplate(w http.ResponseWriter, r *http.Request, layoutName string, templateName string,
+		data map[string]interface{}) error
+	RenderTemplateToBuffer(r *http.Request, layoutName string, templateName string,
+		data map[string]interface{}) (*bytes.Buffer, error)
+	JsonError(w http.ResponseWriter, r *http.Request, err error)
+	EncodeJson(w http.ResponseWriter, r *http.Request, data interface{})
+	GetFromUrlQueryOrFormPost(r *http.Request, key string) string
+	LookupFromUrlQueryOrFormPost(r *http.Request, key string) (string, bool)
+}
+
+type AuthHelper interface {
+	GetAuthContext(r *http.Request) (*ceremony.AuthContext, error)
+	SaveAuthContext(w http.ResponseWriter, r *http.Request, authContext *ceremony.AuthContext) error
+	ClearAuthContext(w http.ResponseWriter, r *http.Request) error
+	// RegenerateSession replaces the browser session's identifier without losing its
+	// contents, which is what a server-side session store must do at every privilege
+	// change to match a cookie store's structural immunity to session fixation (#266).
+	RegenerateSession(w http.ResponseWriter, r *http.Request) error
+}
+
+type OtpSecretGenerator interface {
+	GenerateOTPSecret(email string, appName string) (string, error)
+}
+
+type TokenIssuer interface {
+	GenerateTokenResponseForAuthCode(ctx context.Context, code *models.Code) (*oauth.TokenResponse, error)
+	GenerateTokenResponseForClientCred(ctx context.Context, client *models.Client, scope string) (*oauth.TokenResponse, error)
+	GenerateTokenResponseForRefresh(ctx context.Context, input *issuance.GenerateTokenForRefreshInput) (*oauth.TokenResponse, error)
+	// GenerateTokenResponseForRefreshROPC generates new tokens for an ROPC refresh token.
+	// Unlike auth code flow, ROPC tokens have UserId and ClientId directly on the RefreshToken.
+	GenerateTokenResponseForRefreshROPC(ctx context.Context, input *issuance.GenerateTokenForRefreshROPCInput) (*oauth.TokenResponse, error)
+	GenerateTokenResponseForImplicit(ctx context.Context, input *issuance.ImplicitGrantInput, issueAccessToken bool, issueIdToken bool) (*issuance.ImplicitGrantResponse, error)
+	// GenerateTokenResponseForROPC generates tokens for Resource Owner Password Credentials flow.
+	// RFC 6749 Section 4.3
+	// SECURITY NOTE: ROPC is deprecated in OAuth 2.1 due to credential exposure risks.
+	GenerateTokenResponseForROPC(ctx context.Context, input *issuance.ROPCGrantInput) (*issuance.ROPCGrantResponse, error)
+}
+
+type AuthorizeValidator interface {
+	ValidateScopes(ctx context.Context, scope string) error
+	ValidateClientAndRedirectURI(ctx context.Context, input *protocolvalidation.ValidateClientAndRedirectURIInput) error
+	ValidateRequest(input *protocolvalidation.ValidateRequestInput) error
+	ValidatePrompt(prompt string) (string, error)
+	ValidateUnsupportedRequestParameters(input *protocolvalidation.ValidateUnsupportedRequestParametersInput) error
+}
+
+type CodeIssuer interface {
+	CreateAuthCode(ctx context.Context, tx *sql.Tx, input *issuance.CreateCodeInput) (*models.Code, error)
+}
+
+type UserSessionManager interface {
+	HasValidUserSession(ctx context.Context, userSession *models.UserSession, requestedMaxAgeInSeconds *int) bool
+	StartNewUserSession(w http.ResponseWriter, r *http.Request,
+		userId int64, clientId int64, authMethods string, acrLevel string,
+		authStateGeneration int64, otpConfigGeneration *int64,
+		authenticatedAt *time.Time) (*models.UserSession, error)
+
+	// BumpUserSession updates an existing session's last accessed time and client list.
+	// It also handles ACR/AMR step-up: if the user completed a higher level of authentication
+	// (e.g., added OTP to a password-only session), the session's AuthMethods and AcrLevel
+	// are upgraded to reflect the stronger authentication that was performed.
+	// Note: ACR is only upgraded, never downgraded, during a session's lifetime.
+	BumpUserSession(r *http.Request, sessionIdentifier string, clientId int64,
+		authMethods string, acrLevel string) (*models.UserSession, error)
+}
+
+type TokenValidator interface {
+	ValidateTokenRequest(ctx context.Context, input *protocolvalidation.ValidateTokenRequestInput) (*protocolvalidation.ValidateTokenRequestResult, error)
+}
+
+type TokenParser interface {
+	DecodeAndValidateTokenString(ctx context.Context, token string, withExpirationCheck bool) (*oauth.JwtToken, error)
+}
+
+type PasswordValidator interface {
+	ValidatePassword(ctx context.Context, password string) error
+}
+
+type EmailSender interface {
+	SendEmail(ctx context.Context, input *emaildelivery.SendEmailInput) error
+}
+
+// AuditLogger records one security event. The context is first because every audit event raised
+// while serving a request is correlated to that request: the installed slog handler reads chi's
+// request id off it, so the console record joins the request's own log line, and the persisted row
+// carries the same id. A call that passed context.Background() here would produce exactly the
+// uncorrelated record this exists to prevent, which is why testutil.AssertAuditLogContext refuses
+// one in a request-path package (#328).
+type AuditLogger interface {
+	Log(ctx context.Context, auditEvent string, details map[string]interface{})
+}
+
+// CredentialFailureRecorder marks the credential check this request performed as failed, so
+// the rate limiter charges the reservation it is holding instead of dropping it.
+//
+// A handler names no bucket and no key: the limiter chose those before the handler ran, and
+// a handler that derived them again would be free to disagree with the limiter about which
+// account the request is, which is exactly how the per-account tiers came to be worth
+// nothing (#219). *middleware.RateLimiterMiddleware satisfies it, and the call is a
+// no-op on a request that carries no reservation.
+type CredentialFailureRecorder interface {
+	RecordCredentialFailure(r *http.Request)
+}
+
+type PermissionChecker interface {
+	UserHasScopePermission(ctx context.Context, userId int64, scope string) (bool, error)
+	FilterOutScopesWhereUserIsNotAuthorized(ctx context.Context, scope string, user *models.User) (string, error)
+}

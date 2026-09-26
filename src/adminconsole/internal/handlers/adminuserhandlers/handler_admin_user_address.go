@@ -1,0 +1,204 @@
+package adminuserhandlers
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"sort"
+	"strconv"
+	"strings"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/leodip/goiabada/adminconsole/internal/constants"
+	"github.com/leodip/goiabada/adminconsole/internal/handlers"
+	"github.com/leodip/goiabada/adminconsole/internal/oauthclient"
+	"github.com/leodip/goiabada/core/api"
+	coreconstants "github.com/leodip/goiabada/core/constants"
+	"github.com/leodip/goiabada/core/countries"
+	"github.com/leodip/goiabada/core/errs"
+	"github.com/leodip/goiabada/core/sessionstore"
+)
+
+// userAddressAPI is what the user address page needs: the user, and the address write.
+type userAddressAPI interface {
+	GetUserById(ctx context.Context, accessToken string, userId int64) (*api.UserResponse, error)
+	UpdateUserAddress(ctx context.Context, accessToken string, userId int64, request *api.UpdateUserAddressRequest) (*api.UserResponse, error)
+}
+
+func HandleAdminUserAddressGet(
+	httpHelper handlers.HttpHelper,
+	httpSession sessionstore.Store,
+	apiClient userAddressAPI,
+) http.HandlerFunc {
+
+	countries := countries.AllInfo()
+	sort.Slice(countries, func(i, j int) bool {
+		return countries[i].Name < countries[j].Name
+	})
+
+	return func(w http.ResponseWriter, r *http.Request) {
+
+		idStr := chi.URLParam(r, "userId")
+		if len(idStr) == 0 {
+			httpHelper.NotFound(w, r)
+			return
+		}
+
+		id, err := strconv.ParseInt(idStr, 10, 64)
+		if err != nil {
+			httpHelper.NotFound(w, r)
+			return
+		}
+		// Get JWT info from context to extract access token
+		jwtInfo, ok := r.Context().Value(constants.ContextKeyJwtInfo).(oauthclient.JwtInfo)
+		if !ok {
+			httpHelper.InternalServerError(w, r, errs.New("no JWT info found in context"))
+			return
+		}
+
+		user, err := apiClient.GetUserById(r.Context(), jwtInfo.TokenResponse.AccessToken, id)
+		if err != nil {
+			handlers.HandleAPIError(httpHelper, w, r, err)
+			return
+		}
+		if user == nil {
+			httpHelper.NotFound(w, r)
+			return
+		}
+
+		sess, err := httpSession.Get(r, coreconstants.AdminConsoleSessionName)
+		if err != nil {
+			httpHelper.InternalServerError(w, r, err)
+			return
+		}
+
+		_, savedSuccessfully := sess.TakeFlash("savedSuccessfully")
+		if savedSuccessfully {
+			err = httpSession.Save(r, w, sess)
+			if err != nil {
+				httpHelper.InternalServerError(w, r, err)
+				return
+			}
+		}
+
+		address := Address{
+			AddressLine1:      user.AddressLine1,
+			AddressLine2:      user.AddressLine2,
+			AddressLocality:   user.AddressLocality,
+			AddressRegion:     user.AddressRegion,
+			AddressPostalCode: user.AddressPostalCode,
+			AddressCountry:    user.AddressCountry,
+		}
+
+		bind := map[string]interface{}{
+			"user":              user,
+			"address":           address,
+			"countries":         countries,
+			"page":              r.URL.Query().Get("page"),
+			"query":             r.URL.Query().Get("query"),
+			"savedSuccessfully": savedSuccessfully,
+		}
+
+		err = httpHelper.RenderTemplate(w, r, "/layouts/menu_layout.html", "/admin_users_address.html", bind)
+		if err != nil {
+			httpHelper.InternalServerError(w, r, err)
+			return
+		}
+	}
+}
+
+func HandleAdminUserAddressPost(
+	httpHelper handlers.HttpHelper,
+	httpSession sessionstore.Store,
+	apiClient userAddressAPI,
+) http.HandlerFunc {
+
+	countries := countries.AllInfo()
+	sort.Slice(countries, func(i, j int) bool {
+		return countries[i].Name < countries[j].Name
+	})
+
+	return func(w http.ResponseWriter, r *http.Request) {
+
+		idStr := chi.URLParam(r, "userId")
+		if len(idStr) == 0 {
+			httpHelper.NotFound(w, r)
+			return
+		}
+
+		id, err := strconv.ParseInt(idStr, 10, 64)
+		if err != nil {
+			httpHelper.NotFound(w, r)
+			return
+		}
+		// Get JWT info from context to extract access token
+		jwtInfo, ok := r.Context().Value(constants.ContextKeyJwtInfo).(oauthclient.JwtInfo)
+		if !ok {
+			httpHelper.InternalServerError(w, r, errs.New("no JWT info found in context"))
+			return
+		}
+
+		// Create address update request
+		request := &api.UpdateUserAddressRequest{
+			AddressLine1:      strings.TrimSpace(r.FormValue("addressLine1")),
+			AddressLine2:      strings.TrimSpace(r.FormValue("addressLine2")),
+			AddressLocality:   strings.TrimSpace(r.FormValue("addressLocality")),
+			AddressRegion:     strings.TrimSpace(r.FormValue("addressRegion")),
+			AddressPostalCode: strings.TrimSpace(r.FormValue("addressPostalCode")),
+			AddressCountry:    strings.TrimSpace(r.FormValue("addressCountry")),
+		}
+
+		user, err := apiClient.UpdateUserAddress(r.Context(), jwtInfo.TokenResponse.AccessToken, id, request)
+		if err != nil {
+			// Handle validation errors by showing them in the form
+			handlers.HandleAPIErrorWithCallback(httpHelper, w, r, err, func(errorMessage string) {
+				// Get user data for form display
+				userForDisplay, userErr := apiClient.GetUserById(r.Context(), jwtInfo.TokenResponse.AccessToken, id)
+				if userErr != nil {
+					handlers.HandleAPIError(httpHelper, w, r, userErr)
+					return
+				}
+
+				// Create address struct for display with the form values
+				address := Address{
+					AddressLine1:      request.AddressLine1,
+					AddressLine2:      request.AddressLine2,
+					AddressLocality:   request.AddressLocality,
+					AddressRegion:     request.AddressRegion,
+					AddressPostalCode: request.AddressPostalCode,
+					AddressCountry:    request.AddressCountry,
+				}
+
+				bind := map[string]interface{}{
+					"user":      userForDisplay,
+					"address":   address,
+					"countries": countries,
+					"page":      r.URL.Query().Get("page"),
+					"query":     r.URL.Query().Get("query"),
+					"error":     errorMessage,
+				}
+
+				err = httpHelper.RenderTemplate(w, r, "/layouts/menu_layout.html", "/admin_users_address.html", bind)
+				if err != nil {
+					httpHelper.InternalServerError(w, r, err)
+				}
+			})
+			return
+		}
+
+		sess, err := httpSession.Get(r, coreconstants.AdminConsoleSessionName)
+		if err != nil {
+			httpHelper.InternalServerError(w, r, err)
+			return
+		}
+
+		sess.SetFlash("savedSuccessfully", "true")
+		err = httpSession.Save(r, w, sess)
+		if err != nil {
+			httpHelper.InternalServerError(w, r, err)
+			return
+		}
+
+		http.Redirect(w, r, withListPosition(fmt.Sprintf("/admin/users/%v/address", user.Id), r), http.StatusFound)
+	}
+}

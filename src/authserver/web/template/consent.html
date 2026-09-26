@@ -1,0 +1,53 @@
+{{define "title"}}{{ .appName }} - {{ T $.ctx "consent.page_title" }}{{end}}
+{{define "head"}}
+
+{{end}}
+
+{{define "body"}}
+
+
+    <h2 class='mb-2 text-2xl font-semibold text-center'>{{ T $.ctx "consent.title" }}</h2>
+    <form action="" method="post">
+
+        <input type="hidden" name="ceremonyId" value="{{.ceremonyId}}" />
+
+        <div class="mb-3">
+
+            <p class="mt-2">{{ T $.ctx "consent.intro" }}</p>
+
+            {{if .showClientSection}}
+            <div class="flex flex-col items-center mt-5 mb-8">
+                {{if .hasLogo}}
+                <div class="w-[220px] h-[220px] shrink-0 overflow-hidden rounded-lg">
+                    <img src="{{.clientLogoUrl}}" onerror="this.parentElement.style.display='none'"
+                         class="object-contain w-full h-full" alt="" />
+                </div>
+                {{end}}
+                {{if .clientName}}<span class="mt-1 text-sm text-base-content/80">{{.clientName}}</span>{{end}}
+                {{if .clientNameUnverified}}<span class="mt-0.5 text-xs text-warning">{{ T $.ctx "consent.client_unverified" }}</span>{{end}}
+                {{if .clientDescription}}<span class="mt-0.5 text-xs text-base-content/60">{{.clientDescription}}</span>{{end}}
+                {{if .clientWebsiteUrl}}<a href="{{.clientWebsiteUrl}}" target="_blank" rel="noopener noreferrer"
+                     class="mt-0.5 text-xs link link-primary">{{.clientWebsiteUrl}}</a>{{end}}
+            </div>
+            {{end}}
+
+            <table class="mt-2 table-auto">
+                <tbody>
+                {{range $i, $s := .scopes}}
+                    <tr>
+                        <td>
+                            <input type="checkbox" id="consent{{$i}}" name="consent{{$i}}" checked />
+                        </td>
+                        <td class="p-2"><label for="consent{{$i}}">{{.Scope}}</label></td>
+                        <td class="p-2">{{.Description}}</td>
+                    </tr>
+                {{end}}
+                </tbody>
+            </table>
+
+            <button class="w-full mt-3 btn btn-neutral" name="btnCancel" value="cancel">{{ T $.ctx "consent.button.cancel" }}</button>
+            <button class="w-full mt-3 btn btn-primary" name="btnSubmit" value="submit">{{ T $.ctx "consent.button.submit" }}</button>
+
+    </form>
+
+{{end}}

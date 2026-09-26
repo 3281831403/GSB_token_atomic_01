@@ -1,0 +1,93 @@
+package apihandlers
+
+import (
+	"context"
+	"database/sql"
+	"net/http"
+	"strconv"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/leodip/goiabada/authserver/internal/audit"
+	"github.com/leodip/goiabada/authserver/internal/encryption"
+	"github.com/leodip/goiabada/authserver/internal/middleware"
+	"github.com/leodip/goiabada/authserver/internal/models"
+	"github.com/leodip/goiabada/core/api"
+)
+
+// userEmailVerificationCodeDatabase is what the user email verification code endpoint needs: the
+// user row it stamps.
+type userEmailVerificationCodeDatabase interface {
+	GetUserById(ctx context.Context, tx *sql.Tx, userId int64) (*models.User, error)
+	UpdateUser(ctx context.Context, tx *sql.Tx, user *models.User) error
+}
+
+// HandleAPIUserEmailVerificationCodePost - POST /api/v1/admin/users/{id}/email/verification-code
+func HandleAPIUserEmailVerificationCodePost(
+	database userEmailVerificationCodeDatabase,
+	auditLogger AuditLogger,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Authentication and authorization handled by middleware
+
+		userIdStr := chi.URLParam(r, "id")
+		if userIdStr == "" {
+			writeJSONError(w, "User ID is required", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		userId, err := strconv.ParseInt(userIdStr, 10, 64)
+		if err != nil {
+			writeJSONError(w, "Invalid user ID", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		user, err := database.GetUserById(r.Context(), nil, userId)
+		if err != nil {
+			writeInternalServerError(w, r, err)
+			return
+		}
+		if user == nil {
+			writeJSONError(w, "User not found", "NOT_FOUND", http.StatusNotFound)
+			return
+		}
+
+		verificationCode := generateEmailVerificationCode()
+		encrypted, err := encryption.EncryptData(verificationCode)
+		if err != nil {
+			writeInternalServerError(w, r, err)
+			return
+		}
+
+		issuedAt := time.Now().UTC()
+		user.EmailVerified = false
+		user.EmailVerificationCodeEncrypted = encrypted
+		user.EmailVerificationCodeIssuedAt = sql.NullTime{Time: issuedAt, Valid: true}
+		if err := database.UpdateUser(r.Context(), nil, user); err != nil {
+			writeInternalServerError(w, r, err)
+			return
+		}
+
+		jwtToken, ok := middleware.GetValidatedToken(r)
+		var loggedInUser string
+		if ok {
+			loggedInUser = jwtToken.GetStringClaim("sub")
+		}
+
+		auditLogger.Log(r.Context(), audit.AuditGeneratedEmailVerificationCode, map[string]interface{}{
+			"userId":       user.Id,
+			"email":        user.Email,
+			"loggedInUser": loggedInUser,
+		})
+
+		expiresAt := issuedAt.Add(5 * time.Minute)
+		response := api.GenerateUserEmailVerificationCodeResponse{
+			VerificationCode:          verificationCode,
+			VerificationCodeExpiresAt: &expiresAt,
+			UserId:                    user.Id,
+			Email:                     user.Email,
+		}
+
+		writeJSON(w, r, http.StatusOK, response)
+	}
+}

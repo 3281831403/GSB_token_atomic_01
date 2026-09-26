@@ -1,0 +1,246 @@
+package apihandlers
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"net/http"
+	"strconv"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/leodip/goiabada/authserver/internal/apimapping"
+	"github.com/leodip/goiabada/authserver/internal/audit"
+	"github.com/leodip/goiabada/authserver/internal/models"
+	"github.com/leodip/goiabada/core/api"
+	"github.com/leodip/goiabada/core/errs"
+	"github.com/leodip/goiabada/core/i18n"
+)
+
+// maxGroupIdsPerRequest bounds how many group ids one request body may name.
+//
+// The list is validated by reading every group it names back from the database, and a list longer
+// than one statement can bind is read in several of them (commondb's forEachIdBatch), so without a
+// bound a caller holding manage-users can post a million ids and buy a thousand statements reading
+// ids that cannot exist. The number is one statement's worth, which is the largest list that
+// validation reads in one go, and it is far above any real request: a user can hold at most as
+// many groups as the deployment has defined (#373).
+//
+// This bounds one array, not the request. How large a body the server reads before anything looks
+// at it is #205's axis and wants one answer for every endpoint rather than one for this one.
+//
+// The number is a policy and not a schema rule, and it is worth being plain about what it costs:
+// nothing limits how many groups a deployment defines, and a user can be put into more than a
+// thousand of them one at a time through POST /api/v1/admin/groups/{id}/members. Such a user's
+// membership cannot then be replaced through this endpoint, because even re-sending the set they
+// already hold names more ids than this allows -- only a smaller set is accepted. That state is
+// reachable rather than impossible, and the cap is a deliberate refusal to serve it rather than an
+// oversight; it is published as maxItems on UpdateUserGroupsRequest so a caller meets it in the
+// contract rather than at runtime.
+const maxGroupIdsPerRequest = 1000
+
+// userGroupsDatabase is what the user group membership endpoints need: the user, the groups, and
+// the rows that join them.
+type userGroupsDatabase interface {
+	CountGroupMembers(ctx context.Context, tx *sql.Tx, groupId int64) (int, error)
+	CreateUserGroup(ctx context.Context, tx *sql.Tx, userGroup *models.UserGroup) error
+	DeleteUserGroup(ctx context.Context, tx *sql.Tx, userGroupId int64) error
+	GetGroupsByIds(ctx context.Context, tx *sql.Tx, groupIds []int64) ([]models.Group, error)
+	GetUserById(ctx context.Context, tx *sql.Tx, userId int64) (*models.User, error)
+	GetUserGroupByUserIdAndGroupId(ctx context.Context, tx *sql.Tx, userId, groupId int64) (*models.UserGroup, error)
+	UserLoadGroups(ctx context.Context, tx *sql.Tx, user *models.User) error
+}
+
+func HandleAPIUserGroupsGet(
+	database userGroupsDatabase,
+) http.HandlerFunc {
+
+	return func(w http.ResponseWriter, r *http.Request) {
+
+		idStr := chi.URLParam(r, "id")
+		if len(idStr) == 0 {
+			writeJSONError(w, "User ID is required", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		id, err := strconv.ParseInt(idStr, 10, 64)
+		if err != nil {
+			writeJSONError(w, "Invalid user ID", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		user, err := database.GetUserById(r.Context(), nil, id)
+		if err != nil {
+			writeInternalServerError(w, r, errs.Wrap(err, "database error getting user by ID for groups"), "user_id", id)
+			return
+		}
+		if user == nil {
+			writeJSONError(w, "User not found", "NOT_FOUND", http.StatusNotFound)
+			return
+		}
+
+		err = database.UserLoadGroups(r.Context(), nil, user)
+		if err != nil {
+			writeInternalServerError(w, r, errs.Wrap(err, "database error loading user groups"), "user_id", user.Id)
+			return
+		}
+
+		memberCounts, err := countGroupMembers(r.Context(), database, user.Groups)
+		if err != nil {
+			writeInternalServerError(w, r, err, "user_id", user.Id)
+			return
+		}
+
+		response := api.GetUserGroupsResponse{
+			User:   *apimapping.ToUserResponse(user),
+			Groups: apimapping.ToGroupResponses(user.Groups, memberCounts),
+		}
+
+		writeJSON(w, r, http.StatusOK, response)
+	}
+}
+
+func HandleAPIUserGroupsPut(
+	database userGroupsDatabase,
+	auditLogger AuditLogger,
+) http.HandlerFunc {
+
+	return func(w http.ResponseWriter, r *http.Request) {
+
+		idStr := chi.URLParam(r, "id")
+		if len(idStr) == 0 {
+			writeJSONError(w, "User ID is required", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		id, err := strconv.ParseInt(idStr, 10, 64)
+		if err != nil {
+			writeJSONError(w, "Invalid user ID", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		var request api.UpdateUserGroupsRequest
+		err = json.NewDecoder(r.Body).Decode(&request)
+		if err != nil {
+			writeJSONError(w, "Invalid request body", "INVALID_REQUEST_BODY", http.StatusBadRequest)
+			return
+		}
+
+		// Refused on the body alone, before any query: the ids are not read one at a time, so the
+		// cost of an oversized array is paid by the validation below rather than by the caller.
+		if len(request.GroupIds) > maxGroupIdsPerRequest {
+			writeJSONError(w, "Too many group ids", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		user, err := database.GetUserById(r.Context(), nil, id)
+		if err != nil {
+			writeInternalServerError(w, r, errs.Wrap(err, "database error getting user by ID for groups"), "user_id", id)
+			return
+		}
+		if user == nil {
+			writeJSONError(w, "User not found", "NOT_FOUND", http.StatusNotFound)
+			return
+		}
+
+		// Validate all requested groups exist
+		if len(request.GroupIds) > 0 {
+			groups, getGroupsErr := database.GetGroupsByIds(r.Context(), nil, request.GroupIds)
+			if getGroupsErr != nil {
+				writeInternalServerError(w, r, errs.Wrap(getGroupsErr, "database error getting groups by IDs for validation"), "group_ids", request.GroupIds, "user_id", user.Id)
+				return
+			}
+			if len(groups) != len(request.GroupIds) {
+				// i18n surface: C — admin/account API.
+				writeValidationError(w, r, i18n.NewLocalizedError(i18n.ErrCodeUserGroupsNotFound, nil))
+				return
+			}
+		}
+
+		// Load current user groups
+		err = database.UserLoadGroups(r.Context(), nil, user)
+		if err != nil {
+			writeInternalServerError(w, r, errs.Wrap(err, "database error loading current user groups for update"), "user_id", user.Id)
+			return
+		}
+
+		// Create map of current group IDs for efficient lookup
+		currentGroupIds := make(map[int64]bool)
+		for _, grp := range user.Groups {
+			currentGroupIds[grp.Id] = true
+		}
+
+		// Create map of requested group IDs
+		requestedGroupIds := make(map[int64]bool)
+		for _, groupId := range request.GroupIds {
+			requestedGroupIds[groupId] = true
+		}
+
+		loggedInSubject := callerSubject(r)
+
+		// Add groups that are in requested but not in current
+		for _, groupId := range request.GroupIds {
+			if !currentGroupIds[groupId] {
+				err = database.CreateUserGroup(r.Context(), nil, &models.UserGroup{
+					UserId:  user.Id,
+					GroupId: groupId,
+				})
+				if err != nil {
+					writeInternalServerError(w, r, errs.Wrap(err, "database error creating user group membership"), "user_id", user.Id, "group_id", groupId)
+					return
+				}
+
+				auditLogger.Log(r.Context(), audit.AuditUserAddedToGroup, map[string]interface{}{
+					"userId":       user.Id,
+					"groupId":      groupId,
+					"loggedInUser": loggedInSubject,
+				})
+			}
+		}
+
+		// Remove groups that are in current but not in requested
+		for _, grp := range user.Groups {
+			if !requestedGroupIds[grp.Id] {
+				userGroup, removeErr := database.GetUserGroupByUserIdAndGroupId(r.Context(), nil, user.Id, grp.Id)
+				if removeErr != nil {
+					writeInternalServerError(w, r, errs.Wrap(removeErr, "database error getting user group relationship for removal"), "user_id", user.Id, "group_id", grp.Id)
+					return
+				}
+				if userGroup != nil {
+					removeErr = database.DeleteUserGroup(r.Context(), nil, userGroup.Id)
+					if removeErr != nil {
+						writeInternalServerError(w, r, errs.Wrap(removeErr, "database error deleting user group membership"), "user_group_id", userGroup.Id, "user_id", user.Id, "group_id", grp.Id)
+						return
+					}
+
+					auditLogger.Log(r.Context(), audit.AuditUserRemovedFromGroup, map[string]interface{}{
+						"userId":       user.Id,
+						"groupId":      grp.Id,
+						"loggedInUser": loggedInSubject,
+					})
+				}
+			}
+		}
+
+		// Reload user groups to get updated state
+		err = database.UserLoadGroups(r.Context(), nil, user)
+		if err != nil {
+			writeInternalServerError(w, r, errs.Wrap(err, "database error reloading user groups after update"), "user_id", user.Id)
+			return
+		}
+
+		// The membership change above is already written and audited, so a failure here answers
+		// 500 for a request whose effect stands; a retry of the same set writes nothing new.
+		memberCounts, err := countGroupMembers(r.Context(), database, user.Groups)
+		if err != nil {
+			writeInternalServerError(w, r, err, "user_id", user.Id)
+			return
+		}
+
+		response := api.GetUserGroupsResponse{
+			User:   *apimapping.ToUserResponse(user),
+			Groups: apimapping.ToGroupResponses(user.Groups, memberCounts),
+		}
+
+		writeJSON(w, r, http.StatusOK, response)
+	}
+}

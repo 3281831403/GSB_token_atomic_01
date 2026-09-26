@@ -1,0 +1,215 @@
+package commondb
+
+import (
+	"context"
+	"database/sql"
+	"time"
+
+	"github.com/huandu/go-sqlbuilder"
+	"github.com/leodip/goiabada/authserver/internal/models"
+	"github.com/leodip/goiabada/core/errs"
+)
+
+func (d *CommonDatabase) CreateSettings(ctx context.Context, tx *sql.Tx, settings *models.Settings) error {
+
+	now := time.Now().UTC()
+
+	originalCreatedAt := settings.CreatedAt
+	originalUpdatedAt := settings.UpdatedAt
+	settings.CreatedAt = sql.NullTime{Time: now, Valid: true}
+	settings.UpdatedAt = sql.NullTime{Time: now, Valid: true}
+
+	settingsStruct := sqlbuilder.NewStruct(new(models.Settings)).
+		For(d.Flavor)
+
+	insertBuilder := settingsStruct.WithoutTag("pk").InsertInto("settings", settings)
+
+	id, err := d.insertReturningId(ctx, tx, insertBuilder, "settings")
+	if err != nil {
+		settings.CreatedAt = originalCreatedAt
+		settings.UpdatedAt = originalUpdatedAt
+		return err
+	}
+
+	settings.Id = id
+	return nil
+}
+
+// initialSettingsId is the settings row's id: IsEmpty and every reader of the settings ask for this
+// id and no other, so the one row a deployment carries has to be written at it.
+const initialSettingsId = 1
+
+// CreateInitialSettings writes a deployment's settings row at initialSettingsId rather than at the
+// id the engine's counter hands out. PostgreSQL, MySQL and SQL Server do not give back an id drawn
+// inside a transaction that rolled back, so a first seed that failed after its settings insert left
+// the next seed's row at 2, which no reader finds: the database stayed unusable and every later
+// start failed on the rows it re-inserted (#424 decision 14). Naming the id makes a rolled-back
+// seed leave nothing behind, whatever the engine's counter did.
+//
+// It refuses a nil transaction because SQL Server's IDENTITY_INSERT, which ExplicitIdInsertSQL
+// brackets the insert with there, is a setting of the connection, and only a transaction pins the
+// three statements to one.
+func (d *CommonDatabase) CreateInitialSettings(ctx context.Context, tx *sql.Tx, settings *models.Settings) error {
+	if tx == nil {
+		return errs.New("the initial settings are written inside a transaction, and none was given")
+	}
+
+	now := time.Now().UTC()
+
+	originalId := settings.Id
+	originalCreatedAt := settings.CreatedAt
+	originalUpdatedAt := settings.UpdatedAt
+	restore := func() {
+		settings.Id = originalId
+		settings.CreatedAt = originalCreatedAt
+		settings.UpdatedAt = originalUpdatedAt
+	}
+	settings.Id = initialSettingsId
+	settings.CreatedAt = sql.NullTime{Time: now, Valid: true}
+	settings.UpdatedAt = sql.NullTime{Time: now, Valid: true}
+
+	var before, after []string
+	if d.ExplicitIdInsertSQL != nil {
+		before, after = d.ExplicitIdInsertSQL("settings")
+	}
+
+	for _, statement := range before {
+		if _, err := d.ExecSql(ctx, tx, statement); err != nil {
+			restore()
+			return errs.Wrap(err, "unable to prepare the initial settings insert")
+		}
+	}
+
+	insertBuilder := sqlbuilder.NewStruct(new(models.Settings)).
+		For(d.Flavor).
+		InsertInto("settings", settings)
+	statement, args := insertBuilder.Build()
+	if _, err := d.ExecSql(ctx, tx, statement, args...); err != nil {
+		restore()
+		return d.WrapSQLError(err, "unable to insert the initial settings")
+	}
+
+	for _, statement := range after {
+		if _, err := d.ExecSql(ctx, tx, statement); err != nil {
+			restore()
+			return errs.Wrap(err, "unable to finish the initial settings insert")
+		}
+	}
+
+	return nil
+}
+
+func (d *CommonDatabase) UpdateSettings(ctx context.Context, tx *sql.Tx, settings *models.Settings) error {
+
+	if settings.Id == 0 {
+		return errs.New("can't update settings with id 0")
+	}
+
+	originalUpdatedAt := settings.UpdatedAt
+	settings.UpdatedAt = sql.NullTime{Time: time.Now().UTC(), Valid: true}
+
+	settingsStruct := sqlbuilder.NewStruct(new(models.Settings)).
+		For(d.Flavor)
+
+	updateBuilder := settingsStruct.WithoutTag("pk").WithoutTag("dont-update").Update("settings", settings)
+	updateBuilder.Where(updateBuilder.Equal("id", settings.Id))
+
+	sql, args := updateBuilder.Build()
+	_, err := d.ExecSql(ctx, tx, sql, args...)
+	if err != nil {
+		settings.UpdatedAt = originalUpdatedAt
+		return errs.Wrap(err, "unable to update settings")
+	}
+
+	return nil
+}
+
+func (d *CommonDatabase) getSettingsCommon(ctx context.Context, tx *sql.Tx, selectBuilder *sqlbuilder.SelectBuilder,
+	settingsStruct *sqlbuilder.Struct) (*models.Settings, error) {
+
+	sql, args := selectBuilder.Build()
+	rows, err := d.QuerySql(ctx, tx, sql, args...)
+	if err != nil {
+		return nil, errs.Wrap(err, "unable to query database")
+	}
+	defer func() { _ = rows.Close() }()
+
+	var settings models.Settings
+	if rows.Next() {
+		addr := settingsStruct.Addr(&settings)
+		err = rows.Scan(addr...)
+		if err != nil {
+			return nil, errs.Wrap(err, "unable to scan settings")
+		}
+		return &settings, nil
+	}
+	if err := rows.Err(); err != nil {
+		return nil, errs.Wrap(err, "unable to read query results")
+	}
+
+	return nil, nil
+}
+
+func (d *CommonDatabase) GetSettingsById(ctx context.Context, tx *sql.Tx, settingsId int64) (*models.Settings, error) {
+
+	settingsStruct := sqlbuilder.NewStruct(new(models.Settings)).
+		For(d.Flavor)
+
+	selectBuilder := settingsStruct.SelectFrom("settings")
+	selectBuilder.Where(selectBuilder.Equal("id", settingsId))
+
+	settings, err := d.getSettingsCommon(ctx, tx, selectBuilder, settingsStruct)
+	if err != nil {
+		return nil, err
+	}
+
+	return settings, nil
+}
+
+// TryClaimCleanupRun atomically claims the next background cleanup run, and
+// reports whether this caller won the claim.
+//
+// The claim is a conditional UPDATE on settings.last_cleanup_at, which makes this
+// column serve two purposes at once:
+//
+//   - Single flight across instances. Every replica polls, but only the one whose
+//     UPDATE affects a row proceeds, so the cleanup does not run concurrently on
+//     the same tables from several replicas.
+//   - A wall-clock schedule. The decision is "has it been long enough since the
+//     last run", not "how long has this process been up", so restarts no longer
+//     reset the interval.
+//
+// claimableBefore is the cutoff: the run is claimable when last_cleanup_at is
+// null (never run) or older than it. Pass now.Add(-interval).
+//
+// The claim is taken BEFORE the work runs, so a crash mid-cleanup delays the next
+// attempt by one interval rather than letting every instance retry immediately.
+func (d *CommonDatabase) TryClaimCleanupRun(ctx context.Context, tx *sql.Tx, now time.Time, claimableBefore time.Time) (bool, error) {
+
+	ub := sqlbuilder.NewUpdateBuilder()
+	ub.Update("settings")
+	ub.Set(
+		ub.Assign("last_cleanup_at", now),
+		ub.Assign("updated_at", now),
+	)
+	ub.Where(
+		ub.Equal("id", 1),
+		ub.Or(
+			ub.IsNull("last_cleanup_at"),
+			ub.LessThan("last_cleanup_at", claimableBefore),
+		),
+	)
+
+	query, args := ub.BuildWithFlavor(d.Flavor)
+	result, err := d.ExecSql(ctx, tx, query, args...)
+	if err != nil {
+		return false, errs.Wrap(err, "unable to claim the cleanup run")
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return false, errs.Wrap(err, "unable to get rows affected when claiming the cleanup run")
+	}
+
+	return rowsAffected == 1, nil
+}

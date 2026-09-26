@@ -1,0 +1,470 @@
+package handlers
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"io/fs"
+	"log/slog"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/leodip/goiabada/authserver/internal/audit"
+	"github.com/leodip/goiabada/authserver/internal/ceremony"
+	"github.com/leodip/goiabada/authserver/internal/config"
+	"github.com/leodip/goiabada/authserver/internal/handlerhelpers"
+	"github.com/leodip/goiabada/authserver/internal/models"
+	"github.com/leodip/goiabada/authserver/internal/oidc"
+	"github.com/leodip/goiabada/core/errs"
+	"github.com/leodip/goiabada/core/i18n"
+)
+
+type ScopeInfo struct {
+	Scope            string
+	Description      string
+	AlreadyConsented bool
+}
+
+func buildScopeInfoArray(ctx context.Context, scope string, consent *models.UserConsent) []ScopeInfo {
+	scopeInfoArr := []ScopeInfo{}
+
+	if len(scope) == 0 {
+		return scopeInfoArr
+	}
+
+	scopes := strings.Split(scope, " ")
+	for _, scope := range scopes {
+		if oidc.IsClaimScope(scope) || oidc.IsOfflineAccessScope(scope) {
+			scopeInfoArr = append(scopeInfoArr, ScopeInfo{
+				Scope:            scope,
+				Description:      i18n.T(ctx, oidc.ScopeDescriptionKey(scope)),
+				AlreadyConsented: consent != nil && consent.HasScope(scope),
+			})
+		} else {
+			// resource-permission
+			parts := strings.Split(scope, ":")
+			scopeInfoArr = append(scopeInfoArr, ScopeInfo{
+				Scope: scope,
+				Description: i18n.T(ctx, "consent.scope.permission_template",
+					map[string]any{"permission": parts[1], "resource": parts[0]}),
+				AlreadyConsented: consent != nil && consent.HasScope(scope),
+			})
+		}
+	}
+	return scopeInfoArr
+}
+
+// consentDatabase is what the consent screen needs: the client, the consent it reads and writes,
+// and the user granting it.
+//
+// It embeds the authorize port because a refusal is answered through redirToClientWithError, and
+// the client display port because the screen renders through getClientDisplayInfo.
+type consentDatabase interface {
+	authorizeDatabase
+	clientDisplayDatabase
+
+	CreateUserConsent(ctx context.Context, tx *sql.Tx, userConsent *models.UserConsent) error
+	GetClientByClientIdentifier(ctx context.Context, tx *sql.Tx, clientIdentifier string) (*models.Client, error)
+	GetConsentByUserIdAndClientId(ctx context.Context, tx *sql.Tx, userId int64, clientId int64) (*models.UserConsent, error)
+	GetUserById(ctx context.Context, tx *sql.Tx, userId int64) (*models.User, error)
+	UpdateUserConsent(ctx context.Context, tx *sql.Tx, userConsent *models.UserConsent) error
+}
+
+func HandleConsentGet(
+	httpHelper HttpHelper,
+	authHelper AuthHelper,
+	database consentDatabase,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		authContext, err := authHelper.GetAuthContext(r)
+		if err != nil {
+			if errors.Is(err, handlerhelpers.ErrNoAuthContext) {
+				var profileUrl = GetProfileURL()
+				slog.WarnContext(r.Context(), "auth context is missing, redirecting", "redirect", profileUrl)
+				http.Redirect(w, r, profileUrl, http.StatusFound)
+			} else {
+				httpHelper.InternalServerError(w, r, err)
+			}
+			return
+		}
+
+		requiredState := ceremony.AuthStateRequiresConsent
+		if authContext.AuthState != requiredState {
+			rejectAuthStateMismatch(httpHelper, w, r, requiredState, authContext.AuthState)
+			return
+		}
+
+		user, err := database.GetUserById(r.Context(), nil, authContext.UserId)
+		if err != nil {
+			httpHelper.InternalServerError(w, r, err)
+			return
+		}
+		if user == nil {
+			httpHelper.InternalServerError(w, r, errs.New("user not found"))
+			return
+		}
+
+		client, err := database.GetClientByClientIdentifier(r.Context(), nil, authContext.ClientId)
+		if err != nil {
+			httpHelper.InternalServerError(w, r, err)
+			return
+		}
+		if client == nil {
+			httpHelper.InternalServerError(w, r, errs.New("client not found"))
+			return
+		}
+
+		consent, err := database.GetConsentByUserIdAndClientId(r.Context(), nil, user.Id, client.Id)
+		if err != nil {
+			httpHelper.InternalServerError(w, r, err)
+			return
+		}
+
+		scopeInfoArr := buildScopeInfoArray(r.Context(), authContext.Scope, consent)
+
+		scopesFullyConsented := true
+		for _, scopeInfo := range scopeInfoArr {
+			scopesFullyConsented = scopesFullyConsented && scopeInfo.AlreadyConsented
+		}
+
+		// Show consent screen if:
+		// - Not all scopes are fully consented, OR
+		// - offline_access is requested (always re-confirm refresh token grant), OR
+		// - prompt=consent was explicitly requested (force consent UI)
+		if !scopesFullyConsented || oidc.HasOfflineAccessScope(authContext.Scope) || authContext.HasPromptValue("consent") {
+			displayInfo := getClientDisplayInfo(r.Context(), database, client)
+
+			// The consent screen names the client through its own rule rather than through
+			// displayInfo.ClientName, which falls back to the raw identifier and would show a
+			// self-registered client as dcr_<uuid>. A prompt nobody can evaluate defeats the point
+			// of prompting (#108).
+			clientName, clientNameUnverified := consentClientName(client)
+
+			clientDescription := displayInfo.Description
+			if clientNameUnverified {
+				// The name and the description are both the client's self-asserted client_name in
+				// this case, so an administrator who ticked "show description" on a self-registered
+				// client would otherwise read the same string twice (#108).
+				clientDescription = ""
+			}
+
+			bind := map[string]interface{}{
+				"showClientSection": displayInfo.ShowSection,
+				"clientName":        clientName,
+				// Whether the name above is the client's own claim about itself. The template
+				// renders the unverified notice under the name when this is set.
+				"clientNameUnverified": clientNameUnverified,
+				"clientDescription":    clientDescription,
+				"clientLogoUrl":        displayInfo.LogoURL,
+				"clientWebsiteUrl":     displayInfo.WebsiteURL,
+				"hasLogo":              displayInfo.HasLogo,
+				"scopes":               scopeInfoArr,
+				// The rendered form says which ceremony rendered it, and HandleConsentPost
+				// refuses a submission naming any other one. The checkbox indices are only
+				// meaningful against this ceremony's scope list (#79).
+				"ceremonyId": authContext.CeremonyId,
+			}
+
+			err = httpHelper.RenderTemplate(w, r, "/layouts/auth_layout.html", "/consent.html", bind)
+			if err != nil {
+				httpHelper.InternalServerError(w, r, err)
+			}
+			return
+		} else {
+			// consent is done, ready to issue code
+			authContext.AuthState = ceremony.AuthStateReadyToIssueCode
+			err = authHelper.SaveAuthContext(w, r, authContext)
+			if err != nil {
+				httpHelper.InternalServerError(w, r, err)
+				return
+			}
+			http.Redirect(w, r, config.GetAuthServer().BaseURL+"/auth/issue", http.StatusFound)
+		}
+	}
+}
+
+func HandleConsentPost(
+	httpHelper HttpHelper,
+	authHelper AuthHelper,
+	database consentDatabase,
+	templateFS fs.FS,
+	auditLogger AuditLogger,
+	permissionChecker PermissionChecker,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		authContext, err := authHelper.GetAuthContext(r)
+		if err != nil {
+			if errors.Is(err, handlerhelpers.ErrNoAuthContext) {
+				var profileUrl = GetProfileURL()
+				slog.WarnContext(r.Context(), "auth context is missing, redirecting", "redirect", profileUrl)
+				http.Redirect(w, r, profileUrl, http.StatusFound)
+			} else {
+				httpHelper.InternalServerError(w, r, err)
+			}
+			return
+		}
+
+		// Before the AuthState check, so a form left open in another tab gets the 400 mismatch
+		// page rather than the 500 that a replaced context's state would produce. Before the
+		// btnSubmit/btnCancel dispatch too, so a stale cancel cannot clear the auth context of
+		// the ceremony that is actually current (#79).
+		//
+		// r.PostFormValue rather than r.FormValue: this form posts to action="", so r.Form
+		// would let /auth/consent?ceremonyId=... supply the id, and only the submitted body is
+		// a submission. Same reasoning as the checkbox selection below.
+		if !ceremonyMatches(authContext.CeremonyId, r.PostFormValue(ceremonyIdField)) {
+			rejectCeremonyMismatch(httpHelper, auditLogger, w, r, authContext)
+			return
+		}
+
+		requiredState := ceremony.AuthStateRequiresConsent
+		if authContext.AuthState != requiredState {
+			rejectAuthStateMismatch(httpHelper, w, r, requiredState, authContext.AuthState)
+			return
+		}
+
+		// Both action controls are read from the submitted body, for the same reason as the
+		// checkbox selection below: this form posts to action="", so r.Form would merge the URL
+		// query in, and a button that was not clicked sends no key at all. A consent screen
+		// reached at /auth/consent?btnSubmit=submit would therefore turn the user's click on
+		// Cancel into a grant of every box the form still had checked, since r.FormValue found
+		// the query's btnSubmit where the body had only btnCancel (#79).
+		//
+		// Approval needs the submit control alone. A body carrying both, which no browser sends,
+		// is refused rather than resolved in favour of granting.
+		approved := r.PostForm.Get("btnSubmit") == "submit" && !r.PostForm.Has("btnCancel")
+
+		if approved {
+
+			// The checkbox names are positional, consent0 .. consentN, so the key is matched
+			// exactly. strings.Contains found "consent1" inside "consent10" and granted a scope
+			// the user had unchecked, from 11 scopes upwards (#79).
+			//
+			// r.PostForm rather than r.Form: r.Form merges the URL query, and this form posts to
+			// action="", so a crafted /auth/consent?consent5=on would otherwise count as a tick.
+			scopeInfoArr := buildScopeInfoArray(r.Context(), authContext.Scope, nil)
+			grantedScopes := make([]string, 0, len(scopeInfoArr))
+			for idx, scopeInfo := range scopeInfoArr {
+				if r.PostForm.Has(fmt.Sprintf("consent%d", idx)) {
+					grantedScopes = append(grantedScopes, scopeInfo.Scope)
+				}
+			}
+
+			// Refusal is decided by what was consented to, not by whether a key named consent...
+			// arrived. A submission matching no scope used to reach the issuers with an empty
+			// consented scope, which they read as "no consent screen was shown" and answer with
+			// the full requested scope (#79).
+			if len(grantedScopes) == 0 {
+				// A refusal answers the client with an error redirect, and an error redirect now
+				// carries the client it is answering, so provenance is resolved here rather than
+				// in the approval branch below where the load used to be the only one. The two
+				// branches are mutually exclusive, so no request loads the client twice (#108).
+				refusedClient := clientProvenance(r.Context(), database, authContext.ClientId)
+
+				// The clear goes FIRST. ClearAuthContext persists the deletion through a
+				// Set-Cookie on w, and redirToClientWithError commits the response in every
+				// response mode, so clearing afterwards leaves the header on a response already
+				// written. The browser then keeps an auth context in requires_consent, which
+				// GET /auth/consent accepts: replaying it renders the consent screen again and
+				// the user may approve, so the client would receive access_denied and then a
+				// code for the same authorization request (#141).
+				err = authHelper.ClearAuthContext(w, r)
+				if err != nil {
+					// The clear failed, so Save wrote no cookie and the browser still holds the
+					// auth context. The client is owed an error response regardless: its redirect
+					// URI was validated upstream, so OIDC Core 1.0 3.1.2.2 with 3.1.2.6 applies,
+					// and RFC 6749 4.1.2.1 mints server_error for exactly this condition (#141).
+					slog.ErrorContext(r.Context(), "unable to clear the auth context, answering the client with server_error",
+						"error", err)
+					err = redirToClientWithError(w, r, database, httpHelper, templateFS,
+						redirectErrorFromAuthContext(authContext, refusedClient, "server_error", "Internal server error"))
+					if err != nil {
+						// Nowhere left to send the client, so the 500 is the last resort here.
+						httpHelper.InternalServerError(w, r, err)
+					}
+					return
+				}
+
+				err = redirToClientWithError(w, r, database, httpHelper, templateFS,
+					redirectErrorFromAuthContext(authContext, refusedClient,
+						"access_denied", "The user did not provide consent"))
+				if err != nil {
+					httpHelper.InternalServerError(w, r, err)
+					return
+				}
+				return
+			} else {
+
+				client, consentErr := database.GetClientByClientIdentifier(r.Context(), nil, authContext.ClientId)
+				if consentErr != nil {
+					httpHelper.InternalServerError(w, r, consentErr)
+					return
+				}
+				if client == nil {
+					httpHelper.InternalServerError(w, r, errs.New("client not found"))
+					return
+				}
+
+				user, consentErr := database.GetUserById(r.Context(), nil, authContext.UserId)
+				if consentErr != nil {
+					httpHelper.InternalServerError(w, r, consentErr)
+					return
+				}
+				if user == nil {
+					httpHelper.InternalServerError(w, r, errs.New("user not found"))
+					return
+				}
+
+				// The ticked selection is weighed against the permissions the user holds NOW,
+				// which need not be the ones they held when the screen was rendered. The row
+				// this branch is about to write grants nothing on its own, since every reader
+				// pairs it with a live permission check, but it suppresses the consent screen on
+				// later ceremonies: an unfiltered row means a permission granted back months
+				// later is covered by a tick the user made at a moment when they did not hold
+				// it, and the user's own consents page lists a scope the application can never
+				// use (#241).
+				//
+				// Above the consent row load rather than beside the join below, so a selection
+				// the filter empties refuses without reading or writing anything.
+				grantedScope, consentErr := permissionChecker.FilterOutScopesWhereUserIsNotAuthorized(r.Context(),
+					strings.Join(grantedScopes, " "), user)
+				if consentErr != nil {
+					httpHelper.InternalServerError(w, r, consentErr)
+					return
+				}
+
+				if grantedScope == "" {
+					slog.WarnContext(r.Context(), "the consented selection holds no permission the user still has, so no consent is recorded",
+						"user_id", user.Id,
+						"client_identifier", authContext.ClientId)
+
+					// A DIFFERENT refusal from the one above, deliberately. That one answers a
+					// user who ticked nothing, which is a choice they made; this one answers a
+					// selection an administrator emptied, which is not. The wording and the
+					// error code are /auth/completed's for the same condition arriving later,
+					// so the same removal gets one answer wherever it lands (#241 decision 3).
+					//
+					// The clear goes FIRST, for the reason the two refusals above state: a
+					// Set-Cookie written after redirToClientWithError has committed never
+					// reaches the wire, so the browser would keep an auth context in
+					// requires_consent that a replay of GET /auth/consent can still turn into a
+					// code (#141).
+					consentErr = authHelper.ClearAuthContext(w, r)
+					if consentErr != nil {
+						// The clear failed, so Save wrote no cookie and the browser still holds
+						// the auth context. The client is owed an error response regardless: its
+						// redirect URI was validated upstream, so OIDC Core 1.0 3.1.2.2 with
+						// 3.1.2.6 applies, and RFC 6749 4.1.2.1 mints server_error for exactly
+						// this condition (#141).
+						slog.ErrorContext(r.Context(), "unable to clear the auth context, answering the client with server_error",
+							"error", consentErr)
+						consentErr = redirToClientWithError(w, r, database, httpHelper, templateFS,
+							redirectErrorFromAuthContext(authContext, client, "server_error", "Internal server error"))
+						if consentErr != nil {
+							// Nowhere left to send the client, so the 500 is the last resort here.
+							httpHelper.InternalServerError(w, r, consentErr)
+						}
+						return
+					}
+
+					consentErr = redirToClientWithError(w, r, database, httpHelper, templateFS,
+						redirectErrorFromAuthContext(authContext, client,
+							"access_denied", "The user is not authorized to access any of the requested scopes"))
+					if consentErr != nil {
+						httpHelper.InternalServerError(w, r, consentErr)
+						return
+					}
+					return
+				}
+
+				consent, consentErr := database.GetConsentByUserIdAndClientId(r.Context(), nil, user.Id, client.Id)
+				if consentErr != nil {
+					httpHelper.InternalServerError(w, r, consentErr)
+					return
+				}
+
+				if consent == nil {
+					consent = &models.UserConsent{
+						UserId:    user.Id,
+						ClientId:  client.Id,
+						GrantedAt: sql.NullTime{Time: time.Now().UTC(), Valid: true},
+					}
+				}
+
+				// The assignment takes the whole filtered selection, so an existing consent is
+				// replaced rather than appended to. FilterOutScopesWhereUserIsNotAuthorized
+				// returns a trimmed single-spaced join in the order it was given, which is what
+				// strings.Join produced here before the filter was added.
+				consent.Scope = grantedScope
+
+				if consent.Id > 0 {
+					consentErr = database.UpdateUserConsent(r.Context(), nil, consent)
+					if consentErr != nil {
+						httpHelper.InternalServerError(w, r, consentErr)
+						return
+					}
+				} else {
+					consentErr = database.CreateUserConsent(r.Context(), nil, consent)
+					if consentErr != nil {
+						httpHelper.InternalServerError(w, r, consentErr)
+						return
+					}
+				}
+				authContext.ConsentedScope = consent.Scope
+
+				auditLogger.Log(r.Context(), audit.AuditSavedConsent, map[string]interface{}{
+					"userId":    consent.UserId,
+					"clientId":  consent.ClientId,
+					"consentId": consent.Id,
+				})
+
+				// consent is done, ready to issue code
+				authContext.AuthState = ceremony.AuthStateReadyToIssueCode
+				consentErr = authHelper.SaveAuthContext(w, r, authContext)
+				if consentErr != nil {
+					httpHelper.InternalServerError(w, r, consentErr)
+					return
+				}
+				http.Redirect(w, r, config.GetAuthServer().BaseURL+"/auth/issue", http.StatusFound)
+			}
+		} else {
+
+			// Provenance is resolved here for the same reason as in the no-scopes-consented
+			// refusal above: this branch answers the client with an error redirect, and the
+			// redirect now carries the client it is answering (#108).
+			refusedClient := clientProvenance(r.Context(), database, authContext.ClientId)
+
+			// The clear goes FIRST, for the same reason as the no-scopes-consented refusal
+			// above: a Set-Cookie written after redirToClientWithError has committed never
+			// reaches the wire, so the browser keeps an auth context in requires_consent that
+			// a replay of GET /auth/consent can still turn into a code (#141).
+			err = authHelper.ClearAuthContext(w, r)
+			if err != nil {
+				// The clear failed, so Save wrote no cookie and the browser still holds the
+				// auth context. The client is owed an error response regardless: its redirect
+				// URI was validated upstream, so OIDC Core 1.0 3.1.2.2 with 3.1.2.6 applies,
+				// and RFC 6749 4.1.2.1 mints server_error for exactly this condition (#141).
+				slog.ErrorContext(r.Context(), "unable to clear the auth context, answering the client with server_error",
+					"error", err)
+				err = redirToClientWithError(w, r, database, httpHelper, templateFS,
+					redirectErrorFromAuthContext(authContext, refusedClient, "server_error", "Internal server error"))
+				if err != nil {
+					// Nowhere left to send the client, so the 500 is the last resort here.
+					httpHelper.InternalServerError(w, r, err)
+				}
+				return
+			}
+
+			err = redirToClientWithError(w, r, database, httpHelper, templateFS,
+				redirectErrorFromAuthContext(authContext, refusedClient,
+					"access_denied", "The user did not provide consent"))
+			if err != nil {
+				httpHelper.InternalServerError(w, r, err)
+				return
+			}
+			return
+		}
+	}
+}

@@ -1,0 +1,1892 @@
+package datatests
+
+import (
+	"context"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/leodip/goiabada/authserver/internal/data"
+	"github.com/leodip/goiabada/authserver/internal/models"
+	"github.com/leodip/goiabada/authserver/internal/testutil/fake"
+)
+
+func TestCreateClient(t *testing.T) {
+	random := fake.LetterN(6)
+	client := &models.Client{
+		ClientIdentifier:                        "test_client_" + random,
+		ClientSecretEncrypted:                   []byte("encrypted_secret"),
+		Description:                             "Test Client Description",
+		Enabled:                                 true,
+		ConsentRequired:                         true,
+		IsPublic:                                false,
+		AuthorizationCodeEnabled:                true,
+		ClientCredentialsEnabled:                true,
+		TokenExpirationInSeconds:                3600,
+		RefreshTokenOfflineIdleTimeoutInSeconds: 86400,
+		RefreshTokenOfflineMaxLifetimeInSeconds: 2592000,
+		IncludeOpenIDConnectClaimsInAccessToken: models.ThreeStateSettingDefault.String(),
+		IncludeOpenIDConnectClaimsInIdToken:     models.ThreeStateSettingDefault.String(),
+		DefaultAcrLevel:                         models.AcrLevel1,
+	}
+
+	err := database.CreateClient(context.Background(), nil, client)
+	if err != nil {
+		t.Fatalf("Failed to create client: %v", err)
+	}
+
+	// Verify the client was created
+	createdClient, err := database.GetClientByClientIdentifier(context.Background(), nil, client.ClientIdentifier)
+	if err != nil {
+		t.Fatalf("Failed to retrieve created client: %v", err)
+	}
+
+	// Check all properties
+	if createdClient.ClientIdentifier != client.ClientIdentifier {
+		t.Errorf("Expected ClientIdentifier '%s', got '%s'", client.ClientIdentifier, createdClient.ClientIdentifier)
+	}
+	if string(createdClient.ClientSecretEncrypted) != string(client.ClientSecretEncrypted) {
+		t.Errorf("ClientSecretEncrypted does not match")
+	}
+	if createdClient.Description != client.Description {
+		t.Errorf("Expected Description '%s', got '%s'", client.Description, createdClient.Description)
+	}
+	if createdClient.Enabled != client.Enabled {
+		t.Errorf("Expected Enabled %v, got %v", client.Enabled, createdClient.Enabled)
+	}
+	if createdClient.ConsentRequired != client.ConsentRequired {
+		t.Errorf("Expected ConsentRequired %v, got %v", client.ConsentRequired, createdClient.ConsentRequired)
+	}
+	if createdClient.IsPublic != client.IsPublic {
+		t.Errorf("Expected IsPublic %v, got %v", client.IsPublic, createdClient.IsPublic)
+	}
+	if createdClient.AuthorizationCodeEnabled != client.AuthorizationCodeEnabled {
+		t.Errorf("Expected AuthorizationCodeEnabled %v, got %v", client.AuthorizationCodeEnabled, createdClient.AuthorizationCodeEnabled)
+	}
+	if createdClient.ClientCredentialsEnabled != client.ClientCredentialsEnabled {
+		t.Errorf("Expected ClientCredentialsEnabled %v, got %v", client.ClientCredentialsEnabled, createdClient.ClientCredentialsEnabled)
+	}
+	if createdClient.TokenExpirationInSeconds != client.TokenExpirationInSeconds {
+		t.Errorf("Expected TokenExpirationInSeconds %d, got %d", client.TokenExpirationInSeconds, createdClient.TokenExpirationInSeconds)
+	}
+	if createdClient.RefreshTokenOfflineIdleTimeoutInSeconds != client.RefreshTokenOfflineIdleTimeoutInSeconds {
+		t.Errorf("Expected RefreshTokenOfflineIdleTimeoutInSeconds %d, got %d", client.RefreshTokenOfflineIdleTimeoutInSeconds, createdClient.RefreshTokenOfflineIdleTimeoutInSeconds)
+	}
+	if createdClient.RefreshTokenOfflineMaxLifetimeInSeconds != client.RefreshTokenOfflineMaxLifetimeInSeconds {
+		t.Errorf("Expected RefreshTokenOfflineMaxLifetimeInSeconds %d, got %d", client.RefreshTokenOfflineMaxLifetimeInSeconds, createdClient.RefreshTokenOfflineMaxLifetimeInSeconds)
+	}
+	if createdClient.IncludeOpenIDConnectClaimsInAccessToken != client.IncludeOpenIDConnectClaimsInAccessToken {
+		t.Errorf("Expected IncludeOpenIDConnectClaimsInAccessToken '%s', got '%s'", client.IncludeOpenIDConnectClaimsInAccessToken, createdClient.IncludeOpenIDConnectClaimsInAccessToken)
+	}
+	if createdClient.IncludeOpenIDConnectClaimsInIdToken != client.IncludeOpenIDConnectClaimsInIdToken {
+		t.Errorf("Expected IncludeOpenIDConnectClaimsInIdToken '%s', got '%s'", client.IncludeOpenIDConnectClaimsInIdToken, createdClient.IncludeOpenIDConnectClaimsInIdToken)
+	}
+	if createdClient.DefaultAcrLevel != client.DefaultAcrLevel {
+		t.Errorf("Expected DefaultAcrLevel %v, got %v", client.DefaultAcrLevel, createdClient.DefaultAcrLevel)
+	}
+	if !createdClient.CreatedAt.Valid || createdClient.CreatedAt.Time.IsZero() {
+		t.Errorf("CreatedAt is not set properly")
+	}
+	if !createdClient.UpdatedAt.Valid || createdClient.UpdatedAt.Time.IsZero() {
+		t.Errorf("UpdatedAt is not set properly")
+	}
+}
+
+func TestUpdateClient(t *testing.T) {
+	random := fake.LetterN(6)
+	originalClient := &models.Client{
+		ClientIdentifier:                        "test_client_" + random,
+		ClientSecretEncrypted:                   []byte("original_secret"),
+		Description:                             "Original Description",
+		Enabled:                                 true,
+		ConsentRequired:                         true,
+		IsPublic:                                false,
+		AuthorizationCodeEnabled:                true,
+		ClientCredentialsEnabled:                true,
+		TokenExpirationInSeconds:                3600,
+		RefreshTokenOfflineIdleTimeoutInSeconds: 86400,
+		RefreshTokenOfflineMaxLifetimeInSeconds: 2592000,
+		IncludeOpenIDConnectClaimsInAccessToken: models.ThreeStateSettingDefault.String(),
+		IncludeOpenIDConnectClaimsInIdToken:     models.ThreeStateSettingDefault.String(),
+		DefaultAcrLevel:                         models.AcrLevel1,
+	}
+
+	err := database.CreateClient(context.Background(), nil, originalClient)
+	if err != nil {
+		t.Fatalf("Failed to create initial client: %v", err)
+	}
+
+	updatedClient := &models.Client{
+		Id:                                      originalClient.Id,
+		ClientIdentifier:                        "updated_client_" + random,
+		ClientSecretEncrypted:                   []byte("updated_secret"),
+		Description:                             "Updated Description",
+		Enabled:                                 false,
+		ConsentRequired:                         false,
+		IsPublic:                                true,
+		AuthorizationCodeEnabled:                false,
+		ClientCredentialsEnabled:                false,
+		TokenExpirationInSeconds:                7200,
+		RefreshTokenOfflineIdleTimeoutInSeconds: 172800,
+		RefreshTokenOfflineMaxLifetimeInSeconds: 5184000,
+		IncludeOpenIDConnectClaimsInAccessToken: models.ThreeStateSettingOn.String(),
+		IncludeOpenIDConnectClaimsInIdToken:     models.ThreeStateSettingOff.String(),
+		DefaultAcrLevel:                         models.AcrLevel2Optional,
+	}
+
+	err = database.UpdateClient(context.Background(), nil, updatedClient)
+	if err != nil {
+		t.Fatalf("Failed to update client: %v", err)
+	}
+
+	// Retrieve the updated client
+	retrievedClient, err := database.GetClientById(context.Background(), nil, originalClient.Id)
+	if err != nil {
+		t.Fatalf("Failed to retrieve updated client: %v", err)
+	}
+
+	// Check all properties
+	if retrievedClient.ClientIdentifier != updatedClient.ClientIdentifier {
+		t.Errorf("Expected ClientIdentifier '%s', got '%s'", updatedClient.ClientIdentifier, retrievedClient.ClientIdentifier)
+	}
+	if string(retrievedClient.ClientSecretEncrypted) != string(updatedClient.ClientSecretEncrypted) {
+		t.Errorf("ClientSecretEncrypted does not match")
+	}
+	if retrievedClient.Description != updatedClient.Description {
+		t.Errorf("Expected Description '%s', got '%s'", updatedClient.Description, retrievedClient.Description)
+	}
+	if retrievedClient.Enabled != updatedClient.Enabled {
+		t.Errorf("Expected Enabled %v, got %v", updatedClient.Enabled, retrievedClient.Enabled)
+	}
+	if retrievedClient.ConsentRequired != updatedClient.ConsentRequired {
+		t.Errorf("Expected ConsentRequired %v, got %v", updatedClient.ConsentRequired, retrievedClient.ConsentRequired)
+	}
+	if retrievedClient.IsPublic != updatedClient.IsPublic {
+		t.Errorf("Expected IsPublic %v, got %v", updatedClient.IsPublic, retrievedClient.IsPublic)
+	}
+	if retrievedClient.AuthorizationCodeEnabled != updatedClient.AuthorizationCodeEnabled {
+		t.Errorf("Expected AuthorizationCodeEnabled %v, got %v", updatedClient.AuthorizationCodeEnabled, retrievedClient.AuthorizationCodeEnabled)
+	}
+	if retrievedClient.ClientCredentialsEnabled != updatedClient.ClientCredentialsEnabled {
+		t.Errorf("Expected ClientCredentialsEnabled %v, got %v", updatedClient.ClientCredentialsEnabled, retrievedClient.ClientCredentialsEnabled)
+	}
+	if retrievedClient.TokenExpirationInSeconds != updatedClient.TokenExpirationInSeconds {
+		t.Errorf("Expected TokenExpirationInSeconds %d, got %d", updatedClient.TokenExpirationInSeconds, retrievedClient.TokenExpirationInSeconds)
+	}
+	if retrievedClient.RefreshTokenOfflineIdleTimeoutInSeconds != updatedClient.RefreshTokenOfflineIdleTimeoutInSeconds {
+		t.Errorf("Expected RefreshTokenOfflineIdleTimeoutInSeconds %d, got %d", updatedClient.RefreshTokenOfflineIdleTimeoutInSeconds, retrievedClient.RefreshTokenOfflineIdleTimeoutInSeconds)
+	}
+	if retrievedClient.RefreshTokenOfflineMaxLifetimeInSeconds != updatedClient.RefreshTokenOfflineMaxLifetimeInSeconds {
+		t.Errorf("Expected RefreshTokenOfflineMaxLifetimeInSeconds %d, got %d", updatedClient.RefreshTokenOfflineMaxLifetimeInSeconds, retrievedClient.RefreshTokenOfflineMaxLifetimeInSeconds)
+	}
+	if retrievedClient.IncludeOpenIDConnectClaimsInAccessToken != updatedClient.IncludeOpenIDConnectClaimsInAccessToken {
+		t.Errorf("Expected IncludeOpenIDConnectClaimsInAccessToken '%s', got '%s'", updatedClient.IncludeOpenIDConnectClaimsInAccessToken, retrievedClient.IncludeOpenIDConnectClaimsInAccessToken)
+	}
+	if retrievedClient.IncludeOpenIDConnectClaimsInIdToken != updatedClient.IncludeOpenIDConnectClaimsInIdToken {
+		t.Errorf("Expected IncludeOpenIDConnectClaimsInIdToken '%s', got '%s'", updatedClient.IncludeOpenIDConnectClaimsInIdToken, retrievedClient.IncludeOpenIDConnectClaimsInIdToken)
+	}
+	if retrievedClient.DefaultAcrLevel != updatedClient.DefaultAcrLevel {
+		t.Errorf("Expected DefaultAcrLevel %v, got %v", updatedClient.DefaultAcrLevel, retrievedClient.DefaultAcrLevel)
+	}
+	if !retrievedClient.CreatedAt.Valid || retrievedClient.CreatedAt.Time.IsZero() {
+		t.Errorf("CreatedAt is not set properly")
+	}
+	if !retrievedClient.UpdatedAt.Valid || retrievedClient.UpdatedAt.Time.IsZero() {
+		t.Errorf("UpdatedAt is not set properly")
+	}
+	if retrievedClient.UpdatedAt.Time.Before(originalClient.CreatedAt.Time) || retrievedClient.UpdatedAt.Time.Equal(originalClient.CreatedAt.Time) {
+		t.Errorf("UpdatedAt should be after CreatedAt")
+	}
+
+	// Check that UpdatedAt has changed
+	if retrievedClient.UpdatedAt.Time.Equal(originalClient.UpdatedAt.Time) {
+		t.Errorf("UpdatedAt should have changed")
+	}
+
+	// Small delay to ensure time difference
+	time.Sleep(timestampTick)
+
+	// Update again to check if UpdatedAt changes
+	updatedClient.Description = "Description updated again"
+	err = database.UpdateClient(context.Background(), nil, updatedClient)
+	if err != nil {
+		t.Fatalf("Failed to update client second time: %v", err)
+	}
+
+	retrievedClientAgain, err := database.GetClientById(context.Background(), nil, originalClient.Id)
+	if err != nil {
+		t.Fatalf("Failed to retrieve updated client second time: %v", err)
+	}
+
+	if retrievedClientAgain.UpdatedAt.Time.Equal(retrievedClient.UpdatedAt.Time) {
+		t.Errorf("UpdatedAt should have changed after second update")
+	}
+}
+
+func TestGetClientById(t *testing.T) {
+	random := fake.LetterN(6)
+	client := &models.Client{
+		ClientIdentifier:                        "test_client_" + random,
+		ClientSecretEncrypted:                   []byte("encrypted_secret"),
+		Description:                             "Test Client Description",
+		Enabled:                                 true,
+		ConsentRequired:                         true,
+		IsPublic:                                false,
+		AuthorizationCodeEnabled:                true,
+		ClientCredentialsEnabled:                true,
+		TokenExpirationInSeconds:                3600,
+		RefreshTokenOfflineIdleTimeoutInSeconds: 86400,
+		RefreshTokenOfflineMaxLifetimeInSeconds: 2592000,
+		IncludeOpenIDConnectClaimsInAccessToken: models.ThreeStateSettingDefault.String(),
+		DefaultAcrLevel:                         models.AcrLevel1,
+	}
+
+	err := database.CreateClient(context.Background(), nil, client)
+	if err != nil {
+		t.Fatalf("Failed to create client for testing: %v", err)
+	}
+
+	// Test retrieving the client
+	retrievedClient, err := database.GetClientById(context.Background(), nil, client.Id)
+	if err != nil {
+		t.Fatalf("Failed to retrieve client by ID: %v", err)
+	}
+
+	// Check all properties
+	if retrievedClient.Id != client.Id {
+		t.Errorf("Expected Id %d, got %d", client.Id, retrievedClient.Id)
+	}
+	if retrievedClient.ClientIdentifier != client.ClientIdentifier {
+		t.Errorf("Expected ClientIdentifier '%s', got '%s'", client.ClientIdentifier, retrievedClient.ClientIdentifier)
+	}
+	if string(retrievedClient.ClientSecretEncrypted) != string(client.ClientSecretEncrypted) {
+		t.Errorf("ClientSecretEncrypted does not match")
+	}
+	if retrievedClient.Description != client.Description {
+		t.Errorf("Expected Description '%s', got '%s'", client.Description, retrievedClient.Description)
+	}
+	if retrievedClient.Enabled != client.Enabled {
+		t.Errorf("Expected Enabled %v, got %v", client.Enabled, retrievedClient.Enabled)
+	}
+	if retrievedClient.ConsentRequired != client.ConsentRequired {
+		t.Errorf("Expected ConsentRequired %v, got %v", client.ConsentRequired, retrievedClient.ConsentRequired)
+	}
+	if retrievedClient.IsPublic != client.IsPublic {
+		t.Errorf("Expected IsPublic %v, got %v", client.IsPublic, retrievedClient.IsPublic)
+	}
+	if retrievedClient.AuthorizationCodeEnabled != client.AuthorizationCodeEnabled {
+		t.Errorf("Expected AuthorizationCodeEnabled %v, got %v", client.AuthorizationCodeEnabled, retrievedClient.AuthorizationCodeEnabled)
+	}
+	if retrievedClient.ClientCredentialsEnabled != client.ClientCredentialsEnabled {
+		t.Errorf("Expected ClientCredentialsEnabled %v, got %v", client.ClientCredentialsEnabled, retrievedClient.ClientCredentialsEnabled)
+	}
+	if retrievedClient.TokenExpirationInSeconds != client.TokenExpirationInSeconds {
+		t.Errorf("Expected TokenExpirationInSeconds %d, got %d", client.TokenExpirationInSeconds, retrievedClient.TokenExpirationInSeconds)
+	}
+	if retrievedClient.RefreshTokenOfflineIdleTimeoutInSeconds != client.RefreshTokenOfflineIdleTimeoutInSeconds {
+		t.Errorf("Expected RefreshTokenOfflineIdleTimeoutInSeconds %d, got %d", client.RefreshTokenOfflineIdleTimeoutInSeconds, retrievedClient.RefreshTokenOfflineIdleTimeoutInSeconds)
+	}
+	if retrievedClient.RefreshTokenOfflineMaxLifetimeInSeconds != client.RefreshTokenOfflineMaxLifetimeInSeconds {
+		t.Errorf("Expected RefreshTokenOfflineMaxLifetimeInSeconds %d, got %d", client.RefreshTokenOfflineMaxLifetimeInSeconds, retrievedClient.RefreshTokenOfflineMaxLifetimeInSeconds)
+	}
+	if retrievedClient.IncludeOpenIDConnectClaimsInAccessToken != client.IncludeOpenIDConnectClaimsInAccessToken {
+		t.Errorf("Expected IncludeOpenIDConnectClaimsInAccessToken '%s', got '%s'", client.IncludeOpenIDConnectClaimsInAccessToken, retrievedClient.IncludeOpenIDConnectClaimsInAccessToken)
+	}
+	if retrievedClient.DefaultAcrLevel != client.DefaultAcrLevel {
+		t.Errorf("Expected DefaultAcrLevel %v, got %v", client.DefaultAcrLevel, retrievedClient.DefaultAcrLevel)
+	}
+	if !retrievedClient.CreatedAt.Valid || retrievedClient.CreatedAt.Time.IsZero() {
+		t.Errorf("CreatedAt is not set properly")
+	}
+	if !retrievedClient.UpdatedAt.Valid || retrievedClient.UpdatedAt.Time.IsZero() {
+		t.Errorf("UpdatedAt is not set properly")
+	}
+
+	// Test retrieving a non-existent client
+	nonExistentId := client.Id + 10000 // Assuming this ID doesn't exist
+	nonExistentClient, err := database.GetClientById(context.Background(), nil, nonExistentId)
+	if err != nil {
+		t.Errorf("Expected no error for non-existent client, got: %v", err)
+	}
+	if nonExistentClient != nil {
+		t.Errorf("Expected nil for non-existent client, got a client with ID: %d", nonExistentClient.Id)
+	}
+
+	// Test with invalid ID (e.g., negative ID)
+	invalidClient, err := database.GetClientById(context.Background(), nil, -1)
+	if err != nil {
+		t.Errorf("Expected no error for invalid client ID, got: %v", err)
+	}
+	if invalidClient != nil {
+		t.Errorf("Expected nil for invalid client ID, got a client with ID: %d", invalidClient.Id)
+	}
+}
+
+func TestGetClientByClientIdentifier(t *testing.T) {
+	random := fake.LetterN(6)
+	clientIdentifier := "test_client_" + random
+	client := &models.Client{
+		ClientIdentifier:                        clientIdentifier,
+		ClientSecretEncrypted:                   []byte("encrypted_secret"),
+		Description:                             "Test Client Description",
+		Enabled:                                 true,
+		ConsentRequired:                         true,
+		IsPublic:                                false,
+		AuthorizationCodeEnabled:                true,
+		ClientCredentialsEnabled:                true,
+		TokenExpirationInSeconds:                3600,
+		RefreshTokenOfflineIdleTimeoutInSeconds: 86400,
+		RefreshTokenOfflineMaxLifetimeInSeconds: 2592000,
+		IncludeOpenIDConnectClaimsInAccessToken: models.ThreeStateSettingDefault.String(),
+		DefaultAcrLevel:                         models.AcrLevel1,
+	}
+
+	err := database.CreateClient(context.Background(), nil, client)
+	if err != nil {
+		t.Fatalf("Failed to create client for testing: %v", err)
+	}
+
+	// Test retrieving the client by client identifier
+	retrievedClient, err := database.GetClientByClientIdentifier(context.Background(), nil, clientIdentifier)
+	if err != nil {
+		t.Fatalf("Failed to retrieve client by client identifier: %v", err)
+	}
+
+	// Check all properties
+	if retrievedClient.Id != client.Id {
+		t.Errorf("Expected Id %d, got %d", client.Id, retrievedClient.Id)
+	}
+	if retrievedClient.ClientIdentifier != client.ClientIdentifier {
+		t.Errorf("Expected ClientIdentifier '%s', got '%s'", client.ClientIdentifier, retrievedClient.ClientIdentifier)
+	}
+	if string(retrievedClient.ClientSecretEncrypted) != string(client.ClientSecretEncrypted) {
+		t.Errorf("ClientSecretEncrypted does not match")
+	}
+	if retrievedClient.Description != client.Description {
+		t.Errorf("Expected Description '%s', got '%s'", client.Description, retrievedClient.Description)
+	}
+	if retrievedClient.Enabled != client.Enabled {
+		t.Errorf("Expected Enabled %v, got %v", client.Enabled, retrievedClient.Enabled)
+	}
+	if retrievedClient.ConsentRequired != client.ConsentRequired {
+		t.Errorf("Expected ConsentRequired %v, got %v", client.ConsentRequired, retrievedClient.ConsentRequired)
+	}
+	if retrievedClient.IsPublic != client.IsPublic {
+		t.Errorf("Expected IsPublic %v, got %v", client.IsPublic, retrievedClient.IsPublic)
+	}
+	if retrievedClient.AuthorizationCodeEnabled != client.AuthorizationCodeEnabled {
+		t.Errorf("Expected AuthorizationCodeEnabled %v, got %v", client.AuthorizationCodeEnabled, retrievedClient.AuthorizationCodeEnabled)
+	}
+	if retrievedClient.ClientCredentialsEnabled != client.ClientCredentialsEnabled {
+		t.Errorf("Expected ClientCredentialsEnabled %v, got %v", client.ClientCredentialsEnabled, retrievedClient.ClientCredentialsEnabled)
+	}
+	if retrievedClient.TokenExpirationInSeconds != client.TokenExpirationInSeconds {
+		t.Errorf("Expected TokenExpirationInSeconds %d, got %d", client.TokenExpirationInSeconds, retrievedClient.TokenExpirationInSeconds)
+	}
+	if retrievedClient.RefreshTokenOfflineIdleTimeoutInSeconds != client.RefreshTokenOfflineIdleTimeoutInSeconds {
+		t.Errorf("Expected RefreshTokenOfflineIdleTimeoutInSeconds %d, got %d", client.RefreshTokenOfflineIdleTimeoutInSeconds, retrievedClient.RefreshTokenOfflineIdleTimeoutInSeconds)
+	}
+	if retrievedClient.RefreshTokenOfflineMaxLifetimeInSeconds != client.RefreshTokenOfflineMaxLifetimeInSeconds {
+		t.Errorf("Expected RefreshTokenOfflineMaxLifetimeInSeconds %d, got %d", client.RefreshTokenOfflineMaxLifetimeInSeconds, retrievedClient.RefreshTokenOfflineMaxLifetimeInSeconds)
+	}
+	if retrievedClient.IncludeOpenIDConnectClaimsInAccessToken != client.IncludeOpenIDConnectClaimsInAccessToken {
+		t.Errorf("Expected IncludeOpenIDConnectClaimsInAccessToken '%s', got '%s'", client.IncludeOpenIDConnectClaimsInAccessToken, retrievedClient.IncludeOpenIDConnectClaimsInAccessToken)
+	}
+	if retrievedClient.DefaultAcrLevel != client.DefaultAcrLevel {
+		t.Errorf("Expected DefaultAcrLevel %v, got %v", client.DefaultAcrLevel, retrievedClient.DefaultAcrLevel)
+	}
+	if !retrievedClient.CreatedAt.Valid || retrievedClient.CreatedAt.Time.IsZero() {
+		t.Errorf("CreatedAt is not set properly")
+	}
+	if !retrievedClient.UpdatedAt.Valid || retrievedClient.UpdatedAt.Time.IsZero() {
+		t.Errorf("UpdatedAt is not set properly")
+	}
+
+	// Test retrieving a non-existent client
+	nonExistentIdentifier := "non_existent_client_" + fake.LetterN(6)
+	nonExistentClient, err := database.GetClientByClientIdentifier(context.Background(), nil, nonExistentIdentifier)
+	if err != nil {
+		t.Errorf("Expected no error for non-existent client, got: %v", err)
+	}
+	if nonExistentClient != nil {
+		t.Errorf("Expected nil for non-existent client, got a client with ID: %d", nonExistentClient.Id)
+	}
+
+	// Test with empty client identifier
+	emptyIdentifierClient, err := database.GetClientByClientIdentifier(context.Background(), nil, "")
+	if err != nil {
+		t.Errorf("Expected no error for empty client identifier, got: %v", err)
+	}
+	if emptyIdentifierClient != nil {
+		t.Errorf("Expected nil for empty client identifier, got a client with ID: %d", emptyIdentifierClient.Id)
+	}
+}
+
+func TestClientLoadRedirectURIs(t *testing.T) {
+	random := fake.LetterN(6)
+	client := &models.Client{
+		ClientIdentifier:                        "test_client_" + random,
+		ClientSecretEncrypted:                   []byte("encrypted_secret"),
+		Description:                             "Test Client Description",
+		Enabled:                                 true,
+		ConsentRequired:                         true,
+		IsPublic:                                false,
+		AuthorizationCodeEnabled:                true,
+		ClientCredentialsEnabled:                true,
+		TokenExpirationInSeconds:                3600,
+		RefreshTokenOfflineIdleTimeoutInSeconds: 86400,
+		RefreshTokenOfflineMaxLifetimeInSeconds: 2592000,
+		IncludeOpenIDConnectClaimsInAccessToken: models.ThreeStateSettingDefault.String(),
+		DefaultAcrLevel:                         models.AcrLevel1,
+	}
+
+	err := database.CreateClient(context.Background(), nil, client)
+	if err != nil {
+		t.Fatalf("Failed to create client for testing: %v", err)
+	}
+
+	// Create multiple redirect URIs for the client
+	redirectURIs := []models.RedirectURI{
+		{URI: "https://example.com/callback1", ClientId: client.Id},
+		{URI: "https://example.com/callback2", ClientId: client.Id},
+		{URI: "http://localhost:8080/callback", ClientId: client.Id},
+	}
+
+	for _, uri := range redirectURIs {
+		createRedirectURIErr := database.CreateRedirectURI(context.Background(), nil, &uri)
+		if createRedirectURIErr != nil {
+			t.Fatalf("Failed to create redirect URI: %v", createRedirectURIErr)
+		}
+	}
+
+	// Load redirect URIs for the client
+	err = database.ClientLoadRedirectURIs(context.Background(), nil, client)
+	if err != nil {
+		t.Fatalf("Failed to load redirect URIs: %v", err)
+	}
+
+	// Check if the correct number of redirect URIs were loaded
+	if len(client.RedirectURIs) != len(redirectURIs) {
+		t.Errorf("Expected %d redirect URIs, got %d", len(redirectURIs), len(client.RedirectURIs))
+	}
+
+	// Check if all redirect URIs are present
+	uriMap := make(map[string]bool)
+	for _, uri := range client.RedirectURIs {
+		uriMap[uri.URI] = true
+	}
+
+	for _, expectedURI := range redirectURIs {
+		if !uriMap[expectedURI.URI] {
+			t.Errorf("Expected URI %s not found in loaded redirect URIs", expectedURI.URI)
+		}
+	}
+
+	// Test loading redirect URIs for a client with no URIs
+	clientWithNoURIs := &models.Client{
+		ClientIdentifier: "client_with_no_uris_" + fake.LetterN(6),
+	}
+	err = database.CreateClient(context.Background(), nil, clientWithNoURIs)
+	if err != nil {
+		t.Fatalf("Failed to create client with no URIs: %v", err)
+	}
+
+	err = database.ClientLoadRedirectURIs(context.Background(), nil, clientWithNoURIs)
+	if err != nil {
+		t.Fatalf("Failed to load redirect URIs for client with no URIs: %v", err)
+	}
+
+	if len(clientWithNoURIs.RedirectURIs) != 0 {
+		t.Errorf("Expected 0 redirect URIs for client with no URIs, got %d", len(clientWithNoURIs.RedirectURIs))
+	}
+
+	// Test loading redirect URIs for a nil client (should handle gracefully)
+	err = database.ClientLoadRedirectURIs(context.Background(), nil, nil)
+	if err != nil {
+		t.Errorf("Expected no error when loading redirect URIs for nil client, got: %v", err)
+	}
+}
+
+func TestClientLoadWebOrigins(t *testing.T) {
+	random := fake.LetterN(6)
+	client := &models.Client{
+		ClientIdentifier:                        "test_client_" + random,
+		ClientSecretEncrypted:                   []byte("encrypted_secret"),
+		Description:                             "Test Client Description",
+		Enabled:                                 true,
+		ConsentRequired:                         true,
+		IsPublic:                                false,
+		AuthorizationCodeEnabled:                true,
+		ClientCredentialsEnabled:                true,
+		TokenExpirationInSeconds:                3600,
+		RefreshTokenOfflineIdleTimeoutInSeconds: 86400,
+		RefreshTokenOfflineMaxLifetimeInSeconds: 2592000,
+		IncludeOpenIDConnectClaimsInAccessToken: models.ThreeStateSettingDefault.String(),
+		DefaultAcrLevel:                         models.AcrLevel1,
+	}
+
+	err := database.CreateClient(context.Background(), nil, client)
+	if err != nil {
+		t.Fatalf("Failed to create client for testing: %v", err)
+	}
+
+	// Create multiple web origins for the client
+	webOrigins := []models.WebOrigin{
+		{Origin: "https://example.com", ClientId: client.Id},
+		{Origin: "https://app.example.com", ClientId: client.Id},
+		{Origin: "http://localhost:3000", ClientId: client.Id},
+	}
+
+	for _, origin := range webOrigins {
+		createWebOriginErr := database.CreateWebOrigin(context.Background(), nil, &origin)
+		if createWebOriginErr != nil {
+			t.Fatalf("Failed to create web origin: %v", createWebOriginErr)
+		}
+	}
+
+	// Load web origins for the client
+	err = database.ClientLoadWebOrigins(context.Background(), nil, client)
+	if err != nil {
+		t.Fatalf("Failed to load web origins: %v", err)
+	}
+
+	// Check if the correct number of web origins were loaded
+	if len(client.WebOrigins) != len(webOrigins) {
+		t.Errorf("Expected %d web origins, got %d", len(webOrigins), len(client.WebOrigins))
+	}
+
+	// Check if all web origins are present
+	originMap := make(map[string]bool)
+	for _, origin := range client.WebOrigins {
+		originMap[origin.Origin] = true
+	}
+
+	for _, expectedOrigin := range webOrigins {
+		if !originMap[expectedOrigin.Origin] {
+			t.Errorf("Expected origin %s not found in loaded web origins", expectedOrigin.Origin)
+		}
+	}
+
+	// Test loading web origins for a client with no origins
+	clientWithNoOrigins := &models.Client{
+		ClientIdentifier: "client_with_no_origins_" + fake.LetterN(6),
+	}
+	err = database.CreateClient(context.Background(), nil, clientWithNoOrigins)
+	if err != nil {
+		t.Fatalf("Failed to create client with no origins: %v", err)
+	}
+
+	err = database.ClientLoadWebOrigins(context.Background(), nil, clientWithNoOrigins)
+	if err != nil {
+		t.Fatalf("Failed to load web origins for client with no origins: %v", err)
+	}
+
+	if len(clientWithNoOrigins.WebOrigins) != 0 {
+		t.Errorf("Expected 0 web origins for client with no origins, got %d", len(clientWithNoOrigins.WebOrigins))
+	}
+
+	// Test loading web origins for a nil client (should handle gracefully)
+	err = database.ClientLoadWebOrigins(context.Background(), nil, nil)
+	if err != nil {
+		t.Errorf("Expected no error when loading web origins for nil client, got: %v", err)
+	}
+}
+
+func TestGetClientsByIds(t *testing.T) {
+	// Create multiple test clients
+	clients := make([]models.Client, 3)
+	clientIds := make([]int64, 3)
+
+	for i := 0; i < 3; i++ {
+		random := fake.LetterN(6)
+		client := models.Client{
+			ClientIdentifier:                        "test_client_" + random,
+			ClientSecretEncrypted:                   []byte("encrypted_secret_" + random),
+			Description:                             "Test Client Description " + random,
+			Enabled:                                 i%2 == 0, // alternate between true and false
+			ConsentRequired:                         i%2 == 1,
+			IsPublic:                                i%2 == 0,
+			AuthorizationCodeEnabled:                i%2 == 1,
+			ClientCredentialsEnabled:                i%2 == 0,
+			TokenExpirationInSeconds:                3600 + i*1800,
+			RefreshTokenOfflineIdleTimeoutInSeconds: 86400 + i*43200,
+			RefreshTokenOfflineMaxLifetimeInSeconds: 2592000 + i*1296000,
+			IncludeOpenIDConnectClaimsInAccessToken: models.ThreeStateSettingDefault.String(),
+			DefaultAcrLevel:                         models.AcrLevel1,
+		}
+
+		err := database.CreateClient(context.Background(), nil, &client)
+		if err != nil {
+			t.Fatalf("Failed to create test client %d: %v", i, err)
+		}
+
+		clients[i] = client
+		clientIds[i] = client.Id
+	}
+
+	// Test retrieving all created clients
+	retrievedClients, err := database.GetClientsByIds(context.Background(), nil, clientIds)
+	if err != nil {
+		t.Fatalf("Failed to retrieve clients by IDs: %v", err)
+	}
+
+	if len(retrievedClients) != len(clients) {
+		t.Errorf("Expected %d clients, got %d", len(clients), len(retrievedClients))
+	}
+
+	// Check if all clients are retrieved correctly
+	for i, client := range clients {
+		found := false
+		for _, retrievedClient := range retrievedClients {
+			if retrievedClient.Id == client.Id {
+				found = true
+				// Check all properties
+				if retrievedClient.ClientIdentifier != client.ClientIdentifier {
+					t.Errorf("Client %d: Expected ClientIdentifier %s, got %s", i, client.ClientIdentifier, retrievedClient.ClientIdentifier)
+				}
+				if string(retrievedClient.ClientSecretEncrypted) != string(client.ClientSecretEncrypted) {
+					t.Errorf("Client %d: ClientSecretEncrypted does not match", i)
+				}
+				if retrievedClient.Description != client.Description {
+					t.Errorf("Client %d: Expected Description %s, got %s", i, client.Description, retrievedClient.Description)
+				}
+				if retrievedClient.Enabled != client.Enabled {
+					t.Errorf("Client %d: Expected Enabled %v, got %v", i, client.Enabled, retrievedClient.Enabled)
+				}
+				// ... Add checks for other properties ...
+				break
+			}
+		}
+		if !found {
+			t.Errorf("Client with ID %d not found in retrieved clients", client.Id)
+		}
+	}
+
+	// Test retrieving a subset of clients
+	subsetIds := clientIds[:2]
+	subsetClients, err := database.GetClientsByIds(context.Background(), nil, subsetIds)
+	if err != nil {
+		t.Fatalf("Failed to retrieve subset of clients: %v", err)
+	}
+	if len(subsetClients) != len(subsetIds) {
+		t.Errorf("Expected %d clients in subset, got %d", len(subsetIds), len(subsetClients))
+	}
+
+	// Test retrieving with some non-existent IDs
+	nonExistentId := clientIds[len(clientIds)-1] + 1000 // Assume this ID doesn't exist
+	mixedIds := make([]int64, len(clientIds[:2]), len(clientIds[:2])+1)
+	copy(mixedIds, clientIds[:2])
+	mixedIds = append(mixedIds, nonExistentId)
+	mixedClients, err := database.GetClientsByIds(context.Background(), nil, mixedIds)
+	if err != nil {
+		t.Fatalf("Failed to retrieve clients with mixed existing and non-existing IDs: %v", err)
+	}
+	if len(mixedClients) != len(clientIds[:2]) {
+		t.Errorf("Expected %d clients when including non-existent ID, got %d", len(clientIds[:2]), len(mixedClients))
+	}
+
+	// Test with empty slice of IDs
+	emptyClients, err := database.GetClientsByIds(context.Background(), nil, []int64{})
+	if err != nil {
+		t.Errorf("Expected no error for empty ID slice, got: %v", err)
+	}
+	if len(emptyClients) != 0 {
+		t.Errorf("Expected empty slice for empty ID input, got %d clients", len(emptyClients))
+	}
+
+	// Test with nil slice of IDs
+	nilClients, err := database.GetClientsByIds(context.Background(), nil, nil)
+	if err != nil {
+		t.Errorf("Expected no error for nil ID slice, got: %v", err)
+	}
+	if len(nilClients) != 0 {
+		t.Errorf("Expected empty slice for nil ID input, got %d clients", len(emptyClients))
+	}
+}
+
+// TestGetClientsByIds_MoreIdsThanOneStatementCanCarry asks for more ids than a single statement
+// can bind. Every id in an IN list is a bound parameter and SQL Server refuses a statement
+// carrying more than 2,100 of them with error 8003, the lowest ceiling of the four engines, so
+// an unbounded list answered a valid request with an error instead of its rows. The method reads
+// long lists in several statements now, and this is the case that says so on every engine (#373).
+//
+// The two lengths are chosen: 2,101 is one past SQL Server's ceiling, and 2,000 is an exact
+// multiple of the batch size, where an off-by-one in the loop bounds drops the final batch
+// instead of failing loudly. The real ids sit in different batches in both, including the last
+// slot, so a batch that is never issued loses a client the assertions are counting.
+func TestGetClientsByIds_MoreIdsThanOneStatementCanCarry(t *testing.T) {
+	realIds := make([]int64, 3)
+	for i := 0; i < 3; i++ {
+		random := fake.LetterN(6)
+		client := models.Client{
+			ClientIdentifier:                        "test_client_" + random,
+			ClientSecretEncrypted:                   []byte("encrypted_secret_" + random),
+			Description:                             "Test Client Description " + random,
+			Enabled:                                 true,
+			TokenExpirationInSeconds:                3600,
+			RefreshTokenOfflineIdleTimeoutInSeconds: 86400,
+			RefreshTokenOfflineMaxLifetimeInSeconds: 2592000,
+			IncludeOpenIDConnectClaimsInAccessToken: models.ThreeStateSettingDefault.String(),
+			DefaultAcrLevel:                         models.AcrLevel1,
+		}
+		if err := database.CreateClient(context.Background(), nil, &client); err != nil {
+			t.Fatalf("Failed to create test client %d: %v", i, err)
+		}
+		realIds[i] = client.Id
+	}
+
+	// Ids no row can hold: client ids are assigned by the engine from one, so a billion up is
+	// free, and padding with distinct values is what makes the parameter count the real one.
+	const paddingBase = int64(1_000_000_000)
+
+	testCases := []struct {
+		name      string
+		total     int
+		positions []int
+	}{
+		{name: "one past SQL Server's 2,100 parameter ceiling", total: 2101, positions: []int{0, 1500, 2100}},
+		{name: "an exact multiple of the batch size", total: 2000, positions: []int{0, 999, 1999}},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			ids := make([]int64, testCase.total)
+			for i := range ids {
+				ids[i] = paddingBase + int64(i)
+			}
+			for i, position := range testCase.positions {
+				ids[position] = realIds[i]
+			}
+
+			clients, err := database.GetClientsByIds(context.Background(), nil, ids)
+			if err != nil {
+				t.Fatalf("Failed to retrieve %d clients by ids: %v", testCase.total, err)
+			}
+
+			if len(clients) != len(realIds) {
+				t.Errorf("Expected %d clients, got %d", len(realIds), len(clients))
+			}
+
+			for _, realId := range realIds {
+				found := false
+				for _, client := range clients {
+					if client.Id == realId {
+						found = true
+						break
+					}
+				}
+				if !found {
+					t.Errorf("Client with ID %d not found in retrieved clients", realId)
+				}
+			}
+		})
+	}
+}
+
+// TestGetClientsByIds_ARepeatedIdOnEitherSideOfABatchBoundary asks for one client twice, at two
+// positions a batch boundary sits between. A single IN list answers a repeated id once, so the
+// method owes one row per matching client however long the list is; reading a long list in
+// several statements is what could make the same row arrive twice, and a caller reading the
+// result as a set of clients cannot tell that from two clients (#373).
+//
+// Two placements, and the pair is what makes the case a proof rather than an illustration. 999 and
+// 1000 are the last slot of one statement and the first of the next, the tightest place a duplicate
+// can straddle; but dropping only a repeat of the id just kept passes it too, since collapsing
+// those two leaves 1,000 ids and one statement. 0 and 1000 have nothing adjacent to collapse, so
+// only a method that remembers every id it has already seen answers one row. Keep both: with the
+// far pair alone a boundary off by one slot goes unnoticed, and with the near pair alone
+// deduplicating neighbours passes for deduplicating the list (#373).
+func TestGetClientsByIds_ARepeatedIdOnEitherSideOfABatchBoundary(t *testing.T) {
+	random := fake.LetterN(6)
+	client := models.Client{
+		ClientIdentifier:                        "test_client_" + random,
+		ClientSecretEncrypted:                   []byte("encrypted_secret_" + random),
+		Description:                             "Test Client Description " + random,
+		Enabled:                                 true,
+		TokenExpirationInSeconds:                3600,
+		RefreshTokenOfflineIdleTimeoutInSeconds: 86400,
+		RefreshTokenOfflineMaxLifetimeInSeconds: 2592000,
+		IncludeOpenIDConnectClaimsInAccessToken: models.ThreeStateSettingDefault.String(),
+		DefaultAcrLevel:                         models.AcrLevel1,
+	}
+	if err := database.CreateClient(context.Background(), nil, &client); err != nil {
+		t.Fatalf("Failed to create test client: %v", err)
+	}
+
+	// Ids no row can hold, as in the test above: padding with distinct values is what makes the
+	// list long enough for a statement boundary to fall between the two copies of the real id.
+	const paddingBase = int64(2_000_000_000)
+
+	testCases := []struct {
+		name      string
+		positions []int
+	}{
+		{name: "the two slots the boundary sits between", positions: []int{999, 1000}},
+		{name: "one slot in each statement, nothing adjacent", positions: []int{0, 1000}},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			ids := make([]int64, 1001)
+			for i := range ids {
+				ids[i] = paddingBase + int64(i)
+			}
+			for _, position := range testCase.positions {
+				ids[position] = client.Id
+			}
+
+			clients, err := database.GetClientsByIds(context.Background(), nil, ids)
+			if err != nil {
+				t.Fatalf("Failed to retrieve clients by ids: %v", err)
+			}
+
+			if len(clients) != 1 {
+				t.Errorf("Expected 1 client for an id repeated across a batch boundary, got %d", len(clients))
+			}
+			for _, retrieved := range clients {
+				if retrieved.Id != client.Id {
+					t.Errorf("Expected client with ID %d, got %d", client.Id, retrieved.Id)
+				}
+			}
+		})
+	}
+}
+
+func TestClientLoadPermissions(t *testing.T) {
+	random := fake.LetterN(6)
+	client := &models.Client{
+		ClientIdentifier:                        "test_client_" + random,
+		ClientSecretEncrypted:                   []byte("encrypted_secret"),
+		Description:                             "Test Client Description",
+		Enabled:                                 true,
+		ConsentRequired:                         true,
+		IsPublic:                                false,
+		AuthorizationCodeEnabled:                true,
+		ClientCredentialsEnabled:                true,
+		TokenExpirationInSeconds:                3600,
+		RefreshTokenOfflineIdleTimeoutInSeconds: 86400,
+		RefreshTokenOfflineMaxLifetimeInSeconds: 2592000,
+		IncludeOpenIDConnectClaimsInAccessToken: models.ThreeStateSettingDefault.String(),
+		DefaultAcrLevel:                         models.AcrLevel1,
+	}
+
+	err := database.CreateClient(context.Background(), nil, client)
+	if err != nil {
+		t.Fatalf("Failed to create client for testing: %v", err)
+	}
+
+	// Create a test resource
+	resource := &models.Resource{
+		ResourceIdentifier: "test_resource_" + random,
+		Description:        "Test Resource",
+	}
+	err = database.CreateResource(context.Background(), nil, resource)
+	if err != nil {
+		t.Fatalf("Failed to create resource for testing: %v", err)
+	}
+
+	// Create multiple permissions for the resource
+	permissions := []models.Permission{
+		{PermissionIdentifier: "read_" + random, Description: "Read Permission", ResourceId: resource.Id},
+		{PermissionIdentifier: "write_" + random, Description: "Write Permission", ResourceId: resource.Id},
+		{PermissionIdentifier: "delete_" + random, Description: "Delete Permission", ResourceId: resource.Id},
+	}
+
+	for i := range permissions {
+		createPermissionErr := database.CreatePermission(context.Background(), nil, &permissions[i])
+		if createPermissionErr != nil {
+			t.Fatalf("Failed to create permission: %v", createPermissionErr)
+		}
+	}
+
+	// Associate permissions with the client
+	for _, perm := range permissions {
+		clientPermission := &models.ClientPermission{
+			ClientId:     client.Id,
+			PermissionId: perm.Id,
+		}
+		createClientPermissionErr := database.CreateClientPermission(context.Background(), nil, clientPermission)
+		if createClientPermissionErr != nil {
+			t.Fatalf("Failed to create client permission: %v", createClientPermissionErr)
+		}
+	}
+
+	// Load permissions for the client
+	err = database.ClientLoadPermissions(context.Background(), nil, client)
+	if err != nil {
+		t.Fatalf("Failed to load permissions: %v", err)
+	}
+
+	// Check if the correct number of permissions were loaded
+	if len(client.Permissions) != len(permissions) {
+		t.Errorf("Expected %d permissions, got %d", len(permissions), len(client.Permissions))
+	}
+
+	// Check if all permissions are present and correct
+	permMap := make(map[string]bool)
+	for _, perm := range client.Permissions {
+		permMap[perm.PermissionIdentifier] = true
+		if perm.ResourceId != resource.Id {
+			t.Errorf("Expected ResourceId %d, got %d for permission %s", resource.Id, perm.ResourceId, perm.PermissionIdentifier)
+		}
+	}
+
+	for _, expectedPerm := range permissions {
+		if !permMap[expectedPerm.PermissionIdentifier] {
+			t.Errorf("Expected permission %s not found in loaded permissions", expectedPerm.PermissionIdentifier)
+		}
+	}
+
+	// Test loading permissions for a client with no permissions
+	clientWithNoPermissions := &models.Client{
+		ClientIdentifier: "client_with_no_permissions_" + fake.LetterN(6),
+	}
+	err = database.CreateClient(context.Background(), nil, clientWithNoPermissions)
+	if err != nil {
+		t.Fatalf("Failed to create client with no permissions: %v", err)
+	}
+
+	err = database.ClientLoadPermissions(context.Background(), nil, clientWithNoPermissions)
+	if err != nil {
+		t.Fatalf("Failed to load permissions for client with no permissions: %v", err)
+	}
+
+	if len(clientWithNoPermissions.Permissions) != 0 {
+		t.Errorf("Expected 0 permissions for client with no permissions, got %d", len(clientWithNoPermissions.Permissions))
+	}
+
+	// Test loading permissions for a nil client (should handle gracefully)
+	err = database.ClientLoadPermissions(context.Background(), nil, nil)
+	if err != nil {
+		t.Errorf("Expected no error when loading permissions for nil client, got: %v", err)
+	}
+}
+
+func TestGetAllClients(t *testing.T) {
+	// First, let's clear all existing clients to ensure a clean state
+	allClients, err := database.GetAllClients(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("Failed to get initial clients: %v", err)
+	}
+	for _, client := range allClients {
+		err = database.DeleteClient(context.Background(), nil, client.Id)
+		if err != nil {
+			t.Fatalf("Failed to delete existing client: %v", err)
+		}
+	}
+
+	// Create multiple test clients
+	numClients := 5
+	createdClients := make([]*models.Client, numClients)
+
+	for i := 0; i < numClients; i++ {
+		random := fake.LetterN(6)
+		client := &models.Client{
+			ClientIdentifier:                        "test_client_" + random,
+			ClientSecretEncrypted:                   []byte("encrypted_secret_" + random),
+			Description:                             "Test Client Description " + random,
+			Enabled:                                 i%2 == 0, // alternate between true and false
+			ConsentRequired:                         i%2 == 1,
+			IsPublic:                                i%2 == 0,
+			AuthorizationCodeEnabled:                i%2 == 1,
+			ClientCredentialsEnabled:                i%2 == 0,
+			TokenExpirationInSeconds:                3600 + i*1800,
+			RefreshTokenOfflineIdleTimeoutInSeconds: 86400 + i*43200,
+			RefreshTokenOfflineMaxLifetimeInSeconds: 2592000 + i*1296000,
+			IncludeOpenIDConnectClaimsInAccessToken: models.ThreeStateSettingDefault.String(),
+			DefaultAcrLevel:                         models.AcrLevel1,
+		}
+
+		createClientErr := database.CreateClient(context.Background(), nil, client)
+		if createClientErr != nil {
+			t.Fatalf("Failed to create test client %d: %v", i, createClientErr)
+		}
+
+		createdClients[i] = client
+	}
+
+	// Retrieve all clients
+	retrievedClients, err := database.GetAllClients(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("Failed to retrieve all clients: %v", err)
+	}
+
+	// Check if the number of retrieved clients matches the number of created clients
+	if len(retrievedClients) != numClients {
+		t.Errorf("Expected %d clients, got %d", numClients, len(retrievedClients))
+	}
+
+	// Create a map of created clients for easy lookup
+	createdClientMap := make(map[string]*models.Client)
+	for _, client := range createdClients {
+		createdClientMap[client.ClientIdentifier] = client
+	}
+
+	// Check if all created clients are in the retrieved list and their properties match
+	for _, retrievedClient := range retrievedClients {
+		createdClient, exists := createdClientMap[retrievedClient.ClientIdentifier]
+		if !exists {
+			t.Errorf("Retrieved unexpected client: %s", retrievedClient.ClientIdentifier)
+			continue
+		}
+
+		// Check all properties
+		if retrievedClient.Description != createdClient.Description {
+			t.Errorf("Client %s: Expected Description %s, got %s", retrievedClient.ClientIdentifier, createdClient.Description, retrievedClient.Description)
+		}
+		if retrievedClient.Enabled != createdClient.Enabled {
+			t.Errorf("Client %s: Expected Enabled %v, got %v", retrievedClient.ClientIdentifier, createdClient.Enabled, retrievedClient.Enabled)
+		}
+		if retrievedClient.ConsentRequired != createdClient.ConsentRequired {
+			t.Errorf("Client %s: Expected ConsentRequired %v, got %v", retrievedClient.ClientIdentifier, createdClient.ConsentRequired, retrievedClient.ConsentRequired)
+		}
+		if retrievedClient.IsPublic != createdClient.IsPublic {
+			t.Errorf("Client %s: Expected IsPublic %v, got %v", retrievedClient.ClientIdentifier, createdClient.IsPublic, retrievedClient.IsPublic)
+		}
+		if retrievedClient.AuthorizationCodeEnabled != createdClient.AuthorizationCodeEnabled {
+			t.Errorf("Client %s: Expected AuthorizationCodeEnabled %v, got %v", retrievedClient.ClientIdentifier, createdClient.AuthorizationCodeEnabled, retrievedClient.AuthorizationCodeEnabled)
+		}
+		if retrievedClient.ClientCredentialsEnabled != createdClient.ClientCredentialsEnabled {
+			t.Errorf("Client %s: Expected ClientCredentialsEnabled %v, got %v", retrievedClient.ClientIdentifier, createdClient.ClientCredentialsEnabled, retrievedClient.ClientCredentialsEnabled)
+		}
+		if retrievedClient.TokenExpirationInSeconds != createdClient.TokenExpirationInSeconds {
+			t.Errorf("Client %s: Expected TokenExpirationInSeconds %d, got %d", retrievedClient.ClientIdentifier, createdClient.TokenExpirationInSeconds, retrievedClient.TokenExpirationInSeconds)
+		}
+		if retrievedClient.RefreshTokenOfflineIdleTimeoutInSeconds != createdClient.RefreshTokenOfflineIdleTimeoutInSeconds {
+			t.Errorf("Client %s: Expected RefreshTokenOfflineIdleTimeoutInSeconds %d, got %d", retrievedClient.ClientIdentifier, createdClient.RefreshTokenOfflineIdleTimeoutInSeconds, retrievedClient.RefreshTokenOfflineIdleTimeoutInSeconds)
+		}
+		if retrievedClient.RefreshTokenOfflineMaxLifetimeInSeconds != createdClient.RefreshTokenOfflineMaxLifetimeInSeconds {
+			t.Errorf("Client %s: Expected RefreshTokenOfflineMaxLifetimeInSeconds %d, got %d", retrievedClient.ClientIdentifier, createdClient.RefreshTokenOfflineMaxLifetimeInSeconds, retrievedClient.RefreshTokenOfflineMaxLifetimeInSeconds)
+		}
+		if retrievedClient.IncludeOpenIDConnectClaimsInAccessToken != createdClient.IncludeOpenIDConnectClaimsInAccessToken {
+			t.Errorf("Client %s: Expected IncludeOpenIDConnectClaimsInAccessToken %s, got %s", retrievedClient.ClientIdentifier, createdClient.IncludeOpenIDConnectClaimsInAccessToken, retrievedClient.IncludeOpenIDConnectClaimsInAccessToken)
+		}
+		if retrievedClient.DefaultAcrLevel != createdClient.DefaultAcrLevel {
+			t.Errorf("Client %s: Expected DefaultAcrLevel %v, got %v", retrievedClient.ClientIdentifier, createdClient.DefaultAcrLevel, retrievedClient.DefaultAcrLevel)
+		}
+
+		// Check if CreatedAt and UpdatedAt are set
+		if !retrievedClient.CreatedAt.Valid || retrievedClient.CreatedAt.Time.IsZero() {
+			t.Errorf("Client %s: CreatedAt is not set properly", retrievedClient.ClientIdentifier)
+		}
+		if !retrievedClient.UpdatedAt.Valid || retrievedClient.UpdatedAt.Time.IsZero() {
+			t.Errorf("Client %s: UpdatedAt is not set properly", retrievedClient.ClientIdentifier)
+		}
+
+		// Remove the client from the map to mark it as found
+		delete(createdClientMap, retrievedClient.ClientIdentifier)
+	}
+
+	// Check if there are any clients in the map that weren't retrieved
+	if len(createdClientMap) > 0 {
+		for clientIdentifier := range createdClientMap {
+			t.Errorf("Client %s was created but not retrieved", clientIdentifier)
+		}
+	}
+
+	// Test when there are no clients
+	for _, client := range retrievedClients {
+		err = database.DeleteClient(context.Background(), nil, client.Id)
+		if err != nil {
+			t.Fatalf("Failed to delete client during cleanup: %v", err)
+		}
+	}
+
+	emptyClients, err := database.GetAllClients(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("Failed to get clients after deletion: %v", err)
+	}
+	if len(emptyClients) != 0 {
+		t.Errorf("Expected 0 clients after deletion, got %d", len(emptyClients))
+	}
+}
+
+func TestDeleteClient(t *testing.T) {
+	random := fake.LetterN(6)
+	client := &models.Client{
+		ClientIdentifier:                        "test_client_" + random,
+		ClientSecretEncrypted:                   []byte("encrypted_secret"),
+		Description:                             "Test Client Description",
+		Enabled:                                 true,
+		ConsentRequired:                         true,
+		IsPublic:                                false,
+		AuthorizationCodeEnabled:                true,
+		ClientCredentialsEnabled:                true,
+		TokenExpirationInSeconds:                3600,
+		RefreshTokenOfflineIdleTimeoutInSeconds: 86400,
+		RefreshTokenOfflineMaxLifetimeInSeconds: 2592000,
+		IncludeOpenIDConnectClaimsInAccessToken: models.ThreeStateSettingDefault.String(),
+		DefaultAcrLevel:                         models.AcrLevel1,
+	}
+
+	err := database.CreateClient(context.Background(), nil, client)
+	if err != nil {
+		t.Fatalf("Failed to create client for testing: %v", err)
+	}
+
+	// Create associated data
+	// 1. Redirect URIs
+	redirectURI := &models.RedirectURI{
+		URI:      "https://example.com/callback",
+		ClientId: client.Id,
+	}
+	err = database.CreateRedirectURI(context.Background(), nil, redirectURI)
+	if err != nil {
+		t.Fatalf("Failed to create redirect URI: %v", err)
+	}
+
+	// 2. Web Origins
+	webOrigin := &models.WebOrigin{
+		Origin:   "https://example.com",
+		ClientId: client.Id,
+	}
+	err = database.CreateWebOrigin(context.Background(), nil, webOrigin)
+	if err != nil {
+		t.Fatalf("Failed to create web origin: %v", err)
+	}
+
+	// 3. Client Permissions
+	resource := &models.Resource{
+		ResourceIdentifier: "test_resource_" + random,
+		Description:        "Test Resource",
+	}
+	err = database.CreateResource(context.Background(), nil, resource)
+	if err != nil {
+		t.Fatalf("Failed to create resource: %v", err)
+	}
+
+	permission := &models.Permission{
+		PermissionIdentifier: "test_permission_" + random,
+		Description:          "Test Permission",
+		ResourceId:           resource.Id,
+	}
+	err = database.CreatePermission(context.Background(), nil, permission)
+	if err != nil {
+		t.Fatalf("Failed to create permission: %v", err)
+	}
+
+	clientPermission := &models.ClientPermission{
+		ClientId:     client.Id,
+		PermissionId: permission.Id,
+	}
+	err = database.CreateClientPermission(context.Background(), nil, clientPermission)
+	if err != nil {
+		t.Fatalf("Failed to create client permission: %v", err)
+	}
+
+	// Delete the client
+	err = database.DeleteClient(context.Background(), nil, client.Id)
+	if err != nil {
+		t.Fatalf("Failed to delete client: %v", err)
+	}
+
+	// Verify that the client has been deleted
+	deletedClient, err := database.GetClientById(context.Background(), nil, client.Id)
+	if err != nil {
+		t.Fatalf("Error while checking for deleted client: %v", err)
+	}
+	if deletedClient != nil {
+		t.Errorf("Client still exists after deletion")
+	}
+
+	// Verify that associated data has been deleted
+	// 1. Check Redirect URIs
+	redirectURIs, err := database.GetRedirectURIsByClientId(context.Background(), nil, client.Id)
+	if err != nil {
+		t.Fatalf("Error while checking for deleted redirect URIs: %v", err)
+	}
+	if len(redirectURIs) > 0 {
+		t.Errorf("Redirect URIs still exist after client deletion")
+	}
+
+	// 2. Check Web Origins
+	webOrigins, err := database.GetWebOriginsByClientId(context.Background(), nil, client.Id)
+	if err != nil {
+		t.Fatalf("Error while checking for deleted web origins: %v", err)
+	}
+	if len(webOrigins) > 0 {
+		t.Errorf("Web Origins still exist after client deletion")
+	}
+
+	// 3. Check Client Permissions
+	clientPermissions, err := database.GetClientPermissionsByClientId(context.Background(), nil, client.Id)
+	if err != nil {
+		t.Fatalf("Error while checking for deleted client permissions: %v", err)
+	}
+	if len(clientPermissions) > 0 {
+		t.Errorf("Client Permissions still exist after client deletion")
+	}
+
+	// Test deleting a non-existent client
+	err = database.DeleteClient(context.Background(), nil, client.Id)
+	if err != nil {
+		t.Errorf("Expected no error when deleting non-existent client, got: %v", err)
+	}
+
+	// Test deleting a client with an invalid ID
+	err = database.DeleteClient(context.Background(), nil, -1)
+	if err != nil {
+		t.Errorf("Expected no error when deleting client with invalid ID, got: %v", err)
+	}
+}
+
+// createTestClient seeds a client on the package's shared handle; createTestClientOn takes the
+// handle, for the reason createTestUserOn does.
+func createTestClient(t *testing.T) *models.Client {
+	return createTestClientOn(t, database)
+}
+
+func createTestClientOn(t *testing.T, db data.Database) *models.Client {
+	random := fake.LetterN(6)
+	client := &models.Client{
+		ClientIdentifier: "test_client_" + random,
+		Description:      "Test Client",
+	}
+	err := db.CreateClient(context.Background(), nil, client)
+	if err != nil {
+		t.Fatalf("Failed to create test client: %v", err)
+	}
+	return client
+}
+
+func TestClientNullableOverrideFields(t *testing.T) {
+	// Test 1: Create client with nil override fields (use global settings)
+	random := fake.LetterN(6)
+	clientWithNilOverrides := &models.Client{
+		ClientIdentifier:                        "test_client_nil_overrides_" + random,
+		ClientSecretEncrypted:                   []byte("encrypted_secret"),
+		Description:                             "Test Client with nil overrides",
+		Enabled:                                 true,
+		ConsentRequired:                         true,
+		IsPublic:                                false,
+		AuthorizationCodeEnabled:                true,
+		ClientCredentialsEnabled:                true,
+		TokenExpirationInSeconds:                3600,
+		RefreshTokenOfflineIdleTimeoutInSeconds: 86400,
+		RefreshTokenOfflineMaxLifetimeInSeconds: 2592000,
+		IncludeOpenIDConnectClaimsInAccessToken: models.ThreeStateSettingDefault.String(),
+		DefaultAcrLevel:                         models.AcrLevel1,
+		// PKCERequired, ImplicitGrantEnabled, ResourceOwnerPasswordCredentialsEnabled are nil (use global settings)
+	}
+
+	err := database.CreateClient(context.Background(), nil, clientWithNilOverrides)
+	if err != nil {
+		t.Fatalf("Failed to create client with nil overrides: %v", err)
+	}
+
+	retrievedClient, err := database.GetClientById(context.Background(), nil, clientWithNilOverrides.Id)
+	if err != nil {
+		t.Fatalf("Failed to retrieve client with nil overrides: %v", err)
+	}
+
+	// Verify nil override fields remain nil
+	if retrievedClient.PKCERequired != nil {
+		t.Errorf("Expected PKCERequired to be nil, got %v", *retrievedClient.PKCERequired)
+	}
+	if retrievedClient.ImplicitGrantEnabled != nil {
+		t.Errorf("Expected ImplicitGrantEnabled to be nil, got %v", *retrievedClient.ImplicitGrantEnabled)
+	}
+	if retrievedClient.ResourceOwnerPasswordCredentialsEnabled != nil {
+		t.Errorf("Expected ResourceOwnerPasswordCredentialsEnabled to be nil, got %v", *retrievedClient.ResourceOwnerPasswordCredentialsEnabled)
+	}
+
+	// Test 2: Create client with explicit override values set to true
+	random2 := fake.LetterN(6)
+	pkceTrue := true
+	implicitTrue := true
+	ropcTrue := true
+	clientWithTrueOverrides := &models.Client{
+		ClientIdentifier:                        "test_client_true_overrides_" + random2,
+		ClientSecretEncrypted:                   []byte("encrypted_secret"),
+		Description:                             "Test Client with true overrides",
+		Enabled:                                 true,
+		ConsentRequired:                         true,
+		IsPublic:                                false,
+		AuthorizationCodeEnabled:                true,
+		ClientCredentialsEnabled:                true,
+		TokenExpirationInSeconds:                3600,
+		RefreshTokenOfflineIdleTimeoutInSeconds: 86400,
+		RefreshTokenOfflineMaxLifetimeInSeconds: 2592000,
+		IncludeOpenIDConnectClaimsInAccessToken: models.ThreeStateSettingDefault.String(),
+		DefaultAcrLevel:                         models.AcrLevel1,
+		PKCERequired:                            &pkceTrue,
+		ImplicitGrantEnabled:                    &implicitTrue,
+		ResourceOwnerPasswordCredentialsEnabled: &ropcTrue,
+	}
+
+	err = database.CreateClient(context.Background(), nil, clientWithTrueOverrides)
+	if err != nil {
+		t.Fatalf("Failed to create client with true overrides: %v", err)
+	}
+
+	retrievedClientTrue, err := database.GetClientById(context.Background(), nil, clientWithTrueOverrides.Id)
+	if err != nil {
+		t.Fatalf("Failed to retrieve client with true overrides: %v", err)
+	}
+
+	// Verify override fields are set to true
+	if retrievedClientTrue.PKCERequired == nil || *retrievedClientTrue.PKCERequired != true {
+		t.Errorf("Expected PKCERequired to be true, got %v", retrievedClientTrue.PKCERequired)
+	}
+	if retrievedClientTrue.ImplicitGrantEnabled == nil || *retrievedClientTrue.ImplicitGrantEnabled != true {
+		t.Errorf("Expected ImplicitGrantEnabled to be true, got %v", retrievedClientTrue.ImplicitGrantEnabled)
+	}
+	if retrievedClientTrue.ResourceOwnerPasswordCredentialsEnabled == nil || *retrievedClientTrue.ResourceOwnerPasswordCredentialsEnabled != true {
+		t.Errorf("Expected ResourceOwnerPasswordCredentialsEnabled to be true, got %v", retrievedClientTrue.ResourceOwnerPasswordCredentialsEnabled)
+	}
+
+	// Test 3: Create client with explicit override values set to false
+	random3 := fake.LetterN(6)
+	pkceFalse := false
+	implicitFalse := false
+	ropcFalse := false
+	clientWithFalseOverrides := &models.Client{
+		ClientIdentifier:                        "test_client_false_overrides_" + random3,
+		ClientSecretEncrypted:                   []byte("encrypted_secret"),
+		Description:                             "Test Client with false overrides",
+		Enabled:                                 true,
+		ConsentRequired:                         true,
+		IsPublic:                                false,
+		AuthorizationCodeEnabled:                true,
+		ClientCredentialsEnabled:                true,
+		TokenExpirationInSeconds:                3600,
+		RefreshTokenOfflineIdleTimeoutInSeconds: 86400,
+		RefreshTokenOfflineMaxLifetimeInSeconds: 2592000,
+		IncludeOpenIDConnectClaimsInAccessToken: models.ThreeStateSettingDefault.String(),
+		DefaultAcrLevel:                         models.AcrLevel1,
+		PKCERequired:                            &pkceFalse,
+		ImplicitGrantEnabled:                    &implicitFalse,
+		ResourceOwnerPasswordCredentialsEnabled: &ropcFalse,
+	}
+
+	err = database.CreateClient(context.Background(), nil, clientWithFalseOverrides)
+	if err != nil {
+		t.Fatalf("Failed to create client with false overrides: %v", err)
+	}
+
+	retrievedClientFalse, err := database.GetClientById(context.Background(), nil, clientWithFalseOverrides.Id)
+	if err != nil {
+		t.Fatalf("Failed to retrieve client with false overrides: %v", err)
+	}
+
+	// Verify override fields are set to false
+	if retrievedClientFalse.PKCERequired == nil || *retrievedClientFalse.PKCERequired != false {
+		t.Errorf("Expected PKCERequired to be false, got %v", retrievedClientFalse.PKCERequired)
+	}
+	if retrievedClientFalse.ImplicitGrantEnabled == nil || *retrievedClientFalse.ImplicitGrantEnabled != false {
+		t.Errorf("Expected ImplicitGrantEnabled to be false, got %v", retrievedClientFalse.ImplicitGrantEnabled)
+	}
+	if retrievedClientFalse.ResourceOwnerPasswordCredentialsEnabled == nil || *retrievedClientFalse.ResourceOwnerPasswordCredentialsEnabled != false {
+		t.Errorf("Expected ResourceOwnerPasswordCredentialsEnabled to be false, got %v", retrievedClientFalse.ResourceOwnerPasswordCredentialsEnabled)
+	}
+
+	// Test 4: Update client override fields from nil to set values
+	pkceUpdate := true
+	implicitUpdate := false
+	ropcUpdate := true
+	clientWithNilOverrides.PKCERequired = &pkceUpdate
+	clientWithNilOverrides.ImplicitGrantEnabled = &implicitUpdate
+	clientWithNilOverrides.ResourceOwnerPasswordCredentialsEnabled = &ropcUpdate
+
+	err = database.UpdateClient(context.Background(), nil, clientWithNilOverrides)
+	if err != nil {
+		t.Fatalf("Failed to update client override fields: %v", err)
+	}
+
+	retrievedUpdatedClient, err := database.GetClientById(context.Background(), nil, clientWithNilOverrides.Id)
+	if err != nil {
+		t.Fatalf("Failed to retrieve updated client: %v", err)
+	}
+
+	// Verify updated override fields
+	if retrievedUpdatedClient.PKCERequired == nil || *retrievedUpdatedClient.PKCERequired != true {
+		t.Errorf("Expected PKCERequired to be true after update, got %v", retrievedUpdatedClient.PKCERequired)
+	}
+	if retrievedUpdatedClient.ImplicitGrantEnabled == nil || *retrievedUpdatedClient.ImplicitGrantEnabled != false {
+		t.Errorf("Expected ImplicitGrantEnabled to be false after update, got %v", retrievedUpdatedClient.ImplicitGrantEnabled)
+	}
+	if retrievedUpdatedClient.ResourceOwnerPasswordCredentialsEnabled == nil || *retrievedUpdatedClient.ResourceOwnerPasswordCredentialsEnabled != true {
+		t.Errorf("Expected ResourceOwnerPasswordCredentialsEnabled to be true after update, got %v", retrievedUpdatedClient.ResourceOwnerPasswordCredentialsEnabled)
+	}
+
+	// Test 5: Update client override fields back to nil (reset to use global settings)
+	clientWithNilOverrides.PKCERequired = nil
+	clientWithNilOverrides.ImplicitGrantEnabled = nil
+	clientWithNilOverrides.ResourceOwnerPasswordCredentialsEnabled = nil
+
+	err = database.UpdateClient(context.Background(), nil, clientWithNilOverrides)
+	if err != nil {
+		t.Fatalf("Failed to update client override fields back to nil: %v", err)
+	}
+
+	retrievedResetClient, err := database.GetClientById(context.Background(), nil, clientWithNilOverrides.Id)
+	if err != nil {
+		t.Fatalf("Failed to retrieve reset client: %v", err)
+	}
+
+	// Verify override fields are reset to nil
+	if retrievedResetClient.PKCERequired != nil {
+		t.Errorf("Expected PKCERequired to be nil after reset, got %v", *retrievedResetClient.PKCERequired)
+	}
+	if retrievedResetClient.ImplicitGrantEnabled != nil {
+		t.Errorf("Expected ImplicitGrantEnabled to be nil after reset, got %v", *retrievedResetClient.ImplicitGrantEnabled)
+	}
+	if retrievedResetClient.ResourceOwnerPasswordCredentialsEnabled != nil {
+		t.Errorf("Expected ResourceOwnerPasswordCredentialsEnabled to be nil after reset, got %v", *retrievedResetClient.ResourceOwnerPasswordCredentialsEnabled)
+	}
+}
+
+// TestSetClientPublic covers the contract of the write that classifies the confidential-to-public
+// flip (#245 decision 17). The boolean is not a convenience: it is what decides whether the flip
+// revokes the client's outstanding grants, so "this call made the change" and "the client was
+// already public" have to be told apart exactly.
+func TestSetClientPublic(t *testing.T) {
+	client := createTestClient(t)
+	if client.IsPublic {
+		t.Fatalf("the fixture must start confidential, or the transition below is not a transition")
+	}
+
+	tx := beginTx(t)
+	becamePublic, err := database.SetClientPublic(context.Background(), tx, client.Id)
+	if err != nil {
+		t.Fatalf("SetClientPublic returned error: %v", err)
+	}
+	if !becamePublic {
+		t.Errorf("making a confidential client public must report the transition")
+	}
+	if commitErr := database.CommitTransaction(context.Background(), tx); commitErr != nil {
+		t.Fatalf("CommitTransaction: %v", commitErr)
+	}
+
+	// The column really moved. Reporting the transition without performing it would leave the
+	// flip revoking the grants of a client that is still confidential.
+	stored, err := database.GetClientById(context.Background(), nil, client.Id)
+	if err != nil {
+		t.Fatalf("GetClientById: %v", err)
+	}
+	if stored == nil || !stored.IsPublic {
+		t.Errorf("expected the client to be public after the transition, got %+v", stored)
+	}
+
+	// Idempotent, and false the second time. This is the boundary that stops an administrator
+	// re-saving the authentication page from signing every user of the application out: the save
+	// removes no requirement, so it must revoke nothing.
+	tx = beginTx(t)
+	becamePublic, err = database.SetClientPublic(context.Background(), tx, client.Id)
+	if err != nil {
+		t.Fatalf("second SetClientPublic returned error: %v", err)
+	}
+	if becamePublic {
+		t.Errorf("saving an already-public client must not report a transition")
+	}
+	if err := database.CommitTransaction(context.Background(), tx); err != nil {
+		t.Fatalf("CommitTransaction: %v", err)
+	}
+
+	// A client that is not there is an error rather than a quiet false. False means "nothing was
+	// taken away from a client that exists", and answering that about a row nobody can find would
+	// let the endpoint reply 200 describing a client it did not save.
+	tx = beginTx(t)
+	if _, err := database.SetClientPublic(context.Background(), tx, client.Id+1_000_000); err == nil {
+		t.Errorf("expected an error for a client id that does not exist")
+	}
+	_ = database.RollbackTransaction(context.Background(), tx)
+
+	// A zero id is a caller bug rather than a filter, exactly as it is in RevokeCodesByClientId.
+	tx = beginTx(t)
+	if _, err := database.SetClientPublic(context.Background(), tx, 0); err == nil {
+		t.Errorf("expected an error for a client id of 0")
+	}
+	_ = database.RollbackTransaction(context.Background(), tx)
+
+	// Without a transaction the two statements autocommit separately, so the row is released
+	// between acquiring it and classifying the write and the whole mechanism is gone. Refused
+	// rather than silently degraded.
+	if _, err := database.SetClientPublic(context.Background(), nil, client.Id); err == nil {
+		t.Errorf("expected an error when called without a transaction")
+	}
+}
+
+// TestSetClientPublic_ClassifiesAgainstACommittedConcurrentWrite is the defect itself, run against
+// a real engine rather than described.
+//
+// The row starts public and a request arrives to save it public, which on its own is not a
+// transition. While that request is in flight, another administrator makes the client
+// confidential and commits, which creates a secret and lets grants be issued under it. The save
+// then completes and leaves the client public. That save DID remove the client's obligation to
+// authenticate, so it owes the revocation, and a classification taken from anything the caller
+// read before the other transaction committed reports "already public" and skips it.
+//
+// This is also the only test that distinguishes the acquisition from the classification. Without
+// the unconditional acquisition, PostgreSQL's READ COMMITTED never makes the row a target of a
+// predicate the committed version fails, so the conditional statement returns 0 without waiting
+// and this test fails there while still passing on MySQL and SQL Server, which block and
+// re-evaluate. Only the four-engine data tier can catch that, and only on one of its four engines.
+// Measured per engine in the agreement's probe/client_flip_cas_race.out.
+func TestSetClientPublic_ClassifiesAgainstACommittedConcurrentWrite(t *testing.T) {
+	if dbType() == "" || dbType() == "sqlite" {
+		t.Skip("sqlite is limited to one connection (SetMaxOpenConns(1)), so a second write " +
+			"transaction queues behind the first instead of overlapping it. The interleaving " +
+			"cannot be constructed here, in this process or in the server")
+	}
+
+	client := createTestClient(t)
+	client.IsPublic = true
+	if err := database.UpdateClient(context.Background(), nil, client); err != nil {
+		t.Fatalf("UpdateClient seeding a public client: %v", err)
+	}
+
+	// The other administrator: makes the client confidential, and holds it uncommitted.
+	other := beginTx(t)
+	client.IsPublic = false
+	client.ClientSecretEncrypted = []byte("the-secret-the-other-request-just-set")
+	if err := database.UpdateClient(context.Background(), other, client); err != nil {
+		t.Fatalf("UpdateClient making the client confidential: %v", err)
+	}
+
+	// The save under test, which believes the client is already public.
+	saver := beginTx(t)
+	type outcome struct {
+		becamePublic bool
+		err          error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		becamePublic, err := database.SetClientPublic(context.Background(), saver, client.Id)
+		done <- outcome{becamePublic, err}
+	}()
+
+	// It must not be able to answer yet. Whatever it said now could only come from the row as it
+	// stood before the other transaction committed, which is the stale side the classification
+	// must never be taken from.
+	select {
+	case o := <-done:
+		t.Fatalf("SetClientPublic answered %v while another transaction held the row uncommitted; "+
+			"it must wait for that writer rather than classify against the row it left behind",
+			o.becamePublic)
+	case <-time.After(500 * time.Millisecond):
+	}
+
+	if err := database.CommitTransaction(context.Background(), other); err != nil {
+		t.Fatalf("committing the concurrent confidential write: %v", err)
+	}
+
+	var o outcome
+	select {
+	case o = <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatalf("SetClientPublic never returned after the concurrent transaction committed")
+	}
+	if o.err != nil {
+		t.Fatalf("SetClientPublic returned error: %v", o.err)
+	}
+	if !o.becamePublic {
+		t.Errorf("the save turned a confidential client public and must report the transition, " +
+			"or the flip commits a public client still holding the grants that secret protected")
+	}
+
+	if err := database.CommitTransaction(context.Background(), saver); err != nil {
+		t.Fatalf("committing the save: %v", err)
+	}
+	stored, err := database.GetClientById(context.Background(), nil, client.Id)
+	if err != nil {
+		t.Fatalf("GetClientById: %v", err)
+	}
+	if stored == nil || !stored.IsPublic {
+		t.Errorf("expected the client to end public, got %+v", stored)
+	}
+}
+
+// TestAcquireClientRow covers the contract of the statement that holds a client row for the rest
+// of a transaction (#245 decision 18). It writes nothing a reader can observe, so what there is
+// to pin is when it refuses and when it does not.
+func TestAcquireClientRow(t *testing.T) {
+	client := createTestClient(t)
+
+	tx := beginTx(t)
+	if err := database.AcquireClientRow(context.Background(), tx, client.Id); err != nil {
+		t.Fatalf("AcquireClientRow returned error: %v", err)
+	}
+
+	// Nothing about the client changes. The callers of this run their own write afterwards, so
+	// an acquisition that altered a column would be corrupting the row it was asked to protect.
+	held, err := database.GetClientById(context.Background(), tx, client.Id)
+	if err != nil {
+		t.Fatalf("GetClientById inside the transaction: %v", err)
+	}
+	if held == nil {
+		t.Fatalf("the client vanished inside the transaction that acquired it")
+	}
+	if held.ClientIdentifier != client.ClientIdentifier || held.IsPublic != client.IsPublic ||
+		held.Description != client.Description {
+		t.Errorf("acquiring the row changed it: %+v", held)
+	}
+	if err := database.CommitTransaction(context.Background(), tx); err != nil {
+		t.Fatalf("CommitTransaction: %v", err)
+	}
+
+	// A client that is not there is NOT an error here, which is deliberate and is the one place
+	// this differs from SetClientPublic. There is nothing to hold, and every caller reads the row
+	// immediately afterwards and answers "the client no longer exists" itself. Reporting it twice
+	// would put one sentence in two places and let them disagree.
+	tx = beginTx(t)
+	if err := database.AcquireClientRow(context.Background(), tx, client.Id+1_000_000); err != nil {
+		t.Errorf("acquiring a row that does not exist must not error, got %v", err)
+	}
+	_ = database.RollbackTransaction(context.Background(), tx)
+
+	// A zero id is a caller bug rather than a filter, exactly as it is in SetClientPublic and
+	// RevokeCodesByClientId.
+	tx = beginTx(t)
+	if err := database.AcquireClientRow(context.Background(), tx, 0); err == nil {
+		t.Errorf("expected an error for a client id of 0")
+	}
+	_ = database.RollbackTransaction(context.Background(), tx)
+
+	// Without a transaction the statement autocommits and drops the row before the caller can
+	// read it, which is the whole of what this buys. Refused rather than silently degraded.
+	if err := database.AcquireClientRow(context.Background(), nil, client.Id); err == nil {
+		t.Errorf("expected an error when called without a transaction")
+	}
+}
+
+// TestAcquireClientRow_MakesALaterReadSeeAConcurrentCommit is the property the three admin API
+// endpoints that do not own how a client authenticates depend on, run against a real engine
+// rather than described.
+//
+// Those endpoints re-read is_public and client_secret_encrypted inside their write transaction
+// and copy them over whatever the request is holding, because UpdateClient projects every mutable
+// column and none of them means to change how the client authenticates. A re-read alone does not
+// hold: under MVCC it returns the last committed version WITHOUT WAITING, so another
+// administrator's save can commit confidential mode and a secret while this transaction is
+// between its read and its write, and this transaction then writes the public row it read.
+// The client goes back to public, the newer secret is deleted, and no revocation runs on that
+// path, so grants issued while a secret was required stay redeemable by a client that presents
+// nothing.
+//
+// So the read has to happen under this transaction's own row lock. That is what the acquisition
+// buys, and this is the only tier that can prove it: mysql and postgres do not make the bare
+// re-read wait at all, and no unit test with a mocked database can observe an engine's snapshot
+// rules. Measured per engine in the agreement's probe/shared_writer_restores_public.out.
+func TestAcquireClientRow_MakesALaterReadSeeAConcurrentCommit(t *testing.T) {
+	if dbType() == "" || dbType() == "sqlite" {
+		t.Skip("sqlite is limited to one connection (SetMaxOpenConns(1)), so a second writer " +
+			"queues behind the open transaction instead of landing inside it. The interleaving " +
+			"cannot be constructed here, in this process or in the server")
+	}
+
+	client := createTestClient(t)
+	client.IsPublic = true
+	client.ClientSecretEncrypted = nil
+	if err := database.UpdateClient(context.Background(), nil, client); err != nil {
+		t.Fatalf("UpdateClient seeding a public client: %v", err)
+	}
+
+	// The other administrator: hardens the client to confidential and gives it a secret, and
+	// holds it uncommitted.
+	secret := []byte("the-secret-the-other-request-just-set")
+	other := beginTx(t)
+	client.IsPublic = false
+	client.ClientSecretEncrypted = secret
+	if err := database.UpdateClient(context.Background(), other, client); err != nil {
+		t.Fatalf("UpdateClient making the client confidential: %v", err)
+	}
+
+	// The save under test: one of the three endpoints, which loaded the client while it was
+	// still public and is about to write every column back.
+	saver := beginTx(t)
+	type outcome struct {
+		refreshed *models.Client
+		err       error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		if err := database.AcquireClientRow(context.Background(), saver, client.Id); err != nil {
+			done <- outcome{nil, err}
+			return
+		}
+		refreshed, err := database.GetClientById(context.Background(), saver, client.Id)
+		done <- outcome{refreshed, err}
+	}()
+
+	// It must not be able to read yet. Anything it could return at this point comes from the row
+	// as it stood before the other transaction committed, which is the stale side the write must
+	// never be taken from. This is the assertion a bare re-read fails on mysql and postgres.
+	select {
+	case o := <-done:
+		t.Fatalf("the read completed while another transaction held the row uncommitted "+
+			"(is_public=%v): the acquisition must wait for that writer rather than let the read "+
+			"return the row it left behind", o.refreshed != nil && o.refreshed.IsPublic)
+	case <-time.After(500 * time.Millisecond):
+	}
+
+	if err := database.CommitTransaction(context.Background(), other); err != nil {
+		t.Fatalf("committing the concurrent confidential write: %v", err)
+	}
+
+	var o outcome
+	select {
+	case o = <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatalf("the acquisition never returned after the concurrent transaction committed")
+	}
+	if o.err != nil {
+		t.Fatalf("acquiring and reading the client: %v", o.err)
+	}
+	if o.refreshed == nil {
+		t.Fatalf("the client vanished")
+	}
+	if o.refreshed.IsPublic {
+		t.Errorf("the read must see the committed confidential mode, or the save writes public " +
+			"mode back over it and the grants issued under the secret stay redeemable")
+	}
+	if string(o.refreshed.ClientSecretEncrypted) != string(secret) {
+		t.Errorf("the read must see the committed secret, or the save deletes it; got %q",
+			string(o.refreshed.ClientSecretEncrypted))
+	}
+	_ = database.RollbackTransaction(context.Background(), saver)
+}
+
+// TestGetClientByClientIdentifierIsCaseSensitive is RFC 6749 section 1.9 in the data tier:
+// "Unless otherwise noted, all the protocol parameter names and values are case sensitive",
+// and section 2.2 notes no exception for client_id. Two values that differ in case are two
+// clients, and one is not found by the other's name.
+//
+// It is the seam the whole of #283 turns on, because it answers differently per engine
+// unless something makes it not. MySQL and SQL Server folded case in `=` and in the UNIQUE
+// index behind idx_client_identifier, so registering MyApp and then myapp gave "already in
+// use" there and two rows on SQLite and PostgreSQL, and client_id=myapp resolved MyApp.
+// Migration 000040 moves both engines to a case-sensitive collation; this runs on all four
+// and passes on all four only once it has.
+//
+// The padded lookup is the other half, and no collation reaches it. SQL Server pads for `=`
+// under every collation it has, BIN2 included, so 'myapp' = 'myapp ' is true there and the
+// row comes back. The data layer discards it (see commondb.engineFoldedTheMatch), which is
+// what makes this assertion mean the same thing on four engines.
+func TestGetClientByClientIdentifierIsCaseSensitive(t *testing.T) {
+	lower := "case_client_" + strings.ToLower(fake.LetterN(6))
+	upper := strings.ToUpper(lower)
+
+	lowerClient := newCaseTestClient(t, lower)
+	if err := database.CreateClient(context.Background(), nil, lowerClient); err != nil {
+		t.Fatalf("Failed to create the lowercase client: %v", err)
+	}
+
+	// A second client differing from the first only by case. This is the insert MySQL and
+	// SQL Server refused before 000040, because their UNIQUE index folded.
+	upperClient := newCaseTestClient(t, upper)
+	if err := database.CreateClient(context.Background(), nil, upperClient); err != nil {
+		t.Fatalf("Failed to create a client differing only by case, which every engine must now accept: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name   string
+		lookup string
+		wantId int64
+	}{
+		{"the lowercase name resolves the lowercase client", lower, lowerClient.Id},
+		{"the uppercase name resolves the uppercase client", upper, upperClient.Id},
+		{"a mis-cased name resolves nothing", "Case_Client_" + strings.ToUpper(lower[12:]), 0},
+		{"a trailing space resolves nothing, which SQL Server's padding would otherwise defeat", lower + " ", 0},
+		{"a leading space resolves nothing", " " + lower, 0},
+	} {
+		got, err := database.GetClientByClientIdentifier(context.Background(), nil, tc.lookup)
+		if err != nil {
+			t.Fatalf("%s: unexpected error: %v", tc.name, err)
+		}
+		if tc.wantId == 0 {
+			if got != nil {
+				t.Errorf("%s: expected nil, got the client with id %d and identifier %q",
+					tc.name, got.Id, got.ClientIdentifier)
+			}
+			continue
+		}
+		if got == nil {
+			t.Fatalf("%s: expected the client with id %d, got nil", tc.name, tc.wantId)
+		}
+		if got.Id != tc.wantId {
+			t.Errorf("%s: expected the client with id %d, got id %d (identifier %q)",
+				tc.name, tc.wantId, got.Id, got.ClientIdentifier)
+		}
+	}
+}
+
+// newCaseTestClient is the minimum a client row needs to satisfy the NOT NULL columns.
+func newCaseTestClient(t *testing.T, identifier string) *models.Client {
+	t.Helper()
+	return &models.Client{
+		ClientIdentifier:                        identifier,
+		ClientSecretEncrypted:                   []byte("encrypted_secret"),
+		Enabled:                                 true,
+		AuthorizationCodeEnabled:                true,
+		TokenExpirationInSeconds:                3600,
+		RefreshTokenOfflineIdleTimeoutInSeconds: 86400,
+		RefreshTokenOfflineMaxLifetimeInSeconds: 2592000,
+		IncludeOpenIDConnectClaimsInAccessToken: models.ThreeStateSettingDefault.String(),
+		DefaultAcrLevel:                         models.AcrLevel1,
+	}
+}
+
+// TestClientLoadPermissions_EnlistsInTheCallersTransaction pins the first of #413's five sites.
+// ClientLoadPermissions holds a tx, loads the join rows through it, and then passed nil to
+// GetPermissionsByIds, so the permissions themselves were read outside the caller's transaction.
+//
+// Every row here is created inside the transaction on purpose. Created before it, the escaped
+// read finds them anyway and the case passes with the defect still in place, which is the shape
+// of test this bug survived for as long as it did.
+//
+// On SQLite the case is also the self-deadlock proof: that pool is SetMaxOpenConns(1), so the
+// escaped read asks for a second connection while its own caller holds the only one, and never
+// returns rather than returning something wrong.
+func TestClientLoadPermissions_EnlistsInTheCallersTransaction(t *testing.T) {
+	tx := beginTx(t)
+
+	resource := &models.Resource{
+		ResourceIdentifier: "tx_resource_" + fake.LetterN(8),
+		Description:        "Transaction pass-through resource",
+	}
+	if err := database.CreateResource(context.Background(), tx, resource); err != nil {
+		t.Fatalf("Failed to create resource inside the transaction: %v", err)
+	}
+
+	permission := &models.Permission{
+		PermissionIdentifier: "tx_permission_" + fake.LetterN(8),
+		Description:          "Transaction pass-through permission",
+		ResourceId:           resource.Id,
+	}
+	if err := database.CreatePermission(context.Background(), tx, permission); err != nil {
+		t.Fatalf("Failed to create permission inside the transaction: %v", err)
+	}
+
+	client := &models.Client{
+		ClientIdentifier: "tx_client_" + fake.LetterN(8),
+		Description:      "Transaction pass-through client",
+	}
+	if err := database.CreateClient(context.Background(), tx, client); err != nil {
+		t.Fatalf("Failed to create client inside the transaction: %v", err)
+	}
+
+	clientPermission := &models.ClientPermission{
+		ClientId:     client.Id,
+		PermissionId: permission.Id,
+	}
+	if err := database.CreateClientPermission(context.Background(), tx, clientPermission); err != nil {
+		t.Fatalf("Failed to create client permission inside the transaction: %v", err)
+	}
+
+	if err := database.ClientLoadPermissions(context.Background(), tx, client); err != nil {
+		t.Fatalf("ClientLoadPermissions through the transaction: %v", err)
+	}
+
+	if len(client.Permissions) != 1 {
+		t.Fatalf("Expected the transaction's own permission to be loaded, got %d permission(s): "+
+			"the read ran outside the caller's transaction (#413)", len(client.Permissions))
+	}
+	if client.Permissions[0].Id != permission.Id {
+		t.Errorf("Expected permission %d, got %d", permission.Id, client.Permissions[0].Id)
+	}
+
+	if err := database.RollbackTransaction(context.Background(), tx); err != nil {
+		t.Fatalf("RollbackTransaction: %v", err)
+	}
+}

@@ -1,0 +1,162 @@
+package server
+
+import (
+	"database/sql"
+	"github.com/stretchr/testify/mock"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/leodip/goiabada/authserver/internal/config"
+	mocks_data "github.com/leodip/goiabada/authserver/internal/data/mocks"
+	"github.com/leodip/goiabada/authserver/internal/models"
+	"github.com/leodip/goiabada/core/testutil"
+	"github.com/stretchr/testify/assert"
+)
+
+// TestInitMiddleware_RequestLoggerIsRegistered makes the claim the unit table in
+// src/core/middleware cannot: that MiddlewareRequestLogger is actually mounted on the auth server's
+// router, and that it is wired to the configuration flag rather than mounted with a constant. That
+// table passes perfectly against a middleware nobody wired up, and deleting the Use() line here
+// still compiles, because the package references custom_middleware on six other lines.
+//
+// It is deliberately thin. The middleware's behaviour belongs to its own tests in
+// src/core/middleware, and the redaction table belongs to RequestTargetForLog. This owns one claim:
+// a real request through this server's real chain of eleven middlewares produces a log line, and
+// that line does not carry the id_token_hint (#159).
+//
+// initMiddleware is an ordinary method and httptest drives it with no harness, which is what
+// server_csrf_test.go in the admin console established.
+
+// jwtLike is the three-segment shape an id_token_hint arrives in. It is the sentinel every
+// assertion below looks for.
+const jwtLike = "eyJhbGciOiJSUzI1NiIsImtpZCI6IlBST0JFIn0." +
+	"eyJzdWIiOiJVU0VSLVNVQiIsInNpZCI6IlNFU1NJT04tSUQifQ.U0lHTkFUVVJF"
+
+// withLogHttpRequests sets the flag for the duration of the test and restores it. It has to run
+// before initMiddleware, which is when the value is read.
+func withLogHttpRequests(t *testing.T, enabled bool) {
+	t.Helper()
+	previous := config.GetAuthServer().LogHttpRequests
+	config.GetAuthServer().LogHttpRequests = enabled
+	t.Cleanup(func() {
+		config.GetAuthServer().LogHttpRequests = previous
+	})
+}
+
+// newLoggerTestServer builds a Server by hand, runs the real initMiddleware, and registers one
+// handler that answers 200 and records that it ran.
+//
+// The database is a mock with GetSettingsById stubbed, which MiddlewareSettings calls on every
+// request. MiddlewareCors also holds the database but needs no stub: go-chi/cors only calls
+// AllowOriginFunc for a request carrying an Origin header, and these send none. That is enforced
+// rather than assumed, since mocks_data.NewDatabase(t) fails the test on any call nobody expected.
+func newLoggerTestServer(t *testing.T, logHttpRequests bool, handlerRan *bool) *Server {
+	t.Helper()
+	withLogHttpRequests(t, logHttpRequests)
+
+	database := mocks_data.NewDatabase(t)
+	database.On("GetSettingsById", mock.Anything, (*sql.Tx)(nil), int64(1)).Return(&models.Settings{Id: 1}, nil)
+
+	s := &Server{
+		router:       chi.NewRouter(),
+		database:     database,
+		sessionStore: newTestSessionStore(),
+	}
+	// The handler is registered on the branch initMiddleware returns, not on s.router,
+	// so this exercises the whole chain: the root's middleware plus the four the
+	// application branch adds (#266).
+	app := s.initMiddleware()
+	app.Get("/auth/authorize", func(w http.ResponseWriter, _ *http.Request) {
+		*handlerRan = true
+		w.WriteHeader(http.StatusOK)
+	})
+	// The route the panic case drives. On the same branch as the one above, so the panic
+	// travels back up the whole real chain rather than a shortened one.
+	app.Get("/auth/panic", func(http.ResponseWriter, *http.Request) {
+		*handlerRan = true
+		panic("a handler panicked")
+	})
+	return s
+}
+
+// The target carries one allowlisted parameter and one that is not, so the assertions below can
+// tell "the token was redacted" apart from "nothing was logged at all".
+const loggerTestTarget = "/auth/authorize?client_id=admin-console&response_type=code&id_token_hint=" + jwtLike
+
+func TestInitMiddleware_RequestLoggerIsRegistered(t *testing.T) {
+	handlerRan := false
+	server := newLoggerTestServer(t, true, &handlerRan)
+	logged := testutil.CaptureSlog(t)
+
+	recorder := httptest.NewRecorder()
+	server.router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, loggerTestTarget, nil))
+
+	// The handler at the far end of the chain answered, so the logger did not swallow the request
+	// on its way through. Without this the assertions below are satisfied by a chain that broke.
+	assert.True(t, handlerRan, "the request must still reach the handler")
+	assert.Equal(t, http.StatusOK, recorder.Code)
+
+	output := logged.Text()
+	assert.Equal(t, 1, strings.Count(output, `msg="http request"`),
+		"the request logger must be mounted on the auth server, and write exactly one record")
+
+	// The allowlisted values survived, which is what attributes the absence below to redaction
+	// rather than to an empty log.
+	assert.Contains(t, output, "client_id=admin-console")
+	assert.Contains(t, output, "response_type=code")
+	assert.Contains(t, output, "id_token_hint=[redacted]")
+
+	assert.NotContains(t, output, jwtLike,
+		"the id_token_hint must never reach the log, which is the whole of #159")
+}
+
+// Without this the test above passes against a Use() line that mounts the middleware with a
+// constant true, which is the one way to get this wiring wrong that still redacts correctly.
+func TestInitMiddleware_RequestLoggerHonoursTheFlag(t *testing.T) {
+	handlerRan := false
+	server := newLoggerTestServer(t, false, &handlerRan)
+	logged := testutil.CaptureSlog(t)
+
+	recorder := httptest.NewRecorder()
+	server.router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, loggerTestTarget, nil))
+
+	assert.Equal(t, 0, strings.Count(logged.Text(), `msg="http request"`),
+		"nothing is logged when GOIABADA_AUTHSERVER_LOG_HTTP_REQUESTS is off")
+	// The other half: a middleware that dropped the request would also log nothing.
+	assert.True(t, handlerRan, "the request must still reach the handler with the flag off")
+	assert.Equal(t, http.StatusOK, recorder.Code)
+}
+
+// #203. A panicking handler is answered 500 by Recoverer, and until this change the request
+// logger sat above that 500 rather than below it: chi's Recoverer wrote WriteHeader(500) to the
+// writer it was handed, which was the one ABOVE the logger's wrapper, so the wrapper never saw a
+// status and the record said status=0. An operator filtering for 500s therefore found every
+// request that failed except the ones that failed hardest.
+//
+// This drives the real chain through initMiddleware rather than a hand-built pair, so it fails if
+// anybody ever restores the old order.
+func TestInitMiddleware_APanickingRequestIsRecordedAs500(t *testing.T) {
+	handlerRan := false
+	server := newLoggerTestServer(t, true, &handlerRan)
+	logged := testutil.CaptureSlog(t)
+
+	recorder := httptest.NewRecorder()
+	server.router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/auth/panic", nil))
+
+	// The panic really happened and really was recovered, or the assertion below would be
+	// satisfied by a route that never panicked at all.
+	assert.True(t, handlerRan, "the panicking handler must have run")
+	assert.Equal(t, http.StatusInternalServerError, recorder.Code,
+		"Recoverer must still answer the client 500")
+
+	output := logged.Text()
+	assert.Equal(t, 1, strings.Count(output, `msg="http request"`),
+		"a panicking request must still produce exactly one record")
+	assert.Contains(t, output, "status=500",
+		"the record must say 500, which means the logger is mounted above Recoverer (#203)")
+	assert.NotContains(t, output, "status=0",
+		"status=0 is the old order: Recoverer's 500 never reached the logger's wrapped writer")
+}

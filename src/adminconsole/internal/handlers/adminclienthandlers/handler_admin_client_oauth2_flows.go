@@ -1,0 +1,247 @@
+package adminclienthandlers
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"strconv"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/leodip/goiabada/adminconsole/internal/config"
+	"github.com/leodip/goiabada/adminconsole/internal/constants"
+	"github.com/leodip/goiabada/adminconsole/internal/handlers"
+	"github.com/leodip/goiabada/adminconsole/internal/oauthclient"
+	"github.com/leodip/goiabada/core/api"
+	coreconstants "github.com/leodip/goiabada/core/constants"
+	"github.com/leodip/goiabada/core/errs"
+	"github.com/leodip/goiabada/core/sessionstore"
+)
+
+// clientOAuth2FlowsAPI is what the OAuth2 flows page needs: the client, the global switches it
+// reads against, and the write.
+type clientOAuth2FlowsAPI interface {
+	GetClientById(ctx context.Context, accessToken string, clientId int64) (*api.ClientResponse, error)
+	GetSettingsGeneral(ctx context.Context, accessToken string) (*api.SettingsGeneralResponse, error)
+	UpdateClientOAuth2Flows(ctx context.Context, accessToken string, clientId int64, request *api.UpdateClientOAuth2FlowsRequest) (*api.ClientResponse, error)
+}
+
+func HandleAdminClientOAuth2Get(
+	httpHelper handlers.HttpHelper,
+	httpSession sessionstore.Store,
+	apiClient clientOAuth2FlowsAPI,
+) http.HandlerFunc {
+
+	return func(w http.ResponseWriter, r *http.Request) {
+
+		idStr := chi.URLParam(r, "clientId")
+		if len(idStr) == 0 {
+			httpHelper.NotFound(w, r)
+			return
+		}
+
+		id, err := strconv.ParseInt(idStr, 10, 64)
+		if err != nil {
+			httpHelper.NotFound(w, r)
+			return
+		}
+		// Get JWT info from context to extract access token
+		jwtInfo, ok := r.Context().Value(constants.ContextKeyJwtInfo).(oauthclient.JwtInfo)
+		if !ok {
+			httpHelper.InternalServerError(w, r, errs.New("no JWT info found in context"))
+			return
+		}
+		client, err := apiClient.GetClientById(r.Context(), jwtInfo.TokenResponse.AccessToken, id)
+		if err != nil {
+			handlers.HandleAPIError(httpHelper, w, r, err)
+			return
+		}
+		if client == nil {
+			httpHelper.NotFound(w, r)
+			return
+		}
+
+		// Fetch global settings to get the global PKCE setting
+		settingsResp, err := apiClient.GetSettingsGeneral(r.Context(), jwtInfo.TokenResponse.AccessToken)
+		if err != nil {
+			handlers.HandleAPIError(httpHelper, w, r, err)
+			return
+		}
+
+		adminClientOAuth2Flows := struct {
+			ClientId                                      int64
+			ClientIdentifier                              string
+			IsPublic                                      bool
+			AuthorizationCodeEnabled                      bool
+			ClientCredentialsEnabled                      bool
+			IsSystemLevelClient                           bool
+			PKCERequired                                  *bool
+			GlobalPKCERequired                            bool
+			ImplicitGrantEnabled                          *bool
+			GlobalImplicitFlowEnabled                     bool
+			ResourceOwnerPasswordCredentialsEnabled       *bool
+			GlobalResourceOwnerPasswordCredentialsEnabled bool
+		}{
+			ClientId:                                client.Id,
+			ClientIdentifier:                        client.ClientIdentifier,
+			IsPublic:                                client.IsPublic,
+			AuthorizationCodeEnabled:                client.AuthorizationCodeEnabled,
+			ClientCredentialsEnabled:                client.ClientCredentialsEnabled,
+			IsSystemLevelClient:                     client.IsSystemLevelClient,
+			PKCERequired:                            client.PKCERequired,
+			GlobalPKCERequired:                      settingsResp.PKCERequired,
+			ImplicitGrantEnabled:                    client.ImplicitGrantEnabled,
+			GlobalImplicitFlowEnabled:               settingsResp.ImplicitFlowEnabled,
+			ResourceOwnerPasswordCredentialsEnabled: client.ResourceOwnerPasswordCredentialsEnabled,
+			GlobalResourceOwnerPasswordCredentialsEnabled: settingsResp.ResourceOwnerPasswordCredentialsEnabled,
+		}
+
+		sess, err := httpSession.Get(r, coreconstants.AdminConsoleSessionName)
+		if err != nil {
+			httpHelper.InternalServerError(w, r, err)
+			return
+		}
+
+		_, savedSuccessfully := sess.TakeFlash("savedSuccessfully")
+		if savedSuccessfully {
+			err = httpSession.Save(r, w, sess)
+			if err != nil {
+				httpHelper.InternalServerError(w, r, err)
+				return
+			}
+		}
+
+		bind := map[string]interface{}{
+			"client":            adminClientOAuth2Flows,
+			"savedSuccessfully": savedSuccessfully,
+		}
+
+		err = httpHelper.RenderTemplate(w, r, "/layouts/menu_layout.html", "/admin_clients_oauth2_flows.html", bind)
+		if err != nil {
+			httpHelper.InternalServerError(w, r, err)
+			return
+		}
+	}
+}
+
+func HandleAdminClientOAuth2Post(
+	httpHelper handlers.HttpHelper,
+	httpSession sessionstore.Store,
+	apiClient clientOAuth2FlowsAPI,
+) http.HandlerFunc {
+
+	return func(w http.ResponseWriter, r *http.Request) {
+
+		idStr := chi.URLParam(r, "clientId")
+		if len(idStr) == 0 {
+			httpHelper.NotFound(w, r)
+			return
+		}
+
+		id, err := strconv.ParseInt(idStr, 10, 64)
+		if err != nil {
+			httpHelper.NotFound(w, r)
+			return
+		}
+
+		// Get JWT info from context to extract access token
+		jwtInfo, ok := r.Context().Value(constants.ContextKeyJwtInfo).(oauthclient.JwtInfo)
+		if !ok {
+			httpHelper.InternalServerError(w, r, errs.New("no JWT info found in context"))
+			return
+		}
+		client, err := apiClient.GetClientById(r.Context(), jwtInfo.TokenResponse.AccessToken, id)
+		if err != nil {
+			handlers.HandleAPIError(httpHelper, w, r, err)
+			return
+		}
+		if client == nil {
+			httpHelper.NotFound(w, r)
+			return
+		}
+
+		authCodeEnabled := r.FormValue("authCodeEnabled") == "on"
+		clientCredentialsEnabled := r.FormValue("clientCredentialsEnabled") == "on"
+
+		// Handle tri-state PKCE: "global" = nil (use global), "on" = true (required), "off" = false (optional)
+		pkceRequiredValue := r.FormValue("pkceRequired")
+		var pkceRequired *bool
+		switch pkceRequiredValue {
+		case "on":
+			t := true
+			pkceRequired = &t
+		case "off":
+			f := false
+			pkceRequired = &f
+		default:
+			// "global" or empty - use nil to inherit global setting
+			pkceRequired = nil
+		}
+
+		// Handle tri-state implicit flow: "global" = nil (use global), "on" = true (enabled), "off" = false (disabled)
+		implicitGrantEnabledValue := r.FormValue("implicitGrantEnabled")
+		var implicitGrantEnabled *bool
+		switch implicitGrantEnabledValue {
+		case "on":
+			t := true
+			implicitGrantEnabled = &t
+		case "off":
+			f := false
+			implicitGrantEnabled = &f
+		default:
+			// "global" or empty - use nil to inherit global setting
+			implicitGrantEnabled = nil
+		}
+
+		// Handle tri-state ROPC flow: "global" = nil (use global), "on" = true (enabled), "off" = false (disabled)
+		// RFC 6749 Section 4.3
+		// SECURITY NOTE: ROPC is deprecated in OAuth 2.1 due to credential exposure risks
+		ropcEnabledValue := r.FormValue("ropcEnabled")
+		var ropcEnabled *bool
+		switch ropcEnabledValue {
+		case "on":
+			t := true
+			ropcEnabled = &t
+		case "off":
+			f := false
+			ropcEnabled = &f
+		default:
+			// "global" or empty - use nil to inherit global setting
+			ropcEnabled = nil
+		}
+
+		client.AuthorizationCodeEnabled = authCodeEnabled
+		client.ClientCredentialsEnabled = clientCredentialsEnabled
+		if client.IsPublic {
+			client.ClientCredentialsEnabled = false
+		}
+
+		// Build API request and update via auth server
+		req := &api.UpdateClientOAuth2FlowsRequest{
+			AuthorizationCodeEnabled:                client.AuthorizationCodeEnabled,
+			ClientCredentialsEnabled:                client.ClientCredentialsEnabled,
+			PKCERequired:                            pkceRequired,
+			ImplicitGrantEnabled:                    implicitGrantEnabled,
+			ResourceOwnerPasswordCredentialsEnabled: ropcEnabled,
+		}
+		_, err = apiClient.UpdateClientOAuth2Flows(r.Context(), jwtInfo.TokenResponse.AccessToken, client.Id, req)
+		if err != nil {
+			handlers.HandleAPIError(httpHelper, w, r, err)
+			return
+		}
+
+		sess, err := httpSession.Get(r, coreconstants.AdminConsoleSessionName)
+		if err != nil {
+			httpHelper.InternalServerError(w, r, err)
+			return
+		}
+
+		sess.SetFlash("savedSuccessfully", "true")
+		err = httpSession.Save(r, w, sess)
+		if err != nil {
+			httpHelper.InternalServerError(w, r, err)
+			return
+		}
+
+		http.Redirect(w, r, fmt.Sprintf("%v/admin/clients/%v/oauth2-flows", config.GetAdminConsole().BaseURL, client.Id), http.StatusFound)
+	}
+}

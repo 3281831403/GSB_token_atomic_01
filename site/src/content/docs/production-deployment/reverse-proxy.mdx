@@ -1,0 +1,278 @@
+---
+title: Reverse proxy (no Cloudflare)
+description: Deploy Goiabada with Nginx or Traefik for SSL termination without Cloudflare.
+---
+
+import { Steps, Aside } from '@astrojs/starlight/components';
+
+Use this setup if you're not using Cloudflare and want to manage SSL certificates yourself.
+
+## Architecture
+
+```
+Internet → Nginx (HTTPS port 443) → {
+    auth.example.com    → goiabada-authserver:9090 (HTTP)
+    admin.example.com   → goiabada-adminconsole:9091 (HTTP)
+}
+```
+
+Nginx handles HTTPS termination with Let's Encrypt certificates. Goiabada runs on HTTP internally.
+
+## Prerequisites
+
+- Two domain names (subdomains) for auth and admin console
+- Nginx installed
+- Docker and docker-compose installed
+
+## Setup
+
+### 1. Configure DNS records
+
+At your DNS provider, add A records for both domains pointing to your server's IP address:
+
+```
+Type: A    Name: auth    Content: <your-server-ip>
+Type: A    Name: admin   Content: <your-server-ip>
+```
+
+<Aside type="tip">
+DNS propagation can take up to 48 hours, but usually completes within minutes. You can verify with `dig auth.example.com` or `nslookup auth.example.com`.
+</Aside>
+
+### 2. Start Goiabada containers
+
+Use the [setup wizard](/getting-started/setup-wizard/) to generate your `docker-compose.yml`:
+
+1. Select **"2. Production with reverse proxy"** when prompted
+2. Enter your domain names (e.g., `https://auth.example.com` and `https://admin.example.com`)
+3. The wizard automatically sets `TRUST_PROXY_HEADERS=true` (and, because your base URLs are `https://`, cookies get the `Secure` flag automatically)
+
+Then start the containers:
+
+```bash
+docker compose up -d
+```
+
+Verify containers are running:
+
+```bash
+# Check containers are running
+docker ps | grep goiabada
+
+# Test auth server health (should return: healthy)
+curl http://localhost:9090/health && echo
+
+# Test admin console health (should return: healthy)
+curl http://localhost:9091/health && echo
+```
+
+### 3. Get SSL certificates
+
+<Steps>
+1. Install certbot (Ubuntu/Debian):
+   ```bash
+   sudo apt-get update
+   sudo apt-get install certbot
+   sudo mkdir -p /var/www/certbot
+   ```
+
+2. Create a temporary Nginx config for certificate acquisition:
+   ```bash
+   sudo nano /etc/nginx/sites-available/goiabada
+   ```
+
+3. Add temporary HTTP config:
+
+   <Aside type="caution">
+   Replace `auth.example.com` and `admin.example.com` with your actual domain names throughout this configuration.
+   </Aside>
+
+   ```nginx
+   server {
+       listen 80;
+       server_name auth.example.com;
+
+       location /.well-known/acme-challenge/ {
+           root /var/www/certbot;
+       }
+
+       location / {
+           proxy_pass http://127.0.0.1:9090;
+       }
+   }
+
+   server {
+       listen 80;
+       server_name admin.example.com;
+
+       location /.well-known/acme-challenge/ {
+           root /var/www/certbot;
+       }
+
+       location / {
+           proxy_pass http://127.0.0.1:9091;
+       }
+   }
+   ```
+
+4. Enable and reload:
+   ```bash
+   sudo ln -s /etc/nginx/sites-available/goiabada /etc/nginx/sites-enabled/
+   sudo nginx -t && sudo nginx -s reload
+   ```
+
+5. Get certificates:
+   ```bash
+   sudo certbot certonly --webroot -w /var/www/certbot -d auth.example.com
+   sudo certbot certonly --webroot -w /var/www/certbot -d admin.example.com
+   ```
+</Steps>
+
+### 4. Configure Nginx
+
+Create `/etc/nginx/sites-available/goiabada`:
+
+```nginx
+# Auth Server
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name auth.example.com;
+
+    ssl_certificate /etc/letsencrypt/live/auth.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/auth.example.com/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+    ssl_prefer_server_ciphers on;
+
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+
+    location / {
+        proxy_pass http://127.0.0.1:9090;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+}
+
+# Admin Console
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name admin.example.com;
+
+    ssl_certificate /etc/letsencrypt/live/admin.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/admin.example.com/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+    ssl_prefer_server_ciphers on;
+
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+
+    location / {
+        proxy_pass http://127.0.0.1:9091;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+}
+
+# HTTP to HTTPS redirect
+server {
+    listen 80;
+    listen [::]:80;
+    server_name auth.example.com admin.example.com;
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+```
+
+Enable and reload:
+
+```bash
+sudo ln -s /etc/nginx/sites-available/goiabada /etc/nginx/sites-enabled/
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+### 5. Configure firewall
+
+```bash
+sudo ufw allow 80/tcp
+sudo ufw allow 443/tcp
+# Do NOT expose 9090 or 9091 to the internet
+```
+
+### 6. Set up certificate auto-renewal
+
+Let's Encrypt certificates expire after 90 days. Set up auto-renewal:
+
+```bash
+# Test renewal
+sudo certbot renew --dry-run
+
+# Auto-renewal is typically configured automatically via cron or systemd timer
+sudo systemctl status certbot.timer
+```
+
+## Access your deployment
+
+- Auth server: `https://auth.example.com`
+- Admin console: `https://admin.example.com`
+
+## Client IP resolution and spoofing protection
+
+Goiabada resolves the real client IP for rate limiting (auth server) and audit
+logging. Behind a reverse proxy the direct connection comes from the proxy, so
+Goiabada must read the forwarded headers to recover the original client IP.
+
+- Setting `TRUST_PROXY_HEADERS=true` (the setup wizard does this) tells Goiabada
+  to trust `X-Forwarded-For` / `X-Real-IP` when resolving the client IP. With no
+  `TRUSTED_PROXIES` set, it trusts a **single** proxy hop, using the rightmost
+  `X-Forwarded-For` entry (or `X-Real-IP`).
+- This single-hop mode is safe **only if your proxy overwrites the inbound
+  headers**. The Nginx config above does exactly that: `X-Real-IP $remote_addr`
+  replaces any client-supplied value, and `$proxy_add_x_forwarded_for` appends
+  the real peer to the right of the chain. A value a client tries to inject ends
+  up on the left and is ignored.
+
+<Aside type="caution">
+If you run **more than one** proxy layer (for example an external load balancer
+or a CDN in front of Nginx), single-hop mode is not enough: a client could forge
+extra `X-Forwarded-For` entries. Set `TRUSTED_PROXIES` to the IPs/CIDRs of every
+proxy you control so Goiabada walks the chain from the right across only those
+trusted hops and stops at the real client.
+</Aside>
+
+```bash
+# Example: Nginx on the internal network plus an upstream load balancer
+GOIABADA_AUTHSERVER_TRUSTED_PROXIES=10.0.0.0/8,192.168.1.5
+GOIABADA_ADMINCONSOLE_TRUSTED_PROXIES=10.0.0.0/8,192.168.1.5
+```
+
+<Aside type="tip">
+If you enable a reverse proxy but forget `TRUST_PROXY_HEADERS=true`, every
+request will appear to originate from the proxy's IP, so rate limits and audit
+logs will attribute all traffic to a single address. This fails safe (it
+throttles rather than opens a bypass), but it is a sign the flag is missing.
+</Aside>

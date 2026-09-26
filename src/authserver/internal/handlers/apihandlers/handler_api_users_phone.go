@@ -1,0 +1,171 @@
+package apihandlers
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"net/http"
+	"strconv"
+	"strings"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/leodip/goiabada/authserver/internal/accountvalidation"
+	"github.com/leodip/goiabada/authserver/internal/apimapping"
+	"github.com/leodip/goiabada/authserver/internal/audit"
+	"github.com/leodip/goiabada/authserver/internal/middleware"
+	"github.com/leodip/goiabada/authserver/internal/models"
+	"github.com/leodip/goiabada/authserver/internal/phonecountries"
+	"github.com/leodip/goiabada/core/api"
+)
+
+// HandleAPIPhoneCountriesGet - GET /api/v1/admin/phone-countries
+func HandleAPIPhoneCountriesGet() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Authentication and authorization handled by middleware
+
+		// Get phone countries
+		phoneCountries := phonecountries.Get()
+
+		// Convert to API response
+		phoneCountryResponses := make([]api.PhoneCountryResponse, len(phoneCountries))
+		for i, pc := range phoneCountries {
+			phoneCountryResponses[i] = api.PhoneCountryResponse{
+				UniqueId:    pc.UniqueId,
+				Alpha2:      pc.Alpha2,
+				Emoji:       pc.Emoji,
+				CallingCode: pc.CallingCode,
+				Name:        pc.Name,
+			}
+		}
+
+		response := api.GetPhoneCountriesResponse{
+			PhoneCountries: phoneCountryResponses,
+		}
+
+		// Set content type and encode response
+		writeJSON(w, r, http.StatusOK, response)
+	}
+}
+
+// usersPhoneDatabase is what the administrator's user phone endpoint needs: the user row.
+type usersPhoneDatabase interface {
+	GetUserById(ctx context.Context, tx *sql.Tx, userId int64) (*models.User, error)
+	UpdateUser(ctx context.Context, tx *sql.Tx, user *models.User) error
+}
+
+// HandleAPIUserPhonePut - PUT /api/v1/admin/users/{id}/phone
+func HandleAPIUserPhonePut(
+	database usersPhoneDatabase,
+	phoneValidator *accountvalidation.PhoneValidator,
+	auditLogger AuditLogger,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Authentication and authorization handled by middleware
+
+		// Parse user ID from URL
+		idStr := chi.URLParam(r, "id")
+		if len(idStr) == 0 {
+			writeJSONError(w, "User ID is required", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		userId, err := strconv.ParseInt(idStr, 10, 64)
+		if err != nil {
+			writeJSONError(w, "Invalid user ID", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		// Parse request body
+		var req api.UpdateUserPhoneRequest
+		if decodeErr := json.NewDecoder(r.Body).Decode(&req); decodeErr != nil {
+			writeJSONError(w, "Invalid request body", "INVALID_REQUEST_BODY", http.StatusBadRequest)
+			return
+		}
+
+		// Get user from database
+		user, err := database.GetUserById(r.Context(), nil, userId)
+		if err != nil {
+			writeInternalServerError(w, r, err)
+			return
+		}
+
+		if user == nil {
+			writeJSONError(w, "User not found", "NOT_FOUND", http.StatusNotFound)
+			return
+		}
+
+		// Validate phone data
+		input := &accountvalidation.ValidatePhoneInput{
+			PhoneCountryUniqueId: req.PhoneCountryUniqueId,
+			PhoneNumber:          strings.TrimSpace(req.PhoneNumber),
+		}
+
+		err = phoneValidator.ValidatePhone(input)
+		if err != nil {
+			writeValidationError(w, r, err)
+			return
+		}
+
+		// Get phone countries for country lookup
+		phoneCountries := phonecountries.Get()
+		var phoneCountry phonecountries.PhoneCountry
+		found := false
+		for _, c := range phoneCountries {
+			if c.UniqueId == input.PhoneCountryUniqueId {
+				found = true
+				phoneCountry = c
+				break
+			}
+		}
+
+		if !found && len(input.PhoneCountryUniqueId) > 0 {
+			writeJSONError(w, "Phone country is invalid: "+input.PhoneCountryUniqueId, "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		// Update user phone fields
+		if strings.TrimSpace(input.PhoneNumber) == "" {
+			user.PhoneNumberCountryUniqueId = ""
+			user.PhoneNumberCountryCallingCode = ""
+			user.PhoneNumber = ""
+			user.PhoneNumberVerified = false
+		} else {
+			user.PhoneNumberCountryUniqueId = input.PhoneCountryUniqueId
+			user.PhoneNumberCountryCallingCode = phoneCountry.CallingCode
+			user.PhoneNumber = input.PhoneNumber
+			user.PhoneNumberVerified = req.PhoneNumberVerified
+		}
+
+		if len(strings.TrimSpace(user.PhoneNumber)) == 0 {
+			user.PhoneNumberVerified = false
+		}
+
+		// Update user in database
+		err = database.UpdateUser(r.Context(), nil, user)
+		if err != nil {
+			writeInternalServerError(w, r, err)
+			return
+		}
+
+		// Get logged in user from access token
+		jwtToken, ok := middleware.GetValidatedToken(r)
+		var loggedInUser string
+		if ok {
+			loggedInUser = jwtToken.GetStringClaim("sub")
+		}
+
+		// Log audit event
+		auditLogger.Log(r.Context(), audit.AuditUpdatedUserPhone, map[string]interface{}{
+			"userId":       user.Id,
+			"loggedInUser": loggedInUser,
+		})
+
+		// Create response
+		response := api.UpdateUserResponse{
+			User: *apimapping.ToUserResponse(user),
+		}
+
+		// Set content type and encode response
+		writeJSON(w, r, http.StatusOK, response)
+	}
+}

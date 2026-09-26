@@ -1,0 +1,528 @@
+package integrationtests
+
+import (
+	"context"
+	"encoding/json"
+	"io"
+	"net"
+	"net/http"
+	"strings"
+	"testing"
+
+	"github.com/leodip/goiabada/authserver/internal/config"
+	"github.com/leodip/goiabada/authserver/internal/encryption"
+	"github.com/leodip/goiabada/core/api"
+	"github.com/leodip/goiabada/core/testutil"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// GET /api/v1/admin/settings/email
+func TestAPISettingsEmailGet_Success(t *testing.T) {
+	accessToken, _ := createAdminClientWithToken(t)
+
+	// Read current settings from DB for comparison
+	settings, err := database.GetSettingsById(context.Background(), nil, 1)
+	assert.NoError(t, err)
+	assert.NotNil(t, settings)
+
+	url := config.GetAuthServer().BaseURL + "/api/v1/admin/settings/email"
+	resp := makeAPIRequest(t, "GET", url, accessToken, nil)
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, "application/json", resp.Header.Get("Content-Type"))
+
+	var body api.SettingsEmailResponse
+	err = json.NewDecoder(resp.Body).Decode(&body)
+	assert.NoError(t, err)
+
+	assert.Equal(t, settings.SMTPEnabled, body.SMTPEnabled)
+	assert.Equal(t, settings.SMTPHost, body.SMTPHost)
+	assert.Equal(t, settings.SMTPPort, body.SMTPPort)
+	assert.Equal(t, settings.SMTPUsername, body.SMTPUsername)
+	assert.Equal(t, settings.SMTPEncryption, body.SMTPEncryption)
+	assert.Equal(t, settings.SMTPFromName, body.SMTPFromName)
+	assert.Equal(t, settings.SMTPFromEmail, body.SMTPFromEmail)
+	assert.Equal(t, len(settings.SMTPPasswordEncrypted) > 0, body.HasSMTPPassword)
+}
+
+// PUT /api/v1/admin/settings/email - enable and persist
+func TestAPISettingsEmailPut_EnableSuccess(t *testing.T) {
+	accessToken, _ := createAdminClientWithToken(t)
+
+	req := api.UpdateSettingsEmailRequest{
+		SMTPEnabled:    true,
+		SMTPHost:       "mailpit",
+		SMTPPort:       1025,
+		SMTPUsername:   "",
+		SMTPPassword:   "secret123",
+		SMTPEncryption: "starttls",
+		SMTPFromName:   "Goiabada QA",
+		SMTPFromEmail:  "qa@goiabada.dev",
+	}
+
+	url := config.GetAuthServer().BaseURL + "/api/v1/admin/settings/email"
+	resp := makeAPIRequest(t, "PUT", url, accessToken, req)
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, "application/json", resp.Header.Get("Content-Type"))
+
+	var body api.SettingsEmailResponse
+	err := json.NewDecoder(resp.Body).Decode(&body)
+	assert.NoError(t, err)
+
+	assert.Equal(t, true, body.SMTPEnabled)
+	assert.Equal(t, req.SMTPHost, body.SMTPHost)
+	assert.Equal(t, req.SMTPPort, body.SMTPPort)
+	assert.Equal(t, req.SMTPUsername, body.SMTPUsername)
+	assert.Equal(t, strings.ToLower(req.SMTPEncryption), strings.ToLower(body.SMTPEncryption))
+	assert.Equal(t, req.SMTPFromName, body.SMTPFromName)
+	assert.Equal(t, strings.ToLower(req.SMTPFromEmail), strings.ToLower(body.SMTPFromEmail))
+	assert.Equal(t, true, body.HasSMTPPassword)
+
+	// Verify DB persisted
+	settings, err2 := database.GetSettingsById(context.Background(), nil, 1)
+	assert.NoError(t, err2)
+	assert.True(t, settings.SMTPEnabled)
+	assert.Equal(t, req.SMTPHost, settings.SMTPHost)
+	assert.Equal(t, req.SMTPPort, settings.SMTPPort)
+	assert.Equal(t, req.SMTPUsername, settings.SMTPUsername)
+	assert.Equal(t, strings.ToLower(req.SMTPEncryption), strings.ToLower(settings.SMTPEncryption))
+	assert.Equal(t, req.SMTPFromName, settings.SMTPFromName)
+	assert.Equal(t, strings.ToLower(req.SMTPFromEmail), strings.ToLower(settings.SMTPFromEmail))
+	assert.Greater(t, len(settings.SMTPPasswordEncrypted), 0)
+}
+
+// PUT: disable should reset fields
+func TestAPISettingsEmailPut_DisableResetsFields(t *testing.T) {
+	accessToken, _ := createAdminClientWithToken(t)
+
+	// First enable with a password
+	pre := api.UpdateSettingsEmailRequest{
+		SMTPEnabled:    true,
+		SMTPHost:       "mailpit",
+		SMTPPort:       1025,
+		SMTPUsername:   "user",
+		SMTPPassword:   "p@ss",
+		SMTPEncryption: "none",
+		SMTPFromName:   "Goiabada",
+		SMTPFromEmail:  "noreply@goiabada.dev",
+	}
+	url := config.GetAuthServer().BaseURL + "/api/v1/admin/settings/email"
+	_ = makeAPIRequest(t, "PUT", url, accessToken, pre)
+
+	// Now disable
+	req := api.UpdateSettingsEmailRequest{SMTPEnabled: false}
+	resp := makeAPIRequest(t, "PUT", url, accessToken, req)
+	defer func() { _ = resp.Body.Close() }()
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+	// Verify DB reset
+	settings, err := database.GetSettingsById(context.Background(), nil, 1)
+	assert.NoError(t, err)
+	assert.False(t, settings.SMTPEnabled)
+	assert.Equal(t, "", settings.SMTPHost)
+	assert.Equal(t, 0, settings.SMTPPort)
+	assert.Equal(t, "none", strings.ToLower(settings.SMTPEncryption))
+	assert.Equal(t, "", settings.SMTPUsername)
+	assert.Nil(t, settings.SMTPPasswordEncrypted)
+	assert.Equal(t, "", settings.SMTPFromName)
+	assert.Equal(t, "", settings.SMTPFromEmail)
+}
+
+// PUT: validation errors
+func TestAPISettingsEmailPut_ValidationErrors(t *testing.T) {
+	accessToken, _ := createAdminClientWithToken(t)
+	url := config.GetAuthServer().BaseURL + "/api/v1/admin/settings/email"
+
+	// Missing host
+	resp1 := makeAPIRequest(t, "PUT", url, accessToken, api.UpdateSettingsEmailRequest{
+		SMTPEnabled:   true,
+		SMTPHost:      "",
+		SMTPPort:      1025,
+		SMTPFromEmail: "noreply@goiabada.dev",
+	})
+	defer func() { _ = resp1.Body.Close() }()
+	assert.Equal(t, http.StatusBadRequest, resp1.StatusCode)
+	var err1 api.ErrorResponse
+	_ = json.NewDecoder(resp1.Body).Decode(&err1)
+	assert.Equal(t, "SMTP host is required.", err1.ErrorDescription)
+
+	// Missing port
+	resp2 := makeAPIRequest(t, "PUT", url, accessToken, api.UpdateSettingsEmailRequest{
+		SMTPEnabled:   true,
+		SMTPHost:      "mailpit",
+		SMTPFromEmail: "noreply@goiabada.dev",
+	})
+	defer func() { _ = resp2.Body.Close() }()
+	assert.Equal(t, http.StatusBadRequest, resp2.StatusCode)
+	var err2 api.ErrorResponse
+	_ = json.NewDecoder(resp2.Body).Decode(&err2)
+	assert.Equal(t, "SMTP port is required.", err2.ErrorDescription)
+
+	// Port out of range
+	resp3 := makeAPIRequest(t, "PUT", url, accessToken, api.UpdateSettingsEmailRequest{
+		SMTPEnabled:   true,
+		SMTPHost:      "mailpit",
+		SMTPPort:      70000,
+		SMTPFromEmail: "noreply@goiabada.dev",
+	})
+	defer func() { _ = resp3.Body.Close() }()
+	assert.Equal(t, http.StatusBadRequest, resp3.StatusCode)
+	var err3 api.ErrorResponse
+	_ = json.NewDecoder(resp3.Body).Decode(&err3)
+	assert.Equal(t, "SMTP port must be between 1 and 65535.", err3.ErrorDescription)
+
+	// Host too long
+	resp4 := makeAPIRequest(t, "PUT", url, accessToken, api.UpdateSettingsEmailRequest{
+		SMTPEnabled:   true,
+		SMTPHost:      strings.Repeat("a", 121),
+		SMTPPort:      1025,
+		SMTPFromEmail: "noreply@goiabada.dev",
+	})
+	defer func() { _ = resp4.Body.Close() }()
+	assert.Equal(t, http.StatusBadRequest, resp4.StatusCode)
+	var err4 api.ErrorResponse
+	_ = json.NewDecoder(resp4.Body).Decode(&err4)
+	assert.Equal(t, "SMTP host must be less than 120 characters.", err4.ErrorDescription)
+
+	// Invalid encryption
+	resp5 := makeAPIRequest(t, "PUT", url, accessToken, api.UpdateSettingsEmailRequest{
+		SMTPEnabled:    true,
+		SMTPHost:       "mailpit",
+		SMTPPort:       1025,
+		SMTPFromEmail:  "noreply@goiabada.dev",
+		SMTPEncryption: "invalid",
+	})
+	defer func() { _ = resp5.Body.Close() }()
+	assert.Equal(t, http.StatusBadRequest, resp5.StatusCode)
+	var err5 api.ErrorResponse
+	_ = json.NewDecoder(resp5.Body).Decode(&err5)
+	assert.Equal(t, "Invalid SMTP encryption.", err5.ErrorDescription)
+
+	// Password too long
+	resp6 := makeAPIRequest(t, "PUT", url, accessToken, api.UpdateSettingsEmailRequest{
+		SMTPEnabled:    true,
+		SMTPHost:       "mailpit",
+		SMTPPort:       1025,
+		SMTPFromEmail:  "noreply@goiabada.dev",
+		SMTPEncryption: "none",
+		SMTPPassword:   strings.Repeat("p", 257),
+	})
+	defer func() { _ = resp6.Body.Close() }()
+	assert.Equal(t, http.StatusBadRequest, resp6.StatusCode)
+	var err6 api.ErrorResponse
+	_ = json.NewDecoder(resp6.Body).Decode(&err6)
+	assert.Equal(t, "VALIDATION_ERROR", err6.ErrorCode)
+	assert.Equal(t, "SMTP password must be at most 256 bytes.", err6.ErrorDescription)
+
+	// Oversized password against an unreachable host: the bound is checked before the
+	// dial, so the answer is the password error and arrives without the 3s connect wait.
+	resp7 := makeAPIRequest(t, "PUT", url, accessToken, api.UpdateSettingsEmailRequest{
+		SMTPEnabled:    true,
+		SMTPHost:       "127.0.0.1",
+		SMTPPort:       65534, // likely closed
+		SMTPFromEmail:  "noreply@goiabada.dev",
+		SMTPEncryption: "none",
+		SMTPPassword:   strings.Repeat("p", 257),
+	})
+	defer func() { _ = resp7.Body.Close() }()
+	assert.Equal(t, http.StatusBadRequest, resp7.StatusCode)
+	var err7 api.ErrorResponse
+	_ = json.NewDecoder(resp7.Body).Decode(&err7)
+	assert.Equal(t, "VALIDATION_ERROR", err7.ErrorCode)
+	assert.Equal(t, "SMTP password must be at most 256 bytes.", err7.ErrorDescription)
+}
+
+func TestAPISettingsEmailPut_PasswordAtBoundIsAccepted(t *testing.T) {
+	accessToken, _ := createAdminClientWithToken(t)
+	url := config.GetAuthServer().BaseURL + "/api/v1/admin/settings/email"
+
+	resp := makeAPIRequest(t, "PUT", url, accessToken, api.UpdateSettingsEmailRequest{
+		SMTPEnabled:    true,
+		SMTPHost:       "mailpit",
+		SMTPPort:       1025,
+		SMTPUsername:   "user",
+		SMTPPassword:   strings.Repeat("p", 256),
+		SMTPEncryption: "none",
+		SMTPFromEmail:  "noreply@goiabada.dev",
+	})
+	defer func() { _ = resp.Body.Close() }()
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+	var body api.SettingsEmailResponse
+	err := json.NewDecoder(resp.Body).Decode(&body)
+	assert.NoError(t, err)
+	assert.Equal(t, true, body.HasSMTPPassword)
+
+	settings, err := database.GetSettingsById(context.Background(), nil, 1)
+	assert.NoError(t, err)
+	stored, err := encryption.DecryptData(settings.SMTPPasswordEncrypted)
+	assert.NoError(t, err)
+	assert.Equal(t, strings.Repeat("p", 256), stored)
+}
+
+// PUT: TCP connectivity failure
+func TestAPISettingsEmailPut_TCPConnectionFailure(t *testing.T) {
+	accessToken, _ := createAdminClientWithToken(t)
+	url := config.GetAuthServer().BaseURL + "/api/v1/admin/settings/email"
+
+	req := api.UpdateSettingsEmailRequest{
+		SMTPEnabled:    true,
+		SMTPHost:       "127.0.0.1",
+		SMTPPort:       65534, // likely closed
+		SMTPFromEmail:  "noreply@goiabada.dev",
+		SMTPEncryption: "none",
+	}
+	resp := makeAPIRequest(t, "PUT", url, accessToken, req)
+	defer func() { _ = resp.Body.Close() }()
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+
+	var errBody api.ErrorResponse
+	_ = json.NewDecoder(resp.Body).Decode(&errBody)
+	assert.True(t, strings.HasPrefix(errBody.ErrorDescription, "Unable to connect to the SMTP server:"))
+}
+
+// PUT: the host is dialled, bounded and stored in one normalised form: surrounding space trimmed,
+// and one pair of brackets taken off an IPv6 literal. The sender uses the stored host on its own as
+// the TLS server name, where `[::1]` names nothing, and before #424 the bracketed form never got that
+// far: the dial refused it with "missing port in address".
+func TestAPISettingsEmailPut_HostIsStoredBare(t *testing.T) {
+	accessToken, _ := createAdminClientWithToken(t)
+	url := config.GetAuthServer().BaseURL + "/api/v1/admin/settings/email"
+
+	// The last row leaves a closed IPv6 port behind, and the tests after this one send mail
+	// through whatever the settings row says.
+	before, err := database.GetSettingsById(context.Background(), nil, 1)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, database.UpdateSettings(context.Background(), nil, before))
+	})
+
+	tests := []struct {
+		name string
+		host string
+		want string
+		ipv6 bool
+	}{
+		{name: "surrounding space", host: " mailpit ", want: "mailpit"},
+		{name: "IPv6 loopback", host: "::1", want: "::1", ipv6: true},
+		{name: "IPv6 loopback, bracketed", host: "[::1]", want: "::1", ipv6: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			port := 1025
+			if test.ipv6 {
+				testutil.SkipWithoutIPv6Loopback(t)
+				// The handler dials the host before it saves anything, and the server under test
+				// runs on this machine, so a listener here is what that dial reaches.
+				ln, err := net.Listen("tcp", "[::1]:0")
+				require.NoError(t, err)
+				t.Cleanup(func() { _ = ln.Close() })
+				go func() {
+					for {
+						conn, err := ln.Accept()
+						if err != nil {
+							return
+						}
+						_ = conn.Close()
+					}
+				}()
+				port = ln.Addr().(*net.TCPAddr).Port
+			}
+
+			resp := makeAPIRequest(t, "PUT", url, accessToken, api.UpdateSettingsEmailRequest{
+				SMTPEnabled:    true,
+				SMTPHost:       test.host,
+				SMTPPort:       port,
+				SMTPFromEmail:  "noreply@goiabada.dev",
+				SMTPEncryption: "none",
+			})
+			defer func() { _ = resp.Body.Close() }()
+			require.Equal(t, http.StatusOK, resp.StatusCode)
+
+			var body api.SettingsEmailResponse
+			require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
+			assert.Equal(t, test.want, body.SMTPHost)
+
+			settings, err := database.GetSettingsById(context.Background(), nil, 1)
+			require.NoError(t, err)
+			assert.Equal(t, test.want, settings.SMTPHost)
+		})
+	}
+}
+
+// PUT: password set and clear lifecycle
+func TestAPISettingsEmailPut_PasswordLifecycle(t *testing.T) {
+	accessToken, _ := createAdminClientWithToken(t)
+	url := config.GetAuthServer().BaseURL + "/api/v1/admin/settings/email"
+
+	// Set password
+	req1 := api.UpdateSettingsEmailRequest{
+		SMTPEnabled:    true,
+		SMTPHost:       "mailpit",
+		SMTPPort:       1025,
+		SMTPFromEmail:  "noreply@goiabada.dev",
+		SMTPEncryption: "none",
+		SMTPPassword:   "abc123",
+	}
+	resp1 := makeAPIRequest(t, "PUT", url, accessToken, req1)
+	defer func() { _ = resp1.Body.Close() }()
+	assert.Equal(t, http.StatusOK, resp1.StatusCode)
+	// GET should show has password true
+	respGet := makeAPIRequest(t, "GET", url, accessToken, nil)
+	defer func() { _ = respGet.Body.Close() }()
+	var body api.SettingsEmailResponse
+	_ = json.NewDecoder(respGet.Body).Decode(&body)
+	assert.Equal(t, true, body.HasSMTPPassword)
+
+	// Clear password (send empty)
+	req2 := api.UpdateSettingsEmailRequest{
+		SMTPEnabled:    true,
+		SMTPHost:       "mailpit",
+		SMTPPort:       1025,
+		SMTPFromEmail:  "noreply@goiabada.dev",
+		SMTPEncryption: "none",
+		SMTPPassword:   "",
+	}
+	resp2 := makeAPIRequest(t, "PUT", url, accessToken, req2)
+	defer func() { _ = resp2.Body.Close() }()
+	assert.Equal(t, http.StatusOK, resp2.StatusCode)
+
+	// DB should have password cleared
+	settings, err := database.GetSettingsById(context.Background(), nil, 1)
+	assert.NoError(t, err)
+	assert.Equal(t, 0, len(settings.SMTPPasswordEncrypted))
+
+	// GET should show has password false
+	respGet2 := makeAPIRequest(t, "GET", url, accessToken, nil)
+	defer func() { _ = respGet2.Body.Close() }()
+	var body2 api.SettingsEmailResponse
+	_ = json.NewDecoder(respGet2.Body).Decode(&body2)
+	assert.Equal(t, false, body2.HasSMTPPassword)
+}
+
+// POST /api/v1/admin/settings/email/send-test
+func TestAPISettingsEmailSendTest_Success(t *testing.T) {
+	accessToken, _ := createAdminClientWithToken(t)
+
+	// Ensure SMTP is enabled and pointing to mailpit
+	_ = makeAPIRequest(t, "PUT", config.GetAuthServer().BaseURL+"/api/v1/admin/settings/email", accessToken, api.UpdateSettingsEmailRequest{
+		SMTPEnabled:    true,
+		SMTPHost:       "mailpit",
+		SMTPPort:       1025,
+		SMTPFromEmail:  "noreply@goiabada.dev",
+		SMTPEncryption: "none",
+	})
+
+	url := config.GetAuthServer().BaseURL + "/api/v1/admin/settings/email/send-test"
+	resp := makeAPIRequest(t, "POST", url, accessToken, api.SendTestEmailRequest{To: "someone@example.com"})
+	defer func() { _ = resp.Body.Close() }()
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, "application/json", resp.Header.Get("Content-Type"))
+
+	var okBody struct {
+		Success bool `json:"success"`
+	}
+	err := json.NewDecoder(resp.Body).Decode(&okBody)
+	assert.NoError(t, err)
+	assert.True(t, okBody.Success)
+}
+
+func TestAPISettingsEmailSendTest_SMTPDisabled(t *testing.T) {
+	accessToken, _ := createAdminClientWithToken(t)
+
+	// Disable SMTP
+	_ = makeAPIRequest(t, "PUT", config.GetAuthServer().BaseURL+"/api/v1/admin/settings/email", accessToken, api.UpdateSettingsEmailRequest{SMTPEnabled: false})
+
+	url := config.GetAuthServer().BaseURL + "/api/v1/admin/settings/email/send-test"
+	resp := makeAPIRequest(t, "POST", url, accessToken, api.SendTestEmailRequest{To: "someone@example.com"})
+	defer func() { _ = resp.Body.Close() }()
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	var errBody api.ErrorResponse
+	_ = json.NewDecoder(resp.Body).Decode(&errBody)
+	assert.Equal(t, "SMTP is not enabled", errBody.ErrorDescription)
+}
+
+// Unauthorized scenarios
+func TestAPISettingsEmail_Unauthorized(t *testing.T) {
+	url := config.GetAuthServer().BaseURL + "/api/v1/admin/settings/email"
+	httpClient := createHttpClient(t)
+
+	// No token - GET
+	req, _ := http.NewRequest("GET", url, nil)
+	resp, err := httpClient.Do(req)
+	assert.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	assert.Contains(t, string(bodyBytes), "Access token required.")
+
+	// No token - PUT
+	req2, _ := http.NewRequest("PUT", url, nil)
+	resp2, err := httpClient.Do(req2)
+	assert.NoError(t, err)
+	defer func() { _ = resp2.Body.Close() }()
+	assert.Equal(t, http.StatusUnauthorized, resp2.StatusCode)
+}
+
+// TestAPISettingsEmailPut_AngleBracketsRejected pins the from-name reject. mail.Address.String
+// quotes the name, so this is a consistency choice rather than a header-injection fix: every
+// plain-text field this API writes now applies the same rule (#275).
+func TestAPISettingsEmailPut_AngleBracketsRejected(t *testing.T) {
+	accessToken, _ := createAdminClientWithToken(t)
+	url := config.GetAuthServer().BaseURL + "/api/v1/admin/settings/email"
+
+	before, err := database.GetSettingsById(context.Background(), nil, 1)
+	assert.NoError(t, err)
+
+	resp := makeAPIRequest(t, "PUT", url, accessToken, api.UpdateSettingsEmailRequest{
+		SMTPEnabled:    true,
+		SMTPHost:       "mailpit",
+		SMTPPort:       1025,
+		SMTPEncryption: "starttls",
+		SMTPFromName:   "Acme <Support>",
+		SMTPFromEmail:  "qa@goiabada.dev",
+	})
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	var errResp api.ErrorResponse
+	_ = json.NewDecoder(resp.Body).Decode(&errResp)
+	assert.Equal(t, "validator.settings.smtp_from_name_angle_brackets", errResp.ErrorCode)
+
+	stored, err := database.GetSettingsById(context.Background(), nil, 1)
+	assert.NoError(t, err)
+	assert.Equal(t, before.SMTPFromName, stored.SMTPFromName)
+}
+
+// TestAPISettingsEmailPut_AmpersandsAndQuotesStoredVerbatim is the accepted twin.
+func TestAPISettingsEmailPut_AmpersandsAndQuotesStoredVerbatim(t *testing.T) {
+	accessToken, _ := createAdminClientWithToken(t)
+	url := config.GetAuthServer().BaseURL + "/api/v1/admin/settings/email"
+
+	resp := makeAPIRequest(t, "PUT", url, accessToken, api.UpdateSettingsEmailRequest{
+		SMTPEnabled:    true,
+		SMTPHost:       "mailpit",
+		SMTPPort:       1025,
+		SMTPPassword:   "secret123",
+		SMTPEncryption: "starttls",
+		SMTPFromName:   `  Tom & Jerry "QA"  `,
+		SMTPFromEmail:  "qa@goiabada.dev",
+	})
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+	var body api.SettingsEmailResponse
+	err := json.NewDecoder(resp.Body).Decode(&body)
+	assert.NoError(t, err)
+	assert.Equal(t, `Tom & Jerry "QA"`, body.SMTPFromName)
+
+	stored, err := database.GetSettingsById(context.Background(), nil, 1)
+	assert.NoError(t, err)
+	assert.Equal(t, `Tom & Jerry "QA"`, stored.SMTPFromName)
+}

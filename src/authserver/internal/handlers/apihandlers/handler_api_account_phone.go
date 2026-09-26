@@ -1,0 +1,120 @@
+package apihandlers
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"net/http"
+	"strings"
+
+	"github.com/leodip/goiabada/authserver/internal/accountvalidation"
+	"github.com/leodip/goiabada/authserver/internal/apimapping"
+	"github.com/leodip/goiabada/authserver/internal/audit"
+	"github.com/leodip/goiabada/authserver/internal/middleware"
+	"github.com/leodip/goiabada/authserver/internal/models"
+	"github.com/leodip/goiabada/authserver/internal/phonecountries"
+	"github.com/leodip/goiabada/core/api"
+)
+
+// accountPhoneDatabase is what the account phone endpoints need: the caller's own user row.
+type accountPhoneDatabase interface {
+	GetUserBySubject(ctx context.Context, tx *sql.Tx, subject string) (*models.User, error)
+	UpdateUser(ctx context.Context, tx *sql.Tx, user *models.User) error
+}
+
+// HandleAPIAccountPhonePut - PUT /api/v1/account/phone
+func HandleAPIAccountPhonePut(
+	database accountPhoneDatabase,
+	phoneValidator *accountvalidation.PhoneValidator,
+	auditLogger AuditLogger,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Auth and scope are enforced by middleware; extract validated token
+		jwtToken, ok := middleware.GetValidatedToken(r)
+		if !ok {
+			writeJSONError(w, "Access token required", "ACCESS_TOKEN_REQUIRED", http.StatusUnauthorized)
+			return
+		}
+
+		subject := jwtToken.GetStringClaim("sub")
+		if strings.TrimSpace(subject) == "" {
+			writeJSONError(w, "Invalid token subject", "INVALID_SUBJECT", http.StatusUnauthorized)
+			return
+		}
+
+		// Parse request body
+		var req api.UpdateAccountPhoneRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSONError(w, "Invalid request body", "INVALID_REQUEST_BODY", http.StatusBadRequest)
+			return
+		}
+
+		// Load current user
+		user, err := database.GetUserBySubject(r.Context(), nil, subject)
+		if err != nil {
+			writeInternalServerError(w, r, err)
+			return
+		}
+		if user == nil {
+			writeJSONError(w, "User not found", "NOT_FOUND", http.StatusNotFound)
+			return
+		}
+
+		// Validate phone input
+		input := &accountvalidation.ValidatePhoneInput{
+			PhoneCountryUniqueId: req.PhoneCountryUniqueId,
+			PhoneNumber:          strings.TrimSpace(req.PhoneNumber),
+		}
+		if err := phoneValidator.ValidatePhone(input); err != nil {
+			writeValidationError(w, r, err)
+			return
+		}
+
+		// Resolve phone country if provided
+		var callingCode string
+		if len(input.PhoneCountryUniqueId) > 0 {
+			pcs := phonecountries.Get()
+			found := false
+			for _, c := range pcs {
+				if c.UniqueId == input.PhoneCountryUniqueId {
+					callingCode = c.CallingCode
+					found = true
+					break
+				}
+			}
+			if !found {
+				writeJSONError(w, "Phone country is invalid: "+input.PhoneCountryUniqueId, "VALIDATION_ERROR", http.StatusBadRequest)
+				return
+			}
+		}
+
+		// Apply updates; always mark phone as unverified on change
+		if strings.TrimSpace(input.PhoneNumber) == "" {
+			user.PhoneNumberCountryUniqueId = ""
+			user.PhoneNumberCountryCallingCode = ""
+			user.PhoneNumber = ""
+			user.PhoneNumberVerified = false
+		} else {
+			user.PhoneNumberCountryUniqueId = input.PhoneCountryUniqueId
+			user.PhoneNumberCountryCallingCode = callingCode
+			user.PhoneNumber = input.PhoneNumber
+			user.PhoneNumberVerified = false
+		}
+
+		// Persist
+		if err := database.UpdateUser(r.Context(), nil, user); err != nil {
+			writeInternalServerError(w, r, err)
+			return
+		}
+
+		// Audit (self-service)
+		auditLogger.Log(r.Context(), audit.AuditUpdatedOwnPhone, map[string]interface{}{
+			"userId":       user.Id,
+			"loggedInUser": subject,
+		})
+
+		// Response
+		resp := api.UpdateUserResponse{User: *apimapping.ToUserResponse(user)}
+		writeJSON(w, r, http.StatusOK, resp)
+	}
+}

@@ -1,0 +1,118 @@
+package adminuserhandlers
+
+import (
+	"context"
+	"net/http"
+	"strconv"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/leodip/goiabada/adminconsole/internal/constants"
+	"github.com/leodip/goiabada/adminconsole/internal/handlers"
+	"github.com/leodip/goiabada/adminconsole/internal/oauthclient"
+	"github.com/leodip/goiabada/core/api"
+	"github.com/leodip/goiabada/core/errs"
+)
+
+// userDeleteAPI is what the user delete page needs: the user, the groups it warns about, and the
+// delete.
+type userDeleteAPI interface {
+	DeleteUser(ctx context.Context, accessToken string, userId int64) error
+	GetUserById(ctx context.Context, accessToken string, userId int64) (*api.UserResponse, error)
+	GetUserGroups(ctx context.Context, accessToken string, userId int64) (*api.UserResponse, []api.GroupResponse, error)
+}
+
+func HandleAdminUserDeleteGet(
+	httpHelper handlers.HttpHelper,
+	apiClient userDeleteAPI,
+) http.HandlerFunc {
+
+	return func(w http.ResponseWriter, r *http.Request) {
+
+		idStr := chi.URLParam(r, "userId")
+		if len(idStr) == 0 {
+			httpHelper.NotFound(w, r)
+			return
+		}
+
+		id, err := strconv.ParseInt(idStr, 10, 64)
+		if err != nil {
+			httpHelper.NotFound(w, r)
+			return
+		}
+		// Get JWT info from context to extract access token
+		jwtInfo, ok := r.Context().Value(constants.ContextKeyJwtInfo).(oauthclient.JwtInfo)
+		if !ok {
+			httpHelper.InternalServerError(w, r, errs.New("no JWT info found in context"))
+			return
+		}
+
+		user, err := apiClient.GetUserById(r.Context(), jwtInfo.TokenResponse.AccessToken, id)
+		if err != nil {
+			handlers.HandleAPIError(httpHelper, w, r, err)
+			return
+		}
+		if user == nil {
+			httpHelper.NotFound(w, r)
+			return
+		}
+
+		// The memberships are loaded rather than read off the user, because GET
+		// /api/v1/admin/users/{id} serves none: the page listed "none" for every user,
+		// whatever their real membership, and this is a confirmation screen for a
+		// destructive action, so under-reporting what it discards is the whole defect (#350).
+		_, groups, err := apiClient.GetUserGroups(r.Context(), jwtInfo.TokenResponse.AccessToken, id)
+		if err != nil {
+			handlers.HandleAPIError(httpHelper, w, r, err)
+			return
+		}
+
+		bind := map[string]interface{}{
+			"user":         user,
+			"userFullName": handlers.UserFullName(user),
+			"groups":       groups,
+			"page":         r.URL.Query().Get("page"),
+			"query":        r.URL.Query().Get("query"),
+		}
+
+		err = httpHelper.RenderTemplate(w, r, "/layouts/menu_layout.html", "/admin_users_delete.html", bind)
+		if err != nil {
+			httpHelper.InternalServerError(w, r, err)
+			return
+		}
+	}
+}
+
+func HandleAdminUserDeletePost(
+	httpHelper handlers.HttpHelper,
+	apiClient userDeleteAPI,
+) http.HandlerFunc {
+
+	return func(w http.ResponseWriter, r *http.Request) {
+
+		idStr := chi.URLParam(r, "userId")
+		if len(idStr) == 0 {
+			httpHelper.NotFound(w, r)
+			return
+		}
+
+		id, err := strconv.ParseInt(idStr, 10, 64)
+		if err != nil {
+			httpHelper.NotFound(w, r)
+			return
+		}
+		// Get JWT info from context to extract access token
+		jwtInfo, ok := r.Context().Value(constants.ContextKeyJwtInfo).(oauthclient.JwtInfo)
+		if !ok {
+			httpHelper.InternalServerError(w, r, errs.New("no JWT info found in context"))
+			return
+		}
+
+		err = apiClient.DeleteUser(r.Context(), jwtInfo.TokenResponse.AccessToken, id)
+		if err != nil {
+			handlers.HandleAPIError(httpHelper, w, r, err)
+			return
+		}
+
+		http.Redirect(w, r, withListPosition("/admin/users/", r), http.StatusFound)
+	}
+}

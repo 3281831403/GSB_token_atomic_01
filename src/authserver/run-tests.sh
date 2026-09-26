@@ -1,0 +1,746 @@
+#!/bin/bash
+#
+# run-tests.sh - Run Goiabada test suites with optional filtering.
+#
+# Usage:
+#   ./run-tests.sh [options]
+#
+# Options:
+#   -t, --type   <type>     Test category to run. One of:
+#                             internal      - authserver internal/* and web unit tests
+#                             core          - core module tests
+#                             adminconsole  - adminconsole module tests
+#                             data          - data-layer tests (per DB)
+#                             integration   - end-to-end integration tests (per DB)
+#                             lint          - golangci-lint and unparam over the four
+#                                             modules, the commands CI's Lint job runs
+#                                             per module, plus
+#                                             checks that the generated Tailwind CSS, the
+#                                             mocks and the core symbol ownership table
+#                                             are committed
+#                             modules       - shorthand for internal+core+adminconsole
+#                             all           - everything (default), lint included
+#   -d, --db     <db>       Database to use for `data` and `integration` tests.
+#                           One of: mysql | postgres | mssql | sqlite | all (default: all)
+#   -r, --run    <pattern>  go test -run regex passed to data/integration runs
+#                           (e.g. TestTemp_AccessTokenHasSidClaim or 'TestToken_.*Reuse')
+#   -n, --no-build          Skip the build step at the top of the run. Useful in
+#                           CI, where one job invokes this script several times
+#                           and only the first needs to build. Integration tests
+#                           require a prior build, and this refuses to run them
+#                           without one.
+#   -R, --race              Run the module tiers (internal, core, adminconsole)
+#                           under Go's race detector. Needs a C toolchain, since
+#                           `go test -race` requires cgo: the dev container ships
+#                           gcc for this, and CI's golang image has it. Refused
+#                           together with --type data or --type integration, which
+#                           the flag does not cover (see Notes).
+#   -h, --help              Show this help and exit.
+#
+# Examples:
+#   # Full suite, all DBs (the original behavior)
+#   ./run-tests.sh
+#
+#   # Only integration tests, only sqlite
+#   ./run-tests.sh --type integration --db sqlite
+#
+#   # Focus on a single integration test, sqlite only (fastest feedback loop)
+#   ./run-tests.sh --type integration --db sqlite \
+#                  --run TestTemp_AccessTokenHasSidClaim
+#
+#   # Run a name pattern across every DB
+#   ./run-tests.sh --type integration --run 'TestToken_AuthCode_CodeReuse_'
+#
+#   # Just the internal authserver unit tests
+#   ./run-tests.sh --type internal
+#
+#   # The three module tiers under the race detector, as CI's Unit / race job runs them
+#   ./run-tests.sh --type modules --race
+#
+#   # golangci-lint and unparam alone, where sloglint holds the logging convention (#320)
+#   ./run-tests.sh --type lint
+#
+# Notes:
+#   * --run only affects `data` and `integration` runs (where go test is invoked
+#     against ./tests/<type>/...). It is ignored for module-level test runs.
+#   * `integration` requires a running authserver; this script starts/stops it
+#     automatically per DB.
+#   * --race covers the module tiers only. The integration tier exercises the
+#     binary build.sh produced, which the detector cannot be attached to from
+#     here, and the data tier would need it per database; neither is wired up.
+#     Under --race each module leg runs with CGO_ENABLED=1 for itself, so the
+#     dev container's pinned CGO_ENABLED=0 stays in force for everything else.
+#   * `lint` needs golangci-lint and tailwindcss on PATH at the versions
+#     src/authserver/versions.yaml
+#     pins, which the dev container installs. Without them the tier fails rather
+#     than skipping: a tier that reports green having run nothing is the failure
+#     this script's comments keep returning to. Refused with --race, which it
+#     does not cover.
+#   * Rate limiter is disabled via GOIABADA_AUTHSERVER_RATELIMITER_ENABLED=false.
+#   * Per-phase output is also written to $LOG_DIR (printed at startup). On
+#     failure the log path plus a FAIL/panic summary is printed at the bottom
+#     so you don't have to scroll up through thousands of PASS lines.
+#   * Under GitHub Actions (detected via $GITHUB_ACTIONS) each phase is wrapped
+#     in a collapsible ::group::, failed tests are emitted as ::error::
+#     annotations so they appear at the top of the job page without opening a
+#     log, and a per-phase result table is appended to the job summary. All of
+#     that is inert outside CI: local output is unchanged.
+
+set -uo pipefail
+
+# ---- argument parsing -------------------------------------------------------
+TYPE="all"
+DB="all"
+RUN_PATTERN=""
+BUILD=true
+RACE=false
+
+# Print the header comment block by deriving its extent, rather than with a
+# hardcoded line range. The previous '2,46p' had already gone stale: adding
+# anything to the header shifts the boundary, and the help output was silently
+# truncating the Notes section mid-sentence. This stops at the first line that
+# is not a comment, so the header can grow freely.
+print_help() {
+    awk 'NR == 1 { next } /^#/ { print; next } { exit }' "$0"
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -t|--type)
+            TYPE="${2:-}"; shift 2 ;;
+        -d|--db)
+            DB="${2:-}"; shift 2 ;;
+        -r|--run)
+            RUN_PATTERN="${2:-}"; shift 2 ;;
+        -n|--no-build)
+            BUILD=false; shift ;;
+        -R|--race)
+            RACE=true; shift ;;
+        -h|--help)
+            print_help; exit 0 ;;
+        *)
+            echo "Unknown argument: $1"
+            echo "Run './run-tests.sh --help' for usage."
+            exit 2 ;;
+    esac
+done
+
+# Validate --type
+case "$TYPE" in
+    internal|core|adminconsole|data|integration|lint|modules|all) ;;
+    *)
+        echo "Invalid --type '$TYPE'. Run './run-tests.sh --help'."
+        exit 2 ;;
+esac
+
+# Validate --db and expand 'all'
+case "$DB" in
+    mysql|postgres|mssql|sqlite) databases=("$DB") ;;
+    all) databases=("mysql" "postgres" "mssql" "sqlite") ;;
+    *)
+        echo "Invalid --db '$DB'. Run './run-tests.sh --help'."
+        exit 2 ;;
+esac
+
+# --race applies to the module legs, so a run with none of them is a mistake
+# rather than a no-op to let through silently.
+if [ "$RACE" = true ]; then
+    case "$TYPE" in
+        data|integration|lint)
+            echo "--race covers the module tiers only; it does nothing for --type '$TYPE'."
+            exit 2 ;;
+    esac
+fi
+
+# The go test invocation the three module legs share. Under --race the
+# detector is added and CGO_ENABLED is set for that command alone, because
+# -race needs cgo and the dev container pins CGO_ENABLED=0 for everything else.
+if [ "$RACE" = true ]; then
+    module_go_test=(env CGO_ENABLED=1 go test -race -v -count=1)
+    race_label=" (race)"
+else
+    module_go_test=(go test -v -count=1)
+    race_label=""
+fi
+
+# Helpers to decide whether a section should run for the chosen --type.
+should_run_internal()     { [ "$TYPE" = "all" ] || [ "$TYPE" = "modules" ] || [ "$TYPE" = "internal" ]; }
+should_run_core()         { [ "$TYPE" = "all" ] || [ "$TYPE" = "modules" ] || [ "$TYPE" = "core" ]; }
+should_run_adminconsole() { [ "$TYPE" = "all" ] || [ "$TYPE" = "modules" ] || [ "$TYPE" = "adminconsole" ]; }
+should_run_data()         { [ "$TYPE" = "all" ] || [ "$TYPE" = "data" ]; }
+should_run_integration()  { [ "$TYPE" = "all" ] || [ "$TYPE" = "integration" ]; }
+should_run_lint()         { [ "$TYPE" = "all" ] || [ "$TYPE" = "lint" ]; }
+
+# ---- GitHub Actions output helpers ------------------------------------------
+# Everything CI-specific goes through these. $GITHUB_ACTIONS is set only by the
+# Actions runner, so on a workstation every one of them is a no-op and the
+# script's output is byte-for-byte what it was before.
+if [ -n "${GITHUB_ACTIONS:-}" ]; then
+    gha_group()    { echo "::group::$1"; }
+    gha_endgroup() { echo "::endgroup::"; }
+    gha_error()    { echo "::error title=$1::$2"; }
+    # GITHUB_STEP_SUMMARY is always set by the runner, but default it anyway so
+    # that `set -u` cannot turn a missing variable into a failed test run.
+    gha_summary()  { echo "$1" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"; }
+else
+    gha_group()    { :; }
+    gha_endgroup() { :; }
+    gha_error()    { :; }
+    gha_summary()  { :; }
+fi
+
+# Render seconds as 48s / 1m52s, matching how the Actions UI shows step times.
+fmt_duration() {
+    local s=$1
+    if [ "$s" -ge 60 ]; then
+        printf '%dm%02ds' $((s / 60)) $((s % 60))
+    else
+        printf '%ds' "$s"
+    fi
+}
+
+# One row per phase in the job summary: tier, database, result, duration.
+# GitHub scopes step summaries per job, not per run, so this produces a table
+# for whichever phases this particular invocation ran.
+summary_header_written=false
+gha_summary_row() {
+    if [ "$summary_header_written" = false ]; then
+        gha_summary "| Tier | DB | Result | Duration |"
+        gha_summary "|-------------|----------|--------|----------|"
+        summary_header_written=true
+    fi
+    gha_summary "| $1 | $2 | $3 | $4 |"
+}
+
+# ---- output capture ---------------------------------------------------------
+# Every phase writes its full output here so failures are inspectable without
+# scrolling up through tens of thousands of PASS lines.
+LOG_DIR="/tmp/goiabada-tests-$(date +%Y%m%d-%H%M%S)-$$"
+mkdir -p "$LOG_DIR"
+
+echo "==> type=$TYPE db=$DB run='${RUN_PATTERN:-<all>}' race=$RACE"
+echo "==> log dir: $LOG_DIR"
+
+# fail_with prints the phase that failed, the log path, every failure
+# block (the lines around each `--- FAIL` and `panic:`), and a list of
+# all failed test names — then exits 1. Output goes straight to the
+# terminal so it can be selected and copied; no `less` paging.
+# Args: <phase label> <log file>
+fail_with() {
+    local label="$1"
+    local log="$2"
+
+    # Close whatever phase group is open so the failure report below renders
+    # outside the collapsed section rather than hidden inside it.
+    gha_endgroup
+
+    # One annotation per failed test. These surface in the annotation list at
+    # the top of the job page, which is the difference between "a job went red"
+    # and "these four tests failed" without opening a log at all. Inert locally.
+    while IFS= read -r t; do
+        [ -n "$t" ] && gha_error "$t" "$label — see $log"
+    done < <(grep -oE '^(    )*--- FAIL: [^ ]+' "$log" 2>/dev/null | sed 's/.*--- FAIL: //')
+
+    echo
+    echo "=========================================================="
+    echo "FAILED: $label"
+    echo "Log file: $log"
+    echo "=========================================================="
+    echo
+    echo "---- Failed tests --------------------------------------"
+    # The single-line list of every failed test name.
+    grep -E '^(    )*--- FAIL:' "$log" | sed 's/^/  /' || true
+    echo
+    echo "---- Failure context (40 lines before each --- FAIL) ---"
+    # Each Go test's assertion / mock-mismatch diagnostic prints BEFORE
+    # the `--- FAIL` summary line. Capture that window so the actual
+    # error text is visible inline.
+    grep -B40 -A2 -E '^(    )*--- FAIL:' "$log" || true
+    echo
+    echo "---- Panics --------------------------------------------"
+    grep -B5 -A30 'panic:' "$log" || true
+    echo
+    echo "---- Final package status ------------------------------"
+    grep -E '^(FAIL|ok)\b' "$log" | tail -20 || true
+    echo
+    echo "=========================================================="
+    echo "Full log: $log"
+    echo "(open with: cat $log    or    code $log)"
+    echo "=========================================================="
+    exit 1
+}
+
+# ---- build ------------------------------------------------------------------
+# start_server_and_wait execs ./tmp/goiabada-authserver, so --no-build combined
+# with integration tests fails obscurely (and late) unless there is already a
+# binary on disk. Refuse up front instead.
+if [ "$BUILD" = false ] && should_run_integration && [ ! -x ./tmp/goiabada-authserver ]; then
+    echo "--no-build requires a prior build: ./tmp/goiabada-authserver not found"
+    exit 2
+fi
+
+if [ "$BUILD" = true ]; then
+    build_log="$LOG_DIR/00-build.log"
+    echo "Building the project before running tests... (log: $build_log)"
+    build_start=$SECONDS
+    if ! ./build.sh 2>&1 | tee "$build_log"; then
+        gha_summary_row "Build" "-" "FAIL" "$(fmt_duration $((SECONDS - build_start)))"
+        fail_with "Build" "$build_log"
+    fi
+    gha_summary_row "Build" "-" "pass" "$(fmt_duration $((SECONDS - build_start)))"
+fi
+
+# Remove the temporary SQLite databases along with their sidecar files.
+# WAL mode leaves `<db>-wal` and `<db>-shm` next to the database, and neither is
+# matched by a `*.db` glob. Left behind, a stale WAL with no database beside it
+# makes the next run fail to open the file ("attempt to write a readonly
+# database"), so the trailing wildcard here is load-bearing.
+remove_sqlite_files() {
+    rm -f /tmp/goiabada*.db*
+}
+
+# Cleanup function to kill processes on exit
+cleanup() {
+    echo "Cleaning up processes..."
+    kill_processes_on_ports
+    echo "Cleaning up temporary SQLite databases..."
+    remove_sqlite_files
+}
+
+# Set trap to cleanup on script exit (normal or error)
+trap cleanup EXIT
+
+# Run go test for the given test sub-directory (data|integration).
+# Honors $RUN_PATTERN when set so you can target a single test by name.
+run_tests() {
+    local test_type=$1
+    local args=(-v -count=1 -p 1)
+    if [ -n "$RUN_PATTERN" ]; then
+        args+=(-run "$RUN_PATTERN")
+        echo "Running $test_type tests (filter: -run '$RUN_PATTERN')..."
+    else
+        echo "Running $test_type tests..."
+    fi
+    local log="$LOG_DIR/${test_type}-${GOIABADA_DB_TYPE:-unknown}.log"
+    echo "Log: $log"
+    local db="${GOIABADA_DB_TYPE:-unknown}"
+    # Spelled out rather than using ${test_type^}, which needs bash 4+; nothing
+    # else in this script does.
+    local tier
+    case "$test_type" in
+        data)        tier="Data" ;;
+        integration) tier="Integration" ;;
+        *)           tier="$test_type" ;;
+    esac
+    local start=$SECONDS
+    gha_group "$tier tests ($db)"
+    if ! go test "${args[@]}" "./tests/$test_type/..." 2>&1 | tee "$log"; then
+        gha_summary_row "$tier" "$db" "FAIL" "$(fmt_duration $((SECONDS - start)))"
+        fail_with "$test_type tests ($db)" "$log"
+    fi
+    gha_endgroup
+    gha_summary_row "$tier" "$db" "pass" "$(fmt_duration $((SECONDS - start)))"
+}
+
+# Function to start server and wait for it to be ready
+start_server_and_wait() {
+    # Start server and capture PID
+    ./tmp/goiabada-authserver &
+    server_pid=$!
+    echo "Started server with PID: $server_pid"
+
+    echo "Waiting for the server to start..."
+    env -0 | sort -z | tr '\0' '\n'
+    counter=0
+    while true; do
+        # Check if the server process is still running
+        if ! kill -0 $server_pid 2>/dev/null; then
+            echo "Server process died unexpectedly. Checking for port binding issues..."
+            # Kill any processes that might be holding the ports
+            kill_processes_on_ports
+            echo "Retrying server start..."
+            ./tmp/goiabada-authserver &
+            server_pid=$!
+            echo "Restarted server with PID: $server_pid"
+        fi
+
+        response=$(curl --write-out '%{http_code}' --silent --output /dev/null "${GOIABADA_AUTHSERVER_BASEURL}/health")
+        if [ "$response" -eq 200 ]; then
+            echo "Server is up and running"
+            break
+        else
+            echo "Server is not ready yet. Retrying..."
+            sleep 1
+            counter=$((counter+1))
+            if [ $counter -ge 40 ]; then
+                echo "Server did not start within 40 seconds. Exiting..."
+                exit 1
+            fi
+        fi
+    done
+}
+
+# Function to stop the server
+stop_server() {
+    echo "Tests finished. Killing the server..."
+    # Kill processes will be handled by the EXIT trap, but we can call it here for immediate cleanup
+    kill_processes_on_ports
+}
+
+# Function to kill processes on specified ports
+kill_processes_on_ports() {
+    local ports=("19090" "19091")
+
+    for port in "${ports[@]}"; do
+        echo "Checking for processes on port $port..."
+        pids=$(netstat -tulnp 2>/dev/null | grep ":$port " | awk '{print $7}' | cut -d'/' -f1 | grep -v '^-$' | sort -u)
+
+        if [ -n "$pids" ]; then
+            echo "Found processes listening on port $port: $pids"
+            for pid in $pids; do
+                if [ "$pid" != "-" ] && [ -n "$pid" ]; then
+                    echo "Killing process $pid on port $port"
+                    kill -9 "$pid" 2>/dev/null || true
+                fi
+            done
+        else
+            echo "No processes found on port $port"
+        fi
+    done
+
+    # Wait a moment for processes to be killed
+    sleep 2
+
+    # Verify ports are free
+    for port in "${ports[@]}"; do
+        if netstat -tulnp 2>/dev/null | grep -q ":$port "; then
+            echo "Warning: Port $port is still in use after cleanup attempt"
+        else
+            echo "Port $port is now free"
+        fi
+    done
+}
+
+# Function to configure database environment
+configure_database() {
+    local db_type=$1
+    local is_data_test=$2
+    echo "Configuring for database: $db_type"
+
+    # Set the database name suffix based on test type
+    local db_name_suffix="integration"
+    if [ "$is_data_test" = true ]; then
+        db_name_suffix="data"
+    fi
+
+    case $db_type in
+        "mysql")
+            export GOIABADA_DB_TYPE=mysql
+            export GOIABADA_DB_USERNAME=root
+            export GOIABADA_DB_PASSWORD=mySqlPass123
+            export GOIABADA_DB_HOST=mysql-server
+            export GOIABADA_DB_PORT=13306
+            export GOIABADA_DB_NAME="goiabada_${db_name_suffix}"
+            export GOIABADA_DB_DSN=""
+            ;;
+        "postgres")
+            export GOIABADA_DB_TYPE=postgres
+            export GOIABADA_DB_USERNAME=postgres
+            export GOIABADA_DB_PASSWORD=myPostgresPass123
+            export GOIABADA_DB_HOST=postgres-server
+            export GOIABADA_DB_PORT=15432
+            export GOIABADA_DB_NAME="goiabada_${db_name_suffix}"
+            export GOIABADA_DB_DSN=""
+            ;;
+        "mssql")
+            export GOIABADA_DB_TYPE=mssql
+            export GOIABADA_DB_USERNAME=sa
+            export GOIABADA_DB_PASSWORD=YourStr0ngPassw0rd!
+            export GOIABADA_DB_HOST=mssql-server
+            export GOIABADA_DB_PORT=11433
+            export GOIABADA_DB_NAME="goiabada_${db_name_suffix}"
+            export GOIABADA_DB_DSN=""
+            ;;
+        "sqlite")
+            export GOIABADA_DB_TYPE=sqlite
+            export GOIABADA_DB_USERNAME=""
+            export GOIABADA_DB_PASSWORD=""
+            export GOIABADA_DB_HOST=""
+            export GOIABADA_DB_PORT=""
+            export GOIABADA_DB_NAME=""
+            export GOIABADA_DB_DSN="/tmp/goiabada_${db_name_suffix}.db"
+            ;;
+        *)
+            echo "Unsupported database type: $db_type"
+            exit 1
+            ;;
+    esac
+
+    # Disable rate limiter for tests
+    export GOIABADA_AUTHSERVER_RATELIMITER_ENABLED=false
+
+    # Data-at-rest encryption key (issue #83). Required by the auth server and the
+    # data/integration test harnesses. Honors the value from the devcontainer env
+    # if present, otherwise uses a fixed test key so existing containers work
+    # without a rebuild.
+    export GOIABADA_AES_ENCRYPTION_KEY="${GOIABADA_AES_ENCRYPTION_KEY:-00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff}"
+}
+
+# ---- module test runs (no DB matrix) ----------------------------------------
+# -count=1 defeats Go's test result cache, matching what run_tests already does
+# for the data and integration tiers. It is not optional here: emaildelivery's
+# TestSendEmail talks to a real SMTP server at mailpit:1025, and Go's cache
+# keys on source and flags but has no notion of whether a network service is
+# reachable. Without this, an earlier successful run makes `go test -v ./...`
+# report `ok ... (cached)` and exit 0 even when mailpit is gone -- so the tier
+# reports green having executed nothing. Verified: the same invocation exits 0
+# with 29 cached packages when isolated, and 1 once caching is defeated.
+
+# ---- lint -------------------------------------------------------------------
+# The exact command CI's Lint job runs per module, so local and CI cannot
+# disagree on what lint-clean means. It exists here because sloglint, enabled
+# in .golangci.yml, is now where most of the logging convention is held (#320
+# decision 12, amended): before this tier that convention was a Go test every
+# module leg ran, and moving it into golangci-lint would otherwise have made it
+# CI-only, unlike every other guard in the tree. First among the tiers because
+# it is the cheapest and the one a sweep breaks.
+#
+# unparam runs here for the same reason, and it was added because the claim in
+# the paragraph above was not true of it: CI's Lint job runs `unparam -exported`
+# beside golangci-lint and this tier ran only golangci-lint, so an exported
+# function whose result no caller in its own module uses was invisible to every
+# check on this machine. #385 stage 7 moved ThreeStateSettingFromString from
+# core into authserver, where both call sites discard the parsed value, and the
+# finding appeared only once CI ran -- on a commit already reviewed and pushed.
+# gofmt and `go vet`, the other two legs of that job, are held already: gofmt by
+# TestGoSourcesAreGofmted in every module tier, vet by `where.sh build`.
+if should_run_lint; then
+    log="$LOG_DIR/00-lint.log"
+    echo "Running golangci-lint and unparam over the four modules... (log: $log)"
+    start=$SECONDS
+    gha_group "Lint"
+    for tool in golangci-lint unparam; do
+        if ! command -v "$tool" >/dev/null 2>&1; then
+            echo "$tool is not on PATH; run this inside the dev container, which installs the version versions.yaml pins" | tee "$log"
+            gha_summary_row "Lint" "-" "FAIL" "$(fmt_duration $((SECONDS - start)))"
+            fail_with "Lint" "$log"
+        fi
+    done
+    if ! (
+        for m in core authserver adminconsole cmd/goiabada-setup; do
+            echo "== $m"
+            (cd "../$m" && unparam -exported ./...) || exit 1
+            (cd "../$m" && golangci-lint run --max-same-issues=0 --max-issues-per-linter=0 ./...) || exit 1
+        done
+    ) 2>&1 | tee "$log"; then
+        gha_summary_row "Lint" "-" "FAIL" "$(fmt_duration $((SECONDS - start)))"
+        fail_with "Lint" "$log"
+    fi
+    gha_endgroup
+    gha_summary_row "Lint" "-" "pass" "$(fmt_duration $((SECONDS - start)))"
+
+    # web/static/main.css is generated by Tailwind from the templates' class names
+    # and committed, so a template that uses a class no template used before leaves
+    # the committed file missing that rule: the page ships with the class inert.
+    # The same regeneration and diff as CI's "Generated CSS is committed" step, on
+    # the tailwindcss the dev container installs at the version versions.yaml pins,
+    # which is the one CI downloads. It is here because that step was CI-only and
+    # nothing local could catch it: #328 stage 4 added `w-5/12` to the audit log
+    # viewer, passed every tier that runs on this machine, and went red on Lint.
+    # CI diffs the regenerated file against the checkout with git; this generates
+    # to a temporary file and compares instead, because git cannot run here: a
+    # worktree's .git names the main checkout by host path, which does not exist
+    # inside the dev container. Comparing what Tailwind produces against the file
+    # on disk is the same property and leaves the tree untouched.
+    log="$LOG_DIR/00-lint-css.log"
+    echo "Checking the generated Tailwind CSS is committed... (log: $log)"
+    start=$SECONDS
+    gha_group "Generated CSS"
+    if ! command -v tailwindcss >/dev/null 2>&1; then
+        echo "tailwindcss is not on PATH; run this inside the dev container, which installs the version versions.yaml pins" | tee "$log"
+        gha_summary_row "Generated CSS" "-" "FAIL" "$(fmt_duration $((SECONDS - start)))"
+        fail_with "Generated CSS" "$log"
+    fi
+    # Same working directory as build.sh, since the @source paths in input.css
+    # resolve against the stylesheet and the CLI is invoked from the module root.
+    if ! (
+        stale=0
+        for m in authserver adminconsole; do
+            generated="$LOG_DIR/$m-main.css"
+            (cd "../$m" && tailwindcss -i ./web/tailwindcss/input.css -o "$generated") || exit 1
+            if ! diff -u "../$m/web/static/main.css" "$generated"; then
+                echo "src/$m/web/static/main.css is stale -- run ./build.sh in src/$m and commit the regenerated file"
+                stale=1
+            fi
+        done
+        exit "$stale"
+    ) 2>&1 | tee "$log"; then
+        gha_summary_row "Generated CSS" "-" "FAIL" "$(fmt_duration $((SECONDS - start)))"
+        fail_with "Generated CSS" "$log"
+    fi
+    gha_endgroup
+    gha_summary_row "Generated CSS" "-" "pass" "$(fmt_duration $((SECONDS - start)))"
+
+    # The committed mocks are what the pinned mockery produces, checked by running it.
+    # The same property as CI's "Generated mocks are committed" step, and here for the
+    # reason the CSS check above is: that step is CI-only, and #338 is what being unable
+    # to see it locally costs. Sixteen committed mocks predated the versions.yaml pin, so
+    # generate-mocks.sh was not idempotent against its own tree and a change that
+    # regenerated for its own reasons collected sixteen files belonging to nobody.
+    #
+    # Every module's unit tier already holds each mock's header to the pin, through
+    # testutil.AssertGeneratedMocksArePinned, which needs no generator. This is the other
+    # half: an interface added to a .mockery.yaml that nobody generated, or a mock edited
+    # in its body, both of which leave the header right and the file wrong.
+    #
+    # Digests before and after rather than git: git cannot run in here, since a worktree's
+    # .git names the main checkout by host path. Comparing digests also means no snapshot
+    # and no restoring trap -- there is one EXIT trap already, and a second would replace
+    # it. A passing run writes nothing, because the generator produced the bytes that were
+    # already there; a failing one leaves the regenerated files in the tree on purpose,
+    # since reviewing and committing them is the whole of the fix.
+    log="$LOG_DIR/00-lint-mocks.log"
+    echo "Checking the generated mocks are committed... (log: $log)"
+    start=$SECONDS
+    gha_group "Generated mocks"
+    mocks_digest() { ( cd .. && find . -name '*_mock.go' -type f | sort | xargs sha256sum ); }
+    if ! (
+        mocks_digest > "$LOG_DIR/mocks-before.sha256"
+        ./generate-mocks.sh > "$LOG_DIR/mocks-generate.log" 2>&1 || {
+            echo "generate-mocks.sh failed; see $LOG_DIR/mocks-generate.log"
+            tail -20 "$LOG_DIR/mocks-generate.log"
+            exit 1
+        }
+        mocks_digest > "$LOG_DIR/mocks-after.sha256"
+        # The digests carry the path, so this names files added and removed as well as
+        # files rewritten, which is what an interface appearing in a config looks like.
+        if ! diff -u "$LOG_DIR/mocks-before.sha256" "$LOG_DIR/mocks-after.sha256"; then
+            echo "the committed mocks are not what the pinned mockery produces; the files above"
+            echo "have just been regenerated in your tree -- review with git diff and commit them"
+            exit 1
+        fi
+    ) 2>&1 | tee "$log"; then
+        gha_summary_row "Generated mocks" "-" "FAIL" "$(fmt_duration $((SECONDS - start)))"
+        fail_with "Generated mocks" "$log"
+    fi
+    gha_endgroup
+    gha_summary_row "Generated mocks" "-" "pass" "$(fmt_duration $((SECONDS - start)))"
+
+    # src/core/OWNERSHIP.md carries one row per exported symbol every core package declares,
+    # and ownershipdump writes the four computed justifications from the reference graph. Every
+    # module's unit tier already holds the committed table to the tree through
+    # testutil.AssertSymbolOwnership, which is the semantic half. This is the other half: the
+    # formatting, the ordering and the note the tool would write, none of which the guard reads,
+    # so a hand-edited row that happens to say the right word still leaves the file different
+    # from what the tool produces. Same arrangement as the two checks above, and here for the
+    # same reason -- both of those were CI-only and nothing local could see them (#328, #338).
+    #
+    # Digests rather than git, because git cannot run in here: a worktree's .git names the main
+    # checkout by host path. A passing run writes the bytes that were already there; a failing
+    # one leaves the regenerated file in the tree on purpose, since committing it is the fix.
+    log="$LOG_DIR/00-lint-ownership.log"
+    echo "Checking the core symbol ownership table is committed... (log: $log)"
+    start=$SECONDS
+    gha_group "Core symbol ownership"
+    if ! (
+        sha256sum ../core/OWNERSHIP.md > "$LOG_DIR/ownership-before.sha256"
+        (cd ../core && go run ./cmd/ownershipdump) || exit 1
+        sha256sum ../core/OWNERSHIP.md > "$LOG_DIR/ownership-after.sha256"
+        if ! diff -u "$LOG_DIR/ownership-before.sha256" "$LOG_DIR/ownership-after.sha256"; then
+            echo "src/core/OWNERSHIP.md is not what ownershipdump produces; it has just been"
+            echo "regenerated in your tree -- review with git diff and commit it"
+            exit 1
+        fi
+    ) 2>&1 | tee "$log"; then
+        gha_summary_row "Core symbol ownership" "-" "FAIL" "$(fmt_duration $((SECONDS - start)))"
+        fail_with "Core symbol ownership" "$log"
+    fi
+    gha_endgroup
+    gha_summary_row "Core symbol ownership" "-" "pass" "$(fmt_duration $((SECONDS - start)))"
+fi
+
+if should_run_internal; then
+    log="$LOG_DIR/01-internal.log"
+    echo "Running internal tests... (log: $log)"
+    start=$SECONDS
+    gha_group "Internal tests"
+    # ./web and ./cmd/... as well as ./internal/..., because they are the other authserver
+    # packages with unit tests that need nothing running. ./web's four -- the OpenAPI spec pair
+    # and the two template lints -- executed nowhere at all until #155: this tier ran
+    # ./internal/... only, and the CI job runs this tier. ./cmd was left out for the same reason
+    # and stayed out until #268 put the `migrate` subcommand's tests there; a mutation proved
+    # they were passing without being run. The adminconsole never had either gap because its leg
+    # runs ./... . Only ./tests/data and ./tests/integration stay out on purpose: they have their
+    # own tiers and need a database.
+    if ! "${module_go_test[@]}" "./internal/..." "./web" "./cmd/..." 2>&1 | tee "$log"; then
+        gha_summary_row "Internal$race_label" "-" "FAIL" "$(fmt_duration $((SECONDS - start)))"
+        fail_with "Authserver internal tests" "$log"
+    fi
+    gha_endgroup
+    gha_summary_row "Internal$race_label" "-" "pass" "$(fmt_duration $((SECONDS - start)))"
+fi
+
+if should_run_core; then
+    log="$LOG_DIR/02-core.log"
+    echo "Running tests for core module... (log: $log)"
+    start=$SECONDS
+    gha_group "Core module tests"
+    if ! (cd ../core && "${module_go_test[@]}" ./...) 2>&1 | tee "$log"; then
+        gha_summary_row "Core$race_label" "-" "FAIL" "$(fmt_duration $((SECONDS - start)))"
+        fail_with "Core module tests" "$log"
+    fi
+    gha_endgroup
+    gha_summary_row "Core$race_label" "-" "pass" "$(fmt_duration $((SECONDS - start)))"
+fi
+
+if should_run_adminconsole; then
+    log="$LOG_DIR/03-adminconsole.log"
+    echo "Running tests for admin console module... (log: $log)"
+    start=$SECONDS
+    gha_group "Admin console module tests"
+    if ! (cd ../adminconsole && "${module_go_test[@]}" ./...) 2>&1 | tee "$log"; then
+        gha_summary_row "Adminconsole$race_label" "-" "FAIL" "$(fmt_duration $((SECONDS - start)))"
+        fail_with "Admin console module tests" "$log"
+    fi
+    gha_endgroup
+    gha_summary_row "Adminconsole$race_label" "-" "pass" "$(fmt_duration $((SECONDS - start)))"
+fi
+
+# ---- DB-matrix runs (data + integration) ------------------------------------
+
+if should_run_data || should_run_integration; then
+    # Kill any processes on ports 19090 and 19091 before starting tests
+    kill_processes_on_ports
+
+    # Start from a clean slate. The EXIT trap also does this, but a run that was
+    # killed (or that died before the trap fired) leaves SQLite files behind, and
+    # a stale database or WAL would otherwise be inherited by this run.
+    echo "Removing leftover temporary SQLite databases..."
+    remove_sqlite_files
+fi
+
+if should_run_data; then
+    for db in "${databases[@]}"; do
+        echo "=== Running data tests with $db ==="
+        configure_database "$db" true
+        run_tests "data"
+        echo "=== Completed data tests with $db ==="
+        echo
+    done
+fi
+
+if should_run_integration; then
+    for db in "${databases[@]}"; do
+        echo "=== Running integration tests with $db ==="
+        configure_database "$db" false
+        start_server_and_wait
+        run_tests "integration"
+        stop_server
+        echo "=== Completed integration tests with $db ==="
+        echo
+    done
+fi
+
+echo
+echo "All tests completed successfully."
+echo "Logs in: $LOG_DIR"

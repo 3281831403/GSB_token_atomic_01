@@ -1,0 +1,1015 @@
+package apimapping
+
+import (
+	"database/sql"
+	"encoding/base64"
+	"encoding/json"
+	"reflect"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/leodip/goiabada/authserver/internal/models"
+	"github.com/leodip/goiabada/authserver/internal/testutil/fake"
+	"github.com/leodip/goiabada/core/api"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// =============================================================================
+// Sensitive-field exclusion
+//
+// models.User carries secrets that must never reach an API client: the password
+// hash, the TOTP seed (plaintext and encrypted), and the email / phone /
+// forgot-password verification codes. ToUserResponse deliberately omits all of
+// them. Nothing else in the codebase enforces that, so the two tests below do:
+// one guards the response struct's shape, the other guards the mapper's output.
+// =============================================================================
+
+// sensitiveUserFields are the models.User fields that must never be exposed
+// through api.UserResponse, by field name or by JSON key.
+// OTPSecret is still listed though models.User no longer declares it: migration 000048 dropped
+// the column (#98), and the claim here is about the RESPONSE, which must never grow a key by that
+// name either.
+var sensitiveUserFields = []string{
+	"PasswordHash",
+	"OTPSecret",
+	"OTPSecretEncrypted",
+	"EmailVerificationCodeEncrypted",
+	"EmailVerificationCodeIssuedAt",
+	"PhoneNumberVerificationCodeEncrypted",
+	"PhoneNumberVerificationCodeIssuedAt",
+	"ForgotPasswordCodeEncrypted",
+	"ForgotPasswordCodeIssuedAt",
+	"OtpEnrollmentSecretEncrypted",
+	"OtpEnrollmentIssuedAt",
+}
+
+// This catches a sensitive field being added to api.UserResponse even before any
+// mapper populates it, which a value-based test alone would miss.
+func TestUserResponse_StructHasNoSensitiveFields(t *testing.T) {
+	responseType := reflect.TypeOf(api.UserResponse{})
+
+	for i := 0; i < responseType.NumField(); i++ {
+		field := responseType.Field(i)
+		jsonKey := strings.Split(field.Tag.Get("json"), ",")[0]
+
+		for _, forbidden := range sensitiveUserFields {
+			assert.NotEqual(t, forbidden, field.Name,
+				"api.UserResponse must not expose the sensitive field %q", forbidden)
+			assert.NotEqual(t, strings.ToLower(forbidden), strings.ToLower(jsonKey),
+				"api.UserResponse must not expose a JSON key for the sensitive field %q", forbidden)
+		}
+	}
+}
+
+// A user fully populated with recognizable secrets must serialize without any
+// trace of them.
+func TestToUserResponse_DoesNotLeakSecrets(t *testing.T) {
+	otpSecretEncrypted := []byte("SENTINEL-otp-secret-encrypted")
+	emailCodeEncrypted := []byte("SENTINEL-email-verification-code")
+	phoneCodeEncrypted := []byte("SENTINEL-phone-verification-code")
+	forgotCodeEncrypted := []byte("SENTINEL-forgot-password-code")
+	otpEnrollmentEncrypted := []byte("SENTINEL-otp-enrollment-key-url")
+
+	user := &models.User{
+		Id:                                   1,
+		Email:                                "user@example.com",
+		PasswordHash:                         "SENTINEL-password-hash",
+		OTPSecretEncrypted:                   otpSecretEncrypted,
+		EmailVerificationCodeEncrypted:       emailCodeEncrypted,
+		EmailVerificationCodeIssuedAt:        sql.NullTime{Time: time.Now(), Valid: true},
+		PhoneNumberVerificationCodeEncrypted: phoneCodeEncrypted,
+		PhoneNumberVerificationCodeIssuedAt:  sql.NullTime{Time: time.Now(), Valid: true},
+		ForgotPasswordCodeEncrypted:          forgotCodeEncrypted,
+		ForgotPasswordCodeIssuedAt:           sql.NullTime{Time: time.Now(), Valid: true},
+		OtpEnrollmentSecretEncrypted:         otpEnrollmentEncrypted,
+		OtpEnrollmentIssuedAt:                sql.NullTime{Time: time.Now(), Valid: true},
+	}
+
+	resp := ToUserResponse(user)
+	assert.NotNil(t, resp)
+
+	marshalled, err := json.Marshal(resp)
+	assert.NoError(t, err)
+	payload := string(marshalled)
+
+	// Plaintext secrets.
+	assert.NotContains(t, payload, "SENTINEL-password-hash")
+
+	// Byte-slice secrets would serialize as base64, so check that encoding too.
+	for _, secret := range [][]byte{otpSecretEncrypted, emailCodeEncrypted, phoneCodeEncrypted,
+		forgotCodeEncrypted, otpEnrollmentEncrypted} {
+		assert.NotContains(t, payload, string(secret))
+		assert.NotContains(t, payload, base64.StdEncoding.EncodeToString(secret))
+	}
+
+	// And no key named after any of them.
+	var asMap map[string]any
+	assert.NoError(t, json.Unmarshal(marshalled, &asMap))
+	for key := range asMap {
+		for _, forbidden := range sensitiveUserFields {
+			assert.NotEqual(t, strings.ToLower(forbidden), strings.ToLower(key),
+				"serialized user must not contain a %q key", forbidden)
+		}
+	}
+
+	// The non-sensitive data is still there, so this is not passing by mapping nothing.
+	assert.Equal(t, "user@example.com", resp.Email)
+}
+
+// ToClientResponse intentionally leaves ClientSecret empty; the handler sets it
+// only on the detail endpoint after decryption. Combined with `omitempty` that
+// means list responses carry no clientSecret key at all.
+func TestToClientResponse_DoesNotPopulateClientSecret(t *testing.T) {
+	client := &models.Client{
+		Id:                    1,
+		ClientIdentifier:      "some-client",
+		ClientSecretEncrypted: []byte("SENTINEL-client-secret-encrypted"),
+		Enabled:               true,
+	}
+
+	resp := ToClientResponse(client)
+	assert.NotNil(t, resp)
+	assert.Equal(t, "", resp.ClientSecret, "the mapper must not populate the client secret")
+
+	marshalled, err := json.Marshal(resp)
+	assert.NoError(t, err)
+	payload := string(marshalled)
+
+	assert.NotContains(t, payload, "SENTINEL-client-secret-encrypted")
+	assert.NotContains(t, payload, base64.StdEncoding.EncodeToString(client.ClientSecretEncrypted))
+	assert.NotContains(t, payload, "clientSecret", "omitempty must drop the key when the secret is unset")
+}
+
+func TestToClientResponse_EmitsClientSecretOnceHandlerSetsIt(t *testing.T) {
+	resp := ToClientResponse(&models.Client{Id: 1, ClientIdentifier: "some-client"})
+	resp.ClientSecret = "decrypted-by-handler"
+
+	marshalled, err := json.Marshal(resp)
+	assert.NoError(t, err)
+
+	assert.Contains(t, string(marshalled), `"clientSecret":"decrypted-by-handler"`)
+}
+
+// =============================================================================
+// ToUserResponse field mapping
+// =============================================================================
+
+func TestToUserResponse_MapsAllFields(t *testing.T) {
+	createdAt := time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC)
+	updatedAt := time.Date(2024, 2, 3, 4, 5, 6, 0, time.UTC)
+	birthDate := time.Date(1990, 5, 15, 0, 0, 0, 0, time.UTC)
+	subject := fake.UUID()
+
+	user := &models.User{
+		Id:                            7,
+		CreatedAt:                     sql.NullTime{Time: createdAt, Valid: true},
+		UpdatedAt:                     sql.NullTime{Time: updatedAt, Valid: true},
+		Enabled:                       true,
+		Subject:                       subject,
+		Username:                      "jdoe",
+		GivenName:                     "Jane",
+		MiddleName:                    "Q",
+		FamilyName:                    "Doe",
+		Nickname:                      "jd",
+		Website:                       "https://example.com",
+		Gender:                        "female",
+		Email:                         "jane@example.com",
+		EmailVerified:                 true,
+		ZoneInfoCountryName:           "Brazil",
+		ZoneInfo:                      "America/Sao_Paulo",
+		Locale:                        "pt-BR",
+		BirthDate:                     sql.NullTime{Time: birthDate, Valid: true},
+		PhoneNumberCountryUniqueId:    "BRA_0",
+		PhoneNumberCountryCallingCode: "55",
+		PhoneNumber:                   "11999999999",
+		PhoneNumberVerified:           true,
+		AddressLine1:                  "Rua A, 1",
+		AddressLine2:                  "Apto 2",
+		AddressLocality:               "Sao Paulo",
+		AddressRegion:                 "SP",
+		AddressPostalCode:             "01000-000",
+		AddressCountry:                "BR",
+		OTPEnabled:                    true,
+		Groups:                        []models.Group{{Id: 1, GroupIdentifier: "admins"}},
+		Permissions:                   []models.Permission{{Id: 2, PermissionIdentifier: "read"}},
+		Attributes:                    []models.UserAttribute{{Id: 3, Key: "k", Value: "v"}},
+	}
+
+	resp := ToUserResponse(user)
+
+	assert.Equal(t, int64(7), resp.Id)
+	assert.Equal(t, &createdAt, resp.CreatedAt)
+	assert.Equal(t, &updatedAt, resp.UpdatedAt)
+	assert.True(t, resp.Enabled)
+	assert.Equal(t, subject, resp.Subject)
+	assert.Equal(t, "jdoe", resp.Username)
+	assert.Equal(t, "Jane", resp.GivenName)
+	assert.Equal(t, "Q", resp.MiddleName)
+	assert.Equal(t, "Doe", resp.FamilyName)
+	assert.Equal(t, "jd", resp.Nickname)
+	assert.Equal(t, "https://example.com", resp.Website)
+	assert.Equal(t, "female", resp.Gender)
+	assert.Equal(t, "jane@example.com", resp.Email)
+	assert.True(t, resp.EmailVerified)
+	assert.Equal(t, "Brazil", resp.ZoneInfoCountryName)
+	assert.Equal(t, "America/Sao_Paulo", resp.ZoneInfo)
+	assert.Equal(t, "pt-BR", resp.Locale)
+	assert.Equal(t, &birthDate, resp.BirthDate)
+	assert.Equal(t, "BRA_0", resp.PhoneNumberCountryUniqueId)
+	assert.Equal(t, "55", resp.PhoneNumberCountryCallingCode)
+	assert.Equal(t, "11999999999", resp.PhoneNumber)
+	assert.True(t, resp.PhoneNumberVerified)
+	assert.Equal(t, "Rua A, 1", resp.AddressLine1)
+	assert.Equal(t, "Apto 2", resp.AddressLine2)
+	assert.Equal(t, "Sao Paulo", resp.AddressLocality)
+	assert.Equal(t, "SP", resp.AddressRegion)
+	assert.Equal(t, "01000-000", resp.AddressPostalCode)
+	assert.Equal(t, "BR", resp.AddressCountry)
+	assert.True(t, resp.OTPEnabled)
+	// The fixture above loads Groups, Permissions and Attributes on the model on purpose: none of
+	// the three is a field of UserResponse any more, so what is pinned here is that a loaded
+	// collection changes nothing about the response. wire_json_test.go owns the same fact as
+	// bytes, naming the three keys it refuses to find (#350).
+}
+
+// Invalid sql.NullTime values must become nil pointers rather than the zero time.
+func TestToUserResponse_InvalidNullTimesBecomeNil(t *testing.T) {
+	resp := ToUserResponse(&models.User{
+		Id:        1,
+		CreatedAt: sql.NullTime{Valid: false},
+		UpdatedAt: sql.NullTime{Valid: false},
+		BirthDate: sql.NullTime{Valid: false},
+	})
+
+	assert.Nil(t, resp.CreatedAt)
+	assert.Nil(t, resp.UpdatedAt)
+	assert.Nil(t, resp.BirthDate)
+}
+
+// api.UserResponse.Subject was a 16-byte named type until #278, reaching JSON through that
+// type's MarshalText and coming back through UnmarshalText. It is a plain string now, and the
+// claim that made the swap safe is that no byte on the wire moved: the field is still the
+// bare canonical 36-character spelling, unquoted-array-free and unwrapped, and openapi.yaml
+// still describes it truthfully as type string, format uuid. A JSON encoder given the wrong
+// type would have produced a 16-element array instead, which is what this pins.
+func TestUserResponse_SubjectIsABareCanonicalString(t *testing.T) {
+	const subject = "3f2a1c4e-5b6d-4e8f-9a0b-1c2d3e4f5a6b"
+
+	encoded, err := json.Marshal(&api.UserResponse{Id: 9, Subject: subject})
+	assert.NoError(t, err)
+
+	assert.Contains(t, string(encoded), `"subject":"`+subject+`"`,
+		"subject must marshal as the bare 36-character string a client already parses")
+
+	var decoded api.UserResponse
+	assert.NoError(t, json.Unmarshal(encoded, &decoded))
+	assert.Equal(t, subject, decoded.Subject, "the wire form must round-trip unchanged")
+}
+
+func TestToUserResponses_MapsEachUserDistinctly(t *testing.T) {
+	users := []models.User{
+		{Id: 1, Email: "one@example.com"},
+		{Id: 2, Email: "two@example.com"},
+		{Id: 3, Email: "three@example.com"},
+	}
+
+	responses := ToUserResponses(users)
+
+	assert.Len(t, responses, 3)
+	assert.Equal(t, "one@example.com", responses[0].Email)
+	assert.Equal(t, "two@example.com", responses[1].Email)
+	assert.Equal(t, "three@example.com", responses[2].Email)
+}
+
+// =============================================================================
+// Nil handling
+//
+// Every mapper guards against a nil input. These are one-liners individually,
+// but a nil slip here is a panic in a request handler.
+// =============================================================================
+
+func TestMappers_NilInputReturnsNil(t *testing.T) {
+	assert.Nil(t, ToUserResponse(nil))
+	assert.Nil(t, ToUserResponses(nil))
+	assert.Nil(t, ToSessionOwnerResponse(nil))
+	assert.Nil(t, ToSessionOwnerResponses(nil))
+	assert.Nil(t, ToUserAttributeResponse(nil))
+	assert.Nil(t, ToUserAttributeResponses(nil))
+	assert.Nil(t, ToUserSessionResponse(nil))
+	assert.Nil(t, ToUserConsentResponse(nil))
+	assert.Nil(t, ToUserConsentResponses(nil))
+	assert.Nil(t, ToGroupResponse(nil, 0))
+	assert.Nil(t, ToGroupAttributeResponse(nil))
+	assert.Nil(t, ToGroupAttributeResponses(nil))
+	assert.Nil(t, ToPermissionResponse(nil))
+	assert.Nil(t, ToPermissionResponses(nil))
+	assert.Nil(t, ToResourceResponse(nil))
+	assert.Nil(t, ToResourceResponses(nil))
+	assert.Nil(t, ToClientResponse(nil))
+}
+
+// The group and client list mappers return an empty slice rather than nil, so
+// their JSON is `[]` instead of `null`. The user list mapper returns nil. That
+// inconsistency is load-bearing for API clients, so it is pinned here.
+func TestListMappers_NilSliceBehaviorDiffersByType(t *testing.T) {
+	assert.Equal(t, []api.GroupResponse{}, ToGroupResponses(nil, nil))
+	assert.Equal(t, []api.ClientResponse{}, ToClientResponses(nil))
+	assert.Nil(t, ToUserResponses(nil))
+
+	groupsJSON, err := json.Marshal(ToGroupResponses(nil, nil))
+	assert.NoError(t, err)
+	assert.Equal(t, "[]", string(groupsJSON))
+
+	usersJSON, err := json.Marshal(ToUserResponses(nil))
+	assert.NoError(t, err)
+	assert.Equal(t, "null", string(usersJSON))
+}
+
+// =============================================================================
+// ToSessionOwnerResponse
+// =============================================================================
+
+// The projection is five fields, and which five is a scope decision rather than a payload one:
+// the client sessions endpoint is reached with the clients scopes alone, so a field added here
+// is a field a manage-clients token starts learning about everyone holding a live session on a
+// client it manages. This case is written as an exhaustive key set for that reason -- it fails
+// when a sixth field appears, not merely when one of the five stops being copied (#373
+// decision 12).
+func TestToSessionOwnerResponse_CarriesTheFiveFieldsAndNoOthers(t *testing.T) {
+	resp := ToSessionOwnerResponse(&models.User{
+		Id:         7,
+		Email:      "jane@example.com",
+		GivenName:  "Jane",
+		MiddleName: "Q",
+		FamilyName: "Doe",
+
+		// Everything below is on the same row and must not reach this shape.
+		Subject:      fake.UUID(),
+		Username:     "jdoe",
+		Nickname:     "jd",
+		PhoneNumber:  "555-0100",
+		AddressLine1: "1 Somewhere Street",
+		Locale:       "en",
+		OTPEnabled:   true,
+		BirthDate:    sql.NullTime{Time: time.Date(1990, 5, 15, 0, 0, 0, 0, time.UTC), Valid: true},
+	})
+
+	require.NotNil(t, resp)
+	assert.Equal(t, api.SessionOwnerResponse{
+		Id:         7,
+		Email:      "jane@example.com",
+		GivenName:  "Jane",
+		MiddleName: "Q",
+		FamilyName: "Doe",
+	}, *resp)
+
+	assert.Equal(t, 5, reflect.TypeOf(api.SessionOwnerResponse{}).NumField(),
+		"api.SessionOwnerResponse gained a field: this shape is reachable with the clients "+
+			"scopes alone, so widening it hands a manage-clients token more of a person's "+
+			"profile than the documented scope split allows (#373 decision 12)")
+}
+
+func TestToSessionOwnerResponses_MapsEachUserDistinctly(t *testing.T) {
+	resps := ToSessionOwnerResponses([]models.User{
+		{Id: 1, Email: "one@example.com", GivenName: "One"},
+		{Id: 2, Email: "two@example.com", GivenName: "Two"},
+	})
+
+	require.Len(t, resps, 2)
+	assert.Equal(t, int64(1), resps[0].Id)
+	assert.Equal(t, "one@example.com", resps[0].Email)
+	assert.Equal(t, int64(2), resps[1].Id)
+	assert.Equal(t, "Two", resps[1].GivenName)
+}
+
+// Nil in, nil out, as ToUserResponses does: the difference between [] and null belongs to the
+// producer, which is where an empty page has to answer an empty array rather than a null one.
+func TestToSessionOwnerResponses_NilAndEmpty(t *testing.T) {
+	assert.Nil(t, ToSessionOwnerResponses(nil))
+	assert.Equal(t, []api.SessionOwnerResponse{}, ToSessionOwnerResponses([]models.User{}))
+}
+
+// =============================================================================
+// ToUserSessionResponse
+// =============================================================================
+
+func TestToUserSessionResponse_MapsFields(t *testing.T) {
+	started := time.Date(2024, 3, 1, 10, 0, 0, 0, time.UTC)
+	lastAccessed := time.Date(2024, 3, 1, 11, 0, 0, 0, time.UTC)
+	authTime := time.Date(2024, 3, 1, 10, 0, 5, 0, time.UTC)
+
+	session := &models.UserSession{
+		Id:                3,
+		SessionIdentifier: "session-abc",
+		Started:           started,
+		LastAccessed:      lastAccessed,
+		AuthMethods:       "pwd otp",
+		AcrLevel:          "urn:goiabada:level2_mandatory",
+		AuthTime:          authTime,
+		IpAddress:         "10.0.0.1",
+		DeviceName:        "Pixel",
+		DeviceType:        "mobile",
+		DeviceOS:          "Android",
+		UserAgent:         "Mozilla/5.0 (Linux; Android 10; K) Chrome/120.0.0.0 Mobile Safari/537.36",
+		UserId:            42,
+	}
+
+	resp := ToUserSessionResponse(session)
+
+	assert.Equal(t, int64(3), resp.Id)
+	assert.Equal(t, "session-abc", resp.SessionIdentifier)
+	assert.Equal(t, &started, resp.Started)
+	assert.Equal(t, &lastAccessed, resp.LastAccessed)
+	assert.Equal(t, "pwd otp", resp.AuthMethods)
+	assert.Equal(t, "urn:goiabada:level2_mandatory", resp.AcrLevel)
+	assert.Equal(t, &authTime, resp.AuthTime)
+	assert.Equal(t, "10.0.0.1", resp.IpAddress)
+	assert.Equal(t, "Pixel", resp.DeviceName)
+	assert.Equal(t, "mobile", resp.DeviceType)
+	assert.Equal(t, "Android", resp.DeviceOS)
+	assert.Equal(t, "Mozilla/5.0 (Linux; Android 10; K) Chrome/120.0.0.0 Mobile Safari/537.36", resp.UserAgent)
+	assert.Equal(t, int64(42), resp.UserId)
+}
+
+// Started, LastAccessed and AuthTime are plain time.Time, so absence is the
+// zero value rather than an invalid NullTime.
+func TestToUserSessionResponse_ZeroTimesBecomeNil(t *testing.T) {
+	resp := ToUserSessionResponse(&models.UserSession{Id: 1})
+
+	assert.Nil(t, resp.Started)
+	assert.Nil(t, resp.LastAccessed)
+	assert.Nil(t, resp.AuthTime)
+	assert.Nil(t, resp.CreatedAt)
+	assert.Nil(t, resp.UpdatedAt)
+}
+
+// The three list endpoints build every row through ToUserSessionDetailResponse, which is what
+// makes isCurrent mean the same thing on all three. The table below is the whole of that
+// function's judgement: everything else it returns is the base mapper's, already covered above.
+func TestToUserSessionDetailResponse_IsCurrentComparesTheCallersSid(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		currentSid string
+		want       bool
+	}{
+		// The empty case is not a formality: a client_credentials token and an offline grant
+		// both have sid suppressed, and an empty currentSid matching an empty
+		// SessionIdentifier would make every session in the list the caller's own.
+		{"no sid on the token", "", false},
+		{"the caller's own session", "session-abc", true},
+		{"another session", "session-xyz", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			detail := ToUserSessionDetailResponse(&models.UserSession{Id: 3, SessionIdentifier: "session-abc"}, tc.currentSid)
+
+			require.NotNil(t, detail)
+			assert.Equal(t, tc.want, detail.IsCurrent)
+		})
+	}
+}
+
+// An empty session identifier is what a row would carry if the column were ever blank, and it
+// must not match an empty sid either. Written separately because the case above fixes the
+// identifier and varies the claim; this one fixes the claim and varies the identifier.
+func TestToUserSessionDetailResponse_AnEmptySessionIdentifierIsNeverCurrent(t *testing.T) {
+	detail := ToUserSessionDetailResponse(&models.UserSession{Id: 3}, "")
+
+	require.NotNil(t, detail)
+	assert.False(t, detail.IsCurrent)
+}
+
+func TestToUserSessionDetailResponse_ClientIdentifiersComeFromTheLoadedClients(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		clients []models.UserSessionClient
+		want    []string
+	}{
+		{
+			name: "loaded",
+			clients: []models.UserSessionClient{
+				{ClientId: 1, Client: models.Client{Id: 1, ClientIdentifier: "portal"}},
+				{ClientId: 2, Client: models.Client{Id: 2, ClientIdentifier: "backoffice"}},
+			},
+			want: []string{"portal", "backoffice"},
+		},
+		// Both of these must be an empty slice and never nil: clientIdentifiers is a required
+		// array in the schema, and a nil slice marshals to null, which is not an empty array
+		// to anything generated from that document.
+		{"empty", []models.UserSessionClient{}, []string{}},
+		{"nil", nil, []string{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			detail := ToUserSessionDetailResponse(&models.UserSession{Id: 3, Clients: tc.clients}, "")
+
+			require.NotNil(t, detail)
+			require.NotNil(t, detail.ClientIdentifiers)
+			assert.Equal(t, tc.want, detail.ClientIdentifiers)
+		})
+	}
+}
+
+func TestToUserSessionDetailResponse_NilSession(t *testing.T) {
+	assert.Nil(t, ToUserSessionDetailResponse(nil, "session-abc"))
+}
+
+// The embedded base is filled by the same mapper the single-session endpoint uses, so a field
+// dropped from one is dropped from both. This asserts the promotion rather than re-asserting
+// every field: TestToUserSessionResponse_MapsFields owns those.
+func TestToUserSessionDetailResponse_CarriesTheBaseResponse(t *testing.T) {
+	started := time.Date(2024, 3, 1, 10, 0, 0, 0, time.UTC)
+	session := &models.UserSession{Id: 3, SessionIdentifier: "session-abc", Started: started, UserId: 42}
+
+	detail := ToUserSessionDetailResponse(session, "")
+
+	require.NotNil(t, detail)
+	assert.Equal(t, *ToUserSessionResponse(session), detail.UserSessionResponse)
+	assert.Equal(t, int64(3), detail.Id)
+	assert.Equal(t, int64(42), detail.UserId)
+	assert.Equal(t, &started, detail.Started)
+}
+
+// The level2AuthConfigHasChanged field was published on both session response
+// schemas and described a per-session boolean that no longer decides anything.
+// It is gone from the wire, and the deletions that removed it are otherwise
+// invisible to a test: TestOpenAPI_DescribesEveryAPIRoute checks no response
+// body at all, so nothing else fails if the field comes back (#242).
+func TestUserSessionResponses_OmitLevel2AuthConfigHasChanged(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		value interface{}
+	}{
+		{"api.UserSessionResponse", api.UserSessionResponse{Id: 1}},
+		{"api.UserSessionDetailResponse", api.UserSessionDetailResponse{UserSessionResponse: api.UserSessionResponse{Id: 1}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw, err := json.Marshal(tc.value)
+			assert.NoError(t, err)
+
+			var decoded map[string]interface{}
+			assert.NoError(t, json.Unmarshal(raw, &decoded))
+
+			_, present := decoded["level2AuthConfigHasChanged"]
+			assert.False(t, present, "level2AuthConfigHasChanged must not be published on %s", tc.name)
+		})
+	}
+}
+
+// The raw header is published as "userAgent" by both session schemas, and this is the only
+// tier that can see the wire key. The integration tests decode into these same structs, so a
+// tag renamed, dropped or given an omitempty would leave every one of them green while the
+// console and every other client read nothing (#281, plan review finding 6).
+//
+// Both structs are listed because the detail form is what the three list endpoints return, and
+// the wire key it publishes is the embedded one: a tag renamed on UserSessionResponse moves it on
+// both at once, which is exactly the coupling worth asserting rather than assuming.
+func TestUserSessionResponses_PublishUserAgent(t *testing.T) {
+	const header = `Mozilla/5.0 "quoted" <angled>`
+
+	for _, tc := range []struct {
+		name  string
+		value interface{}
+	}{
+		{"api.UserSessionResponse", api.UserSessionResponse{Id: 1, UserAgent: header}},
+		{"api.UserSessionDetailResponse", api.UserSessionDetailResponse{UserSessionResponse: api.UserSessionResponse{Id: 1, UserAgent: header}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw, err := json.Marshal(tc.value)
+			assert.NoError(t, err)
+
+			var decoded map[string]interface{}
+			assert.NoError(t, json.Unmarshal(raw, &decoded))
+
+			assert.Equal(t, header, decoded["userAgent"],
+				"%s must publish the raw header under the userAgent key", tc.name)
+		})
+	}
+}
+
+// A legacy row carries an empty header, and the key still has to be there: the OpenAPI schema
+// lists userAgent as required, which is a claim about presence. An omitempty on the field would
+// drop the key for exactly the rows an administrator is most likely to be puzzled by.
+func TestUserSessionResponses_PublishUserAgentWhenEmpty(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		value interface{}
+	}{
+		{"api.UserSessionResponse", api.UserSessionResponse{Id: 1}},
+		{"api.UserSessionDetailResponse", api.UserSessionDetailResponse{UserSessionResponse: api.UserSessionResponse{Id: 1}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw, err := json.Marshal(tc.value)
+			assert.NoError(t, err)
+
+			var decoded map[string]interface{}
+			assert.NoError(t, json.Unmarshal(raw, &decoded))
+
+			value, present := decoded["userAgent"]
+			assert.True(t, present, "%s must publish userAgent even when empty", tc.name)
+			assert.Equal(t, "", value)
+		})
+	}
+}
+
+// =============================================================================
+// ToUserConsentResponse
+// =============================================================================
+
+func TestToUserConsentResponse_IncludesClientDetailsWhenClientLoaded(t *testing.T) {
+	grantedAt := time.Date(2024, 4, 1, 9, 0, 0, 0, time.UTC)
+
+	consent := &models.UserConsent{
+		Id:        5,
+		ClientId:  11,
+		UserId:    22,
+		Scope:     "openid profile",
+		GrantedAt: sql.NullTime{Time: grantedAt, Valid: true},
+		Client: models.Client{
+			Id:               11,
+			ClientIdentifier: "web-app",
+			Description:      "The web app",
+		},
+	}
+
+	resp := ToUserConsentResponse(consent)
+
+	assert.Equal(t, int64(5), resp.Id)
+	assert.Equal(t, int64(11), resp.ClientId)
+	assert.Equal(t, int64(22), resp.UserId)
+	assert.Equal(t, "openid profile", resp.Scope)
+	assert.Equal(t, &grantedAt, resp.GrantedAt)
+	assert.Equal(t, "web-app", resp.ClientIdentifier)
+	assert.Equal(t, "The web app", resp.ClientDescription)
+}
+
+// Client details are only copied when the association was actually loaded,
+// which the mapper detects via a non-zero Client.Id.
+func TestToUserConsentResponse_OmitsClientDetailsWhenClientNotLoaded(t *testing.T) {
+	resp := ToUserConsentResponse(&models.UserConsent{
+		Id:       5,
+		ClientId: 11,
+		Scope:    "openid",
+		Client:   models.Client{}, // not loaded
+	})
+
+	assert.Equal(t, "", resp.ClientIdentifier)
+	assert.Equal(t, "", resp.ClientDescription)
+}
+
+func TestToUserConsentResponses_MapsEachConsentDistinctly(t *testing.T) {
+	responses := ToUserConsentResponses([]models.UserConsent{
+		{Id: 1, Scope: "openid"},
+		{Id: 2, Scope: "profile"},
+	})
+
+	assert.Len(t, responses, 2)
+	assert.Equal(t, "openid", responses[0].Scope)
+	assert.Equal(t, "profile", responses[1].Scope)
+}
+
+// =============================================================================
+// Groups, permissions, resources, attributes
+// =============================================================================
+
+func TestToGroupResponse_MapsFieldsAndMemberCount(t *testing.T) {
+	group := &models.Group{
+		Id:                   4,
+		GroupIdentifier:      "admins",
+		Description:          "Administrators",
+		IncludeInIdToken:     true,
+		IncludeInAccessToken: false,
+	}
+
+	resp := ToGroupResponse(group, 17)
+
+	assert.Equal(t, int64(4), resp.Id)
+	assert.Equal(t, "admins", resp.GroupIdentifier)
+	assert.Equal(t, "Administrators", resp.Description)
+	assert.True(t, resp.IncludeInIdToken)
+	assert.False(t, resp.IncludeInAccessToken)
+	assert.Equal(t, 17, resp.MemberCount, "member count comes from the argument, not the model")
+}
+
+func TestToGroupResponses_AppliesMemberCountsPerGroup(t *testing.T) {
+	groups := []models.Group{
+		{Id: 1, GroupIdentifier: "a"},
+		{Id: 2, GroupIdentifier: "b"},
+		{Id: 3, GroupIdentifier: "c"},
+	}
+	memberCounts := map[int64]int{1: 10, 3: 30}
+
+	responses := ToGroupResponses(groups, memberCounts)
+
+	assert.Len(t, responses, 3)
+	assert.Equal(t, 10, responses[0].MemberCount)
+	assert.Equal(t, 0, responses[1].MemberCount, "a group missing from the map gets zero")
+	assert.Equal(t, 30, responses[2].MemberCount)
+	assert.Equal(t, "a", responses[0].GroupIdentifier)
+	assert.Equal(t, "c", responses[2].GroupIdentifier)
+}
+
+func TestToGroupResponses_NilMemberCountsYieldsZeroes(t *testing.T) {
+	responses := ToGroupResponses([]models.Group{{Id: 1, GroupIdentifier: "a"}}, nil)
+
+	assert.Len(t, responses, 1)
+	assert.Equal(t, 0, responses[0].MemberCount)
+}
+
+func TestToGroupResponses_EmptySliceYieldsEmptySlice(t *testing.T) {
+	assert.Equal(t, []api.GroupResponse{}, ToGroupResponses([]models.Group{}, nil))
+}
+
+// A group that has never been updated: the NULL reaches the wire as an absent updatedAt rather
+// than as a zero time, which is the difference between the console printing nothing and printing
+// "01 Jan 0001" (#350).
+func TestToGroupResponse_LeavesAnAbsentUpdatedAtNil(t *testing.T) {
+	createdAt := time.Date(2024, 6, 1, 0, 0, 0, 0, time.UTC)
+
+	original := &models.Group{
+		Id:                   4,
+		GroupIdentifier:      "admins",
+		Description:          "Administrators",
+		IncludeInIdToken:     true,
+		IncludeInAccessToken: true,
+		CreatedAt:            sql.NullTime{Time: createdAt, Valid: true},
+	}
+
+	resp := ToGroupResponse(original, 5)
+
+	assert.Equal(t, int64(4), resp.Id)
+	assert.Equal(t, "admins", resp.GroupIdentifier)
+	assert.Equal(t, "Administrators", resp.Description)
+	assert.True(t, resp.IncludeInIdToken)
+	assert.True(t, resp.IncludeInAccessToken)
+	assert.Equal(t, 5, resp.MemberCount)
+	assert.Equal(t, &createdAt, resp.CreatedAt)
+	assert.Nil(t, resp.UpdatedAt)
+}
+
+func TestToPermissionResponse_IncludesNestedResource(t *testing.T) {
+	perm := &models.Permission{
+		Id:                   8,
+		PermissionIdentifier: "read",
+		Description:          "Read access",
+		ResourceId:           10,
+		Resource: models.Resource{
+			Id:                 10,
+			ResourceIdentifier: "backend-svc",
+			Description:        "Backend service",
+		},
+	}
+
+	resp := ToPermissionResponse(perm)
+
+	assert.Equal(t, int64(8), resp.Id)
+	assert.Equal(t, "read", resp.PermissionIdentifier)
+	assert.Equal(t, "Read access", resp.Description)
+	assert.Equal(t, int64(10), resp.ResourceId)
+	assert.Equal(t, int64(10), resp.Resource.Id)
+	assert.Equal(t, "backend-svc", resp.Resource.ResourceIdentifier)
+	assert.Equal(t, "Backend service", resp.Resource.Description)
+}
+
+func TestToPermissionResponses_MapsEachPermissionDistinctly(t *testing.T) {
+	responses := ToPermissionResponses([]models.Permission{
+		{Id: 1, PermissionIdentifier: "read"},
+		{Id: 2, PermissionIdentifier: "write"},
+	})
+
+	assert.Len(t, responses, 2)
+	assert.Equal(t, "read", responses[0].PermissionIdentifier)
+	assert.Equal(t, "write", responses[1].PermissionIdentifier)
+}
+
+func TestToResourceResponses_MapsEachResourceDistinctly(t *testing.T) {
+	responses := ToResourceResponses([]models.Resource{
+		{Id: 1, ResourceIdentifier: "svc-a"},
+		{Id: 2, ResourceIdentifier: "svc-b"},
+	})
+
+	assert.Len(t, responses, 2)
+	assert.Equal(t, "svc-a", responses[0].ResourceIdentifier)
+	assert.Equal(t, "svc-b", responses[1].ResourceIdentifier)
+}
+
+func TestToUserAttributeResponse_MapsFieldsAndTimestamps(t *testing.T) {
+	createdAt := time.Date(2024, 7, 1, 0, 0, 0, 0, time.UTC)
+	updatedAt := time.Date(2024, 7, 2, 0, 0, 0, 0, time.UTC)
+
+	original := &models.UserAttribute{
+		Id:                   3,
+		Key:                  "department",
+		Value:                "engineering",
+		IncludeInIdToken:     true,
+		IncludeInAccessToken: false,
+		UserId:               42,
+		CreatedAt:            sql.NullTime{Time: createdAt, Valid: true},
+		UpdatedAt:            sql.NullTime{Time: updatedAt, Valid: true},
+	}
+
+	resp := ToUserAttributeResponse(original)
+	assert.Equal(t, "department", resp.Key)
+	assert.Equal(t, "engineering", resp.Value)
+	assert.True(t, resp.IncludeInIdToken)
+	assert.False(t, resp.IncludeInAccessToken)
+	assert.Equal(t, int64(42), resp.UserId)
+	assert.Equal(t, &createdAt, resp.CreatedAt)
+	assert.Equal(t, &updatedAt, resp.UpdatedAt)
+}
+
+func TestToUserAttributeResponses_MapsEachAttributeDistinctly(t *testing.T) {
+	responses := ToUserAttributeResponses([]models.UserAttribute{
+		{Id: 1, Key: "a", Value: "1"},
+		{Id: 2, Key: "b", Value: "2"},
+	})
+
+	assert.Len(t, responses, 2)
+	assert.Equal(t, "a", responses[0].Key)
+	assert.Equal(t, "b", responses[1].Key)
+}
+
+func TestToGroupAttributeResponse_MapsFieldsAndTimestamps(t *testing.T) {
+	createdAt := time.Date(2024, 8, 1, 0, 0, 0, 0, time.UTC)
+
+	original := &models.GroupAttribute{
+		Id:                   3,
+		Key:                  "tier",
+		Value:                "gold",
+		IncludeInIdToken:     true,
+		IncludeInAccessToken: true,
+		GroupId:              9,
+		CreatedAt:            sql.NullTime{Time: createdAt, Valid: true},
+	}
+
+	resp := ToGroupAttributeResponse(original)
+	assert.Equal(t, "tier", resp.Key)
+	assert.Equal(t, "gold", resp.Value)
+	assert.Equal(t, int64(9), resp.GroupId)
+	assert.Equal(t, &createdAt, resp.CreatedAt)
+	assert.Equal(t, int64(3), resp.Id)
+	assert.True(t, resp.IncludeInIdToken)
+	assert.True(t, resp.IncludeInAccessToken)
+	assert.Nil(t, resp.UpdatedAt)
+}
+
+func TestToGroupAttributeResponses_MapsEachAttributeDistinctly(t *testing.T) {
+	responses := ToGroupAttributeResponses([]models.GroupAttribute{
+		{Id: 1, Key: "a"},
+		{Id: 2, Key: "b"},
+	})
+
+	assert.Len(t, responses, 2)
+	assert.Equal(t, "a", responses[0].Key)
+	assert.Equal(t, "b", responses[1].Key)
+}
+
+// =============================================================================
+// ToClientResponse field mapping
+// =============================================================================
+
+func TestToClientResponse_MapsFields(t *testing.T) {
+	pkceRequired := true
+	implicitEnabled := false
+
+	client := &models.Client{
+		Id:                                      12,
+		ClientIdentifier:                        "web-app",
+		Description:                             "The web app",
+		WebsiteURL:                              "https://app.example.com",
+		DisplayName:                             "Web App",
+		Enabled:                                 true,
+		ConsentRequired:                         true,
+		CreatedViaDCR:                           true,
+		ShowLogo:                                true,
+		IsPublic:                                false,
+		AuthorizationCodeEnabled:                true,
+		ClientCredentialsEnabled:                true,
+		PKCERequired:                            &pkceRequired,
+		ImplicitGrantEnabled:                    &implicitEnabled,
+		ResourceOwnerPasswordCredentialsEnabled: nil,
+		TokenExpirationInSeconds:                300,
+		RefreshTokenOfflineIdleTimeoutInSeconds: 3600,
+		RefreshTokenOfflineMaxLifetimeInSeconds: 86400,
+		RedirectURIs:                            []models.RedirectURI{{Id: 1, URI: "https://app.example.com/cb"}},
+		WebOrigins:                              []models.WebOrigin{{Id: 1, Origin: "https://app.example.com"}},
+	}
+
+	resp := ToClientResponse(client)
+
+	assert.Equal(t, int64(12), resp.Id)
+	assert.Equal(t, "web-app", resp.ClientIdentifier)
+	assert.Equal(t, "The web app", resp.Description)
+	assert.Equal(t, "https://app.example.com", resp.WebsiteURL)
+	assert.Equal(t, "Web App", resp.DisplayName)
+	assert.True(t, resp.Enabled)
+	assert.True(t, resp.ConsentRequired)
+	assert.True(t, resp.CreatedViaDCR)
+	assert.True(t, resp.ShowLogo)
+	assert.False(t, resp.IsPublic)
+	assert.True(t, resp.AuthorizationCodeEnabled)
+	assert.True(t, resp.ClientCredentialsEnabled)
+	assert.Equal(t, &pkceRequired, resp.PKCERequired)
+	assert.Equal(t, &implicitEnabled, resp.ImplicitGrantEnabled)
+	assert.Nil(t, resp.ResourceOwnerPasswordCredentialsEnabled,
+		"nil must survive the mapping so the global setting still applies")
+	assert.Equal(t, 300, resp.TokenExpirationInSeconds)
+	assert.Equal(t, 3600, resp.RefreshTokenOfflineIdleTimeoutInSeconds)
+	assert.Equal(t, 86400, resp.RefreshTokenOfflineMaxLifetimeInSeconds)
+	assert.Equal(t, []api.RedirectURIResponse{{Id: 1, URI: "https://app.example.com/cb"}}, resp.RedirectURIs)
+	assert.Equal(t, []api.WebOriginResponse{{Id: 1, Origin: "https://app.example.com"}}, resp.WebOrigins)
+	assert.Equal(t, client.IsSystemLevelClient(), resp.IsSystemLevelClient)
+}
+
+// TestToClientResponse_CreatedViaDCRIsCopiedNotAssumed pins the other half of the mapping. The
+// fixture above is self-registered, so a mapper that hardcoded true would satisfy it; an
+// administrator-created client is what says the value is read off the client. The admin console
+// badges self-registered clients straight off this field, so a mapper stuck on either value would
+// mark every client or none of them (#108).
+func TestToClientResponse_CreatedViaDCRIsCopiedNotAssumed(t *testing.T) {
+	resp := ToClientResponse(&models.Client{ClientIdentifier: "web-app", CreatedViaDCR: false})
+	assert.False(t, resp.CreatedViaDCR)
+}
+
+// =============================================================================
+// Audit timestamps
+//
+// Every mapper copies createdAt / updatedAt out of a sql.NullTime, and each one
+// does it with its own pair of branches. These are the timestamps an admin sees
+// in the console, so both the present and absent cases are worth pinning across
+// the mappers rather than only on api.UserResponse.
+// =============================================================================
+
+func TestMappers_CopyCreatedAtAndUpdatedAt(t *testing.T) {
+	createdAt := time.Date(2024, 9, 1, 8, 0, 0, 0, time.UTC)
+	updatedAt := time.Date(2024, 9, 2, 9, 30, 0, 0, time.UTC)
+	valid := sql.NullTime{Time: createdAt, Valid: true}
+	validUpdated := sql.NullTime{Time: updatedAt, Valid: true}
+
+	t.Run("user session", func(t *testing.T) {
+		resp := ToUserSessionResponse(&models.UserSession{
+			Id: 1, CreatedAt: valid, UpdatedAt: validUpdated,
+		})
+		assert.Equal(t, &createdAt, resp.CreatedAt)
+		assert.Equal(t, &updatedAt, resp.UpdatedAt)
+	})
+
+	t.Run("user consent", func(t *testing.T) {
+		resp := ToUserConsentResponse(&models.UserConsent{
+			Id: 1, CreatedAt: valid, UpdatedAt: validUpdated,
+		})
+		assert.Equal(t, &createdAt, resp.CreatedAt)
+		assert.Equal(t, &updatedAt, resp.UpdatedAt)
+		assert.Nil(t, resp.GrantedAt, "an ungranted consent has no grantedAt")
+	})
+
+	t.Run("group", func(t *testing.T) {
+		resp := ToGroupResponse(&models.Group{Id: 1, CreatedAt: valid, UpdatedAt: validUpdated}, 0)
+		assert.Equal(t, &createdAt, resp.CreatedAt)
+		assert.Equal(t, &updatedAt, resp.UpdatedAt)
+	})
+
+	t.Run("group attribute", func(t *testing.T) {
+		resp := ToGroupAttributeResponse(&models.GroupAttribute{
+			Id: 1, CreatedAt: valid, UpdatedAt: validUpdated,
+		})
+		assert.Equal(t, &createdAt, resp.CreatedAt)
+		assert.Equal(t, &updatedAt, resp.UpdatedAt)
+	})
+
+	t.Run("user attribute", func(t *testing.T) {
+		resp := ToUserAttributeResponse(&models.UserAttribute{
+			Id: 1, CreatedAt: valid, UpdatedAt: validUpdated,
+		})
+		assert.Equal(t, &createdAt, resp.CreatedAt)
+		assert.Equal(t, &updatedAt, resp.UpdatedAt)
+	})
+
+	t.Run("user", func(t *testing.T) {
+		resp := ToUserResponse(&models.User{Id: 1, CreatedAt: valid, UpdatedAt: validUpdated})
+		assert.Equal(t, &createdAt, resp.CreatedAt)
+		assert.Equal(t, &updatedAt, resp.UpdatedAt)
+		assert.Nil(t, resp.BirthDate, "an absent birth date reaches the wire as null")
+	})
+
+	t.Run("client", func(t *testing.T) {
+		resp := ToClientResponse(&models.Client{Id: 1, CreatedAt: valid, UpdatedAt: validUpdated})
+		assert.Equal(t, &createdAt, resp.CreatedAt)
+		assert.Equal(t, &updatedAt, resp.UpdatedAt)
+	})
+}
+
+func TestToClientResponses_MapsEachClientDistinctly(t *testing.T) {
+	responses := ToClientResponses([]models.Client{
+		{Id: 1, ClientIdentifier: "one"},
+		{Id: 2, ClientIdentifier: "two"},
+	})
+
+	assert.Len(t, responses, 2)
+	assert.Equal(t, "one", responses[0].ClientIdentifier)
+	assert.Equal(t, "two", responses[1].ClientIdentifier)
+}
+
+func TestToClientResponses_EmptySliceYieldsEmptySlice(t *testing.T) {
+	assert.Equal(t, []api.ClientResponse{}, ToClientResponses([]models.Client{}))
+}

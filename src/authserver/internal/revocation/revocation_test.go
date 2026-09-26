@@ -1,0 +1,1185 @@
+package revocation
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"testing"
+
+	mocks_data "github.com/leodip/goiabada/authserver/internal/data/mocks"
+	"github.com/leodip/goiabada/authserver/internal/models"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
+)
+
+// revokeTx is an opaque non-nil transaction. RevokeUserAuthState requires one, so passing nil
+// here would exercise a shape production never runs. The mocks never dereference it; it only
+// has to be the same pointer the helper forwards.
+var revokeTx = &sql.Tx{}
+
+// The user under revocation, and the two sessions the fixture below spreads tokens across.
+const (
+	revokeUserId   = int64(7)
+	revokeKeepSid  = "sid-keep"
+	revokeOtherSid = "sid-other"
+	// Nonzero on purpose. A fixture at 0 coincides with the column default, so an
+	// implementation that never read the stored value would still pass.
+	revokeOldGeneration = int64(3)
+	revokeNewGeneration = int64(4)
+)
+
+// revocationFixture builds the five refresh tokens the sweep table reasons about. It is one
+// fixture shared by both cases (exceptSid set and empty) so the two are directly comparable:
+// the only thing that varies between them is exceptSid.
+//
+// The five shapes are chosen to cover both linkage forms and both the preserved and swept
+// sides of each:
+//
+//	1 rt-keep-session   auth-code, session-bound, on the PRESERVED session
+//	2 rt-keep-offline   auth-code, OFFLINE, on the preserved session, own sid empty
+//	3 rt-other-session  auth-code, session-bound, on another session
+//	4 rt-already-gone   auth-code, on another session, ALREADY revoked
+//	5 rt-ropc           ROPC, no code at all
+//
+// Token 2 is the load-bearing one. Its own session_identifier is empty, because an offline
+// grant is not session-bound, and the sid it came from lives only on the joined codes row.
+// So it is indistinguishable from the ROPC token by inspecting the user-scoped rows alone,
+// and any implementation that derives the preserved set from those rows revokes it. That
+// contradicts decision 4: the user changes their own password and their own session's
+// offline tokens die.
+func revocationFixture() []*models.RefreshToken {
+	return []*models.RefreshToken{
+		{
+			Id: 1, RefreshTokenJti: "rt-keep-session",
+			SessionIdentifier:   revokeKeepSid,
+			RefreshTokenType:    "Refresh",
+			CodeId:              sql.NullInt64{Int64: 11, Valid: true},
+			AuthStateGeneration: revokeOldGeneration,
+		},
+		{
+			Id: 2, RefreshTokenJti: "rt-keep-offline",
+			SessionIdentifier:   "",
+			RefreshTokenType:    "Offline",
+			CodeId:              sql.NullInt64{Int64: 12, Valid: true},
+			AuthStateGeneration: revokeOldGeneration,
+		},
+		{
+			Id: 3, RefreshTokenJti: "rt-other-session",
+			SessionIdentifier:   revokeOtherSid,
+			RefreshTokenType:    "Refresh",
+			CodeId:              sql.NullInt64{Int64: 13, Valid: true},
+			AuthStateGeneration: revokeOldGeneration,
+		},
+		{
+			Id: 4, RefreshTokenJti: "rt-already-gone",
+			SessionIdentifier:   revokeOtherSid,
+			RefreshTokenType:    "Refresh",
+			CodeId:              sql.NullInt64{Int64: 14, Valid: true},
+			Revoked:             true,
+			AuthStateGeneration: revokeOldGeneration,
+		},
+		{
+			Id: 5, RefreshTokenJti: "rt-ropc",
+			SessionIdentifier:   "",
+			RefreshTokenType:    "Offline",
+			CodeId:              sql.NullInt64{Valid: false},
+			UserId:              sql.NullInt64{Int64: revokeUserId, Valid: true},
+			AuthStateGeneration: revokeOldGeneration,
+		},
+	}
+}
+
+func revocationSessions() []models.UserSession {
+	return []models.UserSession{
+		{Id: 100, SessionIdentifier: revokeKeepSid, UserId: revokeUserId,
+			AuthStateGeneration: revokeOldGeneration},
+		{Id: 200, SessionIdentifier: revokeOtherSid, UserId: revokeUserId,
+			AuthStateGeneration: revokeOldGeneration},
+	}
+}
+
+// TestRevokeUserAuthState_PreservingASession is the exhaustive owner of the sweep table for
+// the exceptSid case (#106 stage 4). Every expectation is registered on a strict mock, so an
+// unexpected or missing database call fails the test on its own.
+func TestRevokeUserAuthState_PreservingASession(t *testing.T) {
+	db := mocks_data.NewDatabase(t)
+	tokens := revocationFixture()
+
+	db.On("IncrementUserAuthStateGeneration", mock.Anything, revokeTx, revokeUserId).
+		Return(revokeNewGeneration, nil).Once()
+
+	// The sid-scoped query, which is the ONLY thing that can identify token 2 as belonging
+	// to the preserved session. It matches codes.session_identifier, so it returns both the
+	// session-bound and the offline token of that session.
+	db.On("GetRefreshTokensBySessionIdentifier", mock.Anything, revokeTx, revokeKeepSid).
+		Return([]*models.RefreshToken{tokens[0], tokens[1]}, nil).Once()
+
+	db.On("GetRefreshTokensByUserId", mock.Anything, revokeTx, revokeUserId).
+		Return(tokens, nil).Once()
+
+	// Exactly the three tokens outside the preserved set are written, and the
+	// already-revoked one is not among them.
+	db.On("UpdateRefreshToken", mock.Anything, revokeTx, tokens[2]).Return(nil).Once()
+	db.On("UpdateRefreshToken", mock.Anything, revokeTx, tokens[4]).Return(nil).Once()
+
+	db.On("PromoteRefreshTokenGenerations", mock.Anything, revokeTx, []int64{1, 2}, revokeNewGeneration).
+		Return(nil).Once()
+
+	db.On("GetUserSessionsByUserId", mock.Anything, revokeTx, revokeUserId).
+		Return(revocationSessions(), nil).Once()
+	db.On("PromoteUserSessionGeneration", mock.Anything, revokeTx, int64(100), revokeNewGeneration).
+		Return(nil).Once()
+	db.On("DeleteUserSession", mock.Anything, revokeTx, int64(200)).Return(nil).Once()
+
+	result, err := RevokeUserAuthState(context.Background(), db, revokeTx, revokeUserId, revokeKeepSid)
+	require.NoError(t, err)
+
+	// Both tokens of the preserved session are promoted, the offline one included. This is
+	// the assertion that fails against an implementation deriving the preserved set from the
+	// user-scoped rows: token 2 would land in the revoked list instead.
+	assert.Equal(t, []int64{1, 2}, promotedIds(t, db),
+		"the preserved session's session-bound AND offline tokens must be promoted")
+
+	// Two revoked, not three: rt-already-gone was revoked before the call and so is neither
+	// written again nor reported. Callers use "we revoked something" as a signal (#77).
+	assert.Equal(t, []string{"rt-other-session", "rt-ropc"}, result.RevokedRefreshTokenJtis)
+	assert.NotContains(t, result.RevokedRefreshTokenJtis, "rt-already-gone")
+
+	assert.Equal(t, []string{revokeOtherSid}, result.TerminatedSessionIdentifiers)
+	assert.Equal(t, revokeKeepSid, result.PreservedSessionIdentifier)
+	assert.Equal(t, revokeOldGeneration, result.OldGeneration)
+	assert.Equal(t, revokeNewGeneration, result.NewGeneration)
+
+	// The tokens the sweep touched carry Revoked, and the preserved ones do not.
+	assert.False(t, tokens[0].Revoked, "rt-keep-session must survive")
+	assert.False(t, tokens[1].Revoked, "rt-keep-offline must survive")
+	assert.True(t, tokens[2].Revoked)
+	assert.True(t, tokens[4].Revoked)
+}
+
+// TestRevokeUserAuthState_RevokingEverything is the same fixture with exceptSid empty.
+// Exactly one input differs from the test above, so any difference in outcome is attributable
+// to it.
+func TestRevokeUserAuthState_RevokingEverything(t *testing.T) {
+	db := mocks_data.NewDatabase(t)
+	tokens := revocationFixture()
+
+	db.On("IncrementUserAuthStateGeneration", mock.Anything, revokeTx, revokeUserId).
+		Return(revokeNewGeneration, nil).Once()
+	db.On("GetRefreshTokensByUserId", mock.Anything, revokeTx, revokeUserId).
+		Return(tokens, nil).Once()
+
+	db.On("UpdateRefreshToken", mock.Anything, revokeTx, tokens[0]).Return(nil).Once()
+	db.On("UpdateRefreshToken", mock.Anything, revokeTx, tokens[1]).Return(nil).Once()
+	db.On("UpdateRefreshToken", mock.Anything, revokeTx, tokens[2]).Return(nil).Once()
+	db.On("UpdateRefreshToken", mock.Anything, revokeTx, tokens[4]).Return(nil).Once()
+
+	db.On("PromoteRefreshTokenGenerations", mock.Anything, revokeTx, []int64{}, revokeNewGeneration).
+		Return(nil).Once()
+
+	db.On("GetUserSessionsByUserId", mock.Anything, revokeTx, revokeUserId).
+		Return(revocationSessions(), nil).Once()
+	db.On("DeleteUserSession", mock.Anything, revokeTx, int64(100)).Return(nil).Once()
+	db.On("DeleteUserSession", mock.Anything, revokeTx, int64(200)).Return(nil).Once()
+
+	result, err := RevokeUserAuthState(context.Background(), db, revokeTx, revokeUserId, "")
+	require.NoError(t, err)
+
+	// FOUR entries, not five. Every live token transitions, and the already-revoked one is
+	// still excluded from the report. An earlier draft of the plan said "all five revoked",
+	// which contradicted its own executed sketch (finding 27); this count is the correction.
+	assert.Len(t, result.RevokedRefreshTokenJtis, 4)
+	assert.Equal(t, []string{"rt-keep-session", "rt-keep-offline", "rt-other-session", "rt-ropc"},
+		result.RevokedRefreshTokenJtis)
+
+	assert.ElementsMatch(t, []string{revokeKeepSid, revokeOtherSid}, result.TerminatedSessionIdentifiers)
+	assert.Equal(t, "", result.PreservedSessionIdentifier)
+	assert.Equal(t, revokeOldGeneration, result.OldGeneration)
+	assert.Equal(t, revokeNewGeneration, result.NewGeneration)
+
+	// Nothing promoted, and no sid-scoped query issued at all. The second is enforced by the
+	// strict mock: no GetRefreshTokensBySessionIdentifier expectation is registered, so a
+	// call would fail the test.
+	assert.Empty(t, promotedIds(t, db))
+	db.AssertNotCalled(t, "PromoteUserSessionGeneration", mock.Anything, mock.Anything, mock.Anything, mock.Anything)
+}
+
+// promotedIds pulls the id list actually passed to PromoteRefreshTokenGenerations, rather than
+// trusting the expectation to have matched a nil-versus-empty slice loosely.
+func promotedIds(t *testing.T, db *mocks_data.Database) []int64 {
+	t.Helper()
+	for _, call := range db.Calls {
+		if call.Method == "PromoteRefreshTokenGenerations" {
+			ids, ok := call.Arguments[2].([]int64)
+			require.True(t, ok, "second argument should be []int64")
+			return ids
+		}
+	}
+	t.Fatal("PromoteRefreshTokenGenerations was never called")
+	return nil
+}
+
+// TestRevokeUserAuthState_RequiresATransaction pins the entry precondition. The helper spans
+// an increment and a multi-table sweep, so without a transaction a failure part-way through
+// leaves the user on a new generation with their old state half swept. Enforced here rather
+// than left to whichever nested data method happens to check, so the contract is the
+// function's own.
+func TestRevokeUserAuthState_RequiresATransaction(t *testing.T) {
+	db := mocks_data.NewDatabase(t)
+
+	result, err := RevokeUserAuthState(context.Background(), db, nil, revokeUserId, "")
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "requires a transaction")
+	// Nothing was attempted. The strict mock has no expectations registered, so any call at
+	// all would fail the test on its own.
+	assert.Equal(t, RevocationResult{
+		TerminatedSessionIdentifiers: []string{},
+		RevokedRefreshTokenJtis:      []string{},
+	}, result)
+}
+
+// TestRevokeUserAuthState_UnknownUser pins that an unknown user is an error rather than a
+// silent no-op. There is no pre-read to catch it: IncrementUserAuthStateGeneration requires
+// exactly one affected row and reports it, which is why the helper does not look the user up
+// separately (finding 30).
+func TestRevokeUserAuthState_UnknownUser(t *testing.T) {
+	db := mocks_data.NewDatabase(t)
+	notFound := errors.New("user not found when incrementing auth state generation")
+	db.On("IncrementUserAuthStateGeneration", mock.Anything, revokeTx, revokeUserId).
+		Return(int64(0), notFound).Once()
+
+	result, err := RevokeUserAuthState(context.Background(), db, revokeTx, revokeUserId, "")
+
+	require.ErrorIs(t, err, notFound)
+	assert.Empty(t, result.RevokedRefreshTokenJtis)
+	// No sweep was attempted after the failed increment: revoking state while leaving the
+	// generation behind would be the worst of both outcomes.
+	db.AssertNotCalled(t, "GetRefreshTokensByUserId", mock.Anything, mock.Anything, mock.Anything)
+	assert.Equal(t, int64(0), result.OldGeneration)
+	assert.Equal(t, int64(0), result.NewGeneration)
+}
+
+// TestRevokeUserAuthState_OldGenerationIsDerivedFromTheIncrement is the finding-30 regression.
+// The helper used to SELECT the stored generation before incrementing, which is not a locking
+// read: a concurrent revocation can commit between the read and the increment, and the caller
+// then reports an old generation it never moved away from.
+//
+// The fixture makes that concrete. The increment returns 9, meaning another transaction had
+// already advanced the user past whatever a prior read would have seen. OldGeneration must be
+// 8, the value THIS increment moved away from, not the 3 a pre-read would have reported.
+func TestRevokeUserAuthState_OldGenerationIsDerivedFromTheIncrement(t *testing.T) {
+	db := mocks_data.NewDatabase(t)
+
+	db.On("IncrementUserAuthStateGeneration", mock.Anything, revokeTx, revokeUserId).Return(int64(9), nil).Once()
+	db.On("GetRefreshTokensByUserId", mock.Anything, revokeTx, revokeUserId).
+		Return([]*models.RefreshToken{}, nil).Once()
+	db.On("PromoteRefreshTokenGenerations", mock.Anything, revokeTx, []int64{}, int64(9)).Return(nil).Once()
+	db.On("GetUserSessionsByUserId", mock.Anything, revokeTx, revokeUserId).
+		Return([]models.UserSession{}, nil).Once()
+
+	result, err := RevokeUserAuthState(context.Background(), db, revokeTx, revokeUserId, "")
+
+	require.NoError(t, err)
+	assert.Equal(t, int64(9), result.NewGeneration)
+	assert.Equal(t, int64(8), result.OldGeneration)
+	// The user is never read separately. A GetUserById call would fail on the strict mock,
+	// which is what keeps the racy pre-read from coming back.
+	db.AssertNotCalled(t, "GetUserById", mock.Anything, mock.Anything, mock.Anything)
+}
+
+// TestRevokeUserAuthState_ChildCommittedBetweenTheDiscoveryQueries covers a refresh racing the
+// sweep, in the one window the query ORDER can do anything about (finding 33).
+//
+// A refresh that validated before the sweep began commits its child token while the sweep is
+// running. Where a database gives each statement a fresh read view, a child landing between the
+// user-scoped query and the sid-scoped one is absent from the first and present in the second.
+// Querying user-scoped FIRST is what makes that harmless: the child is never a candidate for
+// revocation, and the sid-scoped query promotes it. The reverse order revokes the user's own
+// newly issued token.
+//
+// TWO LIMITS, both deliberate and neither fixable at this layer. This says nothing about a child
+// committed after both queries, which no ordering can reach. And it says nothing about whether the
+// second query can see the commit at all: under MySQL/InnoDB's default REPEATABLE READ both reads
+// can share one snapshot, in which case the child is invisible to both and the order is moot. The
+// residual is accepted in decision 16 and tracked in #131, whose criterion 5 is the cross-engine
+// validation this test cannot provide.
+func TestRevokeUserAuthState_ChildCommittedBetweenTheDiscoveryQueries(t *testing.T) {
+	db := mocks_data.NewDatabase(t)
+
+	parent := &models.RefreshToken{
+		Id: 1, RefreshTokenJti: "rt-parent", SessionIdentifier: revokeKeepSid,
+		RefreshTokenType: "Refresh", CodeId: sql.NullInt64{Int64: 11, Valid: true},
+		AuthStateGeneration: revokeOldGeneration,
+	}
+	// Committed by the racing refresh after the user-scoped query ran, so it appears only in
+	// the sid-scoped result below.
+	child := &models.RefreshToken{
+		Id: 2, RefreshTokenJti: "rt-child", SessionIdentifier: revokeKeepSid,
+		RefreshTokenType: "Refresh", CodeId: sql.NullInt64{Int64: 11, Valid: true},
+		PreviousRefreshTokenJti: "rt-parent", AuthStateGeneration: revokeOldGeneration,
+	}
+
+	db.On("IncrementUserAuthStateGeneration", mock.Anything, revokeTx, revokeUserId).
+		Return(revokeNewGeneration, nil).Once()
+	db.On("GetRefreshTokensByUserId", mock.Anything, revokeTx, revokeUserId).
+		Return([]*models.RefreshToken{parent}, nil).Once()
+	db.On("GetRefreshTokensBySessionIdentifier", mock.Anything, revokeTx, revokeKeepSid).
+		Return([]*models.RefreshToken{parent, child}, nil).Once()
+	db.On("PromoteRefreshTokenGenerations", mock.Anything, revokeTx, []int64{1, 2}, revokeNewGeneration).
+		Return(nil).Once()
+	db.On("GetUserSessionsByUserId", mock.Anything, revokeTx, revokeUserId).
+		Return([]models.UserSession{revocationSessions()[0]}, nil).Once()
+	db.On("PromoteUserSessionGeneration", mock.Anything, revokeTx, int64(100), revokeNewGeneration).
+		Return(nil).Once()
+
+	result, err := RevokeUserAuthState(context.Background(), db, revokeTx, revokeUserId, revokeKeepSid)
+	require.NoError(t, err)
+
+	// The child is promoted, not revoked. Promoting an id the sweep never saw is deliberate:
+	// it belongs to the exempted grant origin by the only query that can establish that.
+	assert.Equal(t, []int64{1, 2}, promotedIds(t, db))
+	assert.False(t, child.Revoked, "the racing child must not be revoked")
+	assert.Empty(t, result.RevokedRefreshTokenJtis)
+
+	// The ORDER itself, asserted directly on the recorded calls. Everything above would hold
+	// under the reverse order too, because a mock returns the same rows whenever it is called
+	// and so cannot represent a commit landing between two queries. This assertion therefore
+	// proves the order and NOTHING about visibility: on an engine where the second query can
+	// see the commit, the order is what decides whether the racing child is promoted or
+	// revoked, and on one where it cannot, the order is moot. Pinned here so the ordering is
+	// not "tidied" by someone who reads it as arbitrary.
+	userScoped := callIndex(t, db, "GetRefreshTokensByUserId")
+	sidScoped := callIndex(t, db, "GetRefreshTokensBySessionIdentifier")
+	assert.Less(t, userScoped, sidScoped,
+		"the user-scoped query must run BEFORE the sid-scoped one, so a child committed between them is promoted rather than swept")
+}
+
+// callIndex reports where a method appears in the mock's recorded call sequence.
+func callIndex(t *testing.T, db *mocks_data.Database, method string) int {
+	t.Helper()
+	for i, call := range db.Calls {
+		if call.Method == method {
+			return i
+		}
+	}
+	t.Fatalf("%v was never called", method)
+	return -1
+}
+
+// TestRevokeUserAuthState_PreservedSessionAlreadyReaped covers exceptSid naming a session
+// with no row left. Legitimate rather than an error: the background worker reaps idle
+// sessions while offline refresh tokens outlive them, so the tokens are still exempted and
+// there is simply nothing to promote.
+func TestRevokeUserAuthState_PreservedSessionAlreadyReaped(t *testing.T) {
+	db := mocks_data.NewDatabase(t)
+	offline := &models.RefreshToken{
+		Id: 2, RefreshTokenJti: "rt-keep-offline", RefreshTokenType: "Offline",
+		CodeId: sql.NullInt64{Int64: 12, Valid: true}, AuthStateGeneration: revokeOldGeneration,
+	}
+
+	db.On("IncrementUserAuthStateGeneration", mock.Anything, revokeTx, revokeUserId).
+		Return(revokeNewGeneration, nil).Once()
+	db.On("GetRefreshTokensBySessionIdentifier", mock.Anything, revokeTx, revokeKeepSid).
+		Return([]*models.RefreshToken{offline}, nil).Once()
+	db.On("GetRefreshTokensByUserId", mock.Anything, revokeTx, revokeUserId).
+		Return([]*models.RefreshToken{offline}, nil).Once()
+	db.On("PromoteRefreshTokenGenerations", mock.Anything, revokeTx, []int64{2}, revokeNewGeneration).
+		Return(nil).Once()
+	db.On("GetUserSessionsByUserId", mock.Anything, revokeTx, revokeUserId).
+		Return([]models.UserSession{}, nil).Once()
+
+	result, err := RevokeUserAuthState(context.Background(), db, revokeTx, revokeUserId, revokeKeepSid)
+	require.NoError(t, err)
+
+	assert.False(t, offline.Revoked, "the token is still preserved even with no session row")
+	assert.Equal(t, []int64{2}, promotedIds(t, db))
+	// The exemption WAS applied, so the result reports it even with no session row left
+	// (finding 32). Reporting "" here would leave the audit record unable to explain why
+	// rt-keep-offline is missing from the revoked list. The field names the exempted grant
+	// origin, not a surviving session.
+	assert.Equal(t, revokeKeepSid, result.PreservedSessionIdentifier)
+	assert.Empty(t, result.TerminatedSessionIdentifiers)
+}
+
+// TestRevokeRefreshTokens covers the extracted primitive on its own. Its contract is one
+// sentence, "return only the JTIs this call transitioned", and #77's teardown guard depends on
+// it, so it is tested apart from the sweep that uses it.
+func TestRevokeRefreshTokens(t *testing.T) {
+	t.Run("empty input writes nothing and returns an empty list", func(t *testing.T) {
+		db := mocks_data.NewDatabase(t)
+
+		jtis, err := RevokeRefreshTokens(context.Background(), db, revokeTx, nil)
+
+		require.NoError(t, err)
+		assert.Empty(t, jtis)
+		// Non-nil, so a JSON audit payload carries [] rather than null.
+		assert.NotNil(t, jtis)
+		db.AssertNotCalled(t, "UpdateRefreshToken", mock.Anything, mock.Anything, mock.Anything)
+	})
+
+	t.Run("all already revoked writes nothing and reports nothing", func(t *testing.T) {
+		db := mocks_data.NewDatabase(t)
+		tokens := []*models.RefreshToken{
+			{Id: 1, RefreshTokenJti: "a", Revoked: true},
+			{Id: 2, RefreshTokenJti: "b", Revoked: true},
+		}
+
+		jtis, err := RevokeRefreshTokens(context.Background(), db, revokeTx, tokens)
+
+		require.NoError(t, err)
+		// The load-bearing case for #77: an empty return here is what tells
+		// revokeOnAuthCodeReuse to leave the session alone.
+		assert.Empty(t, jtis)
+		db.AssertNotCalled(t, "UpdateRefreshToken", mock.Anything, mock.Anything, mock.Anything)
+	})
+
+	t.Run("mixed input reports only the transitioned ones", func(t *testing.T) {
+		db := mocks_data.NewDatabase(t)
+		tokens := []*models.RefreshToken{
+			{Id: 1, RefreshTokenJti: "live-1"},
+			{Id: 2, RefreshTokenJti: "dead", Revoked: true},
+			{Id: 3, RefreshTokenJti: "live-2"},
+		}
+		db.On("UpdateRefreshToken", mock.Anything, revokeTx, tokens[0]).Return(nil).Once()
+		db.On("UpdateRefreshToken", mock.Anything, revokeTx, tokens[2]).Return(nil).Once()
+
+		jtis, err := RevokeRefreshTokens(context.Background(), db, revokeTx, tokens)
+
+		require.NoError(t, err)
+		assert.Equal(t, []string{"live-1", "live-2"}, jtis)
+		assert.True(t, tokens[0].Revoked)
+		assert.True(t, tokens[2].Revoked)
+	})
+
+	t.Run("an error mid-loop discards the partial list", func(t *testing.T) {
+		db := mocks_data.NewDatabase(t)
+		tokens := []*models.RefreshToken{
+			{Id: 1, RefreshTokenJti: "live-1"},
+			{Id: 2, RefreshTokenJti: "live-2"},
+		}
+		boom := errors.New("connection refused")
+		db.On("UpdateRefreshToken", mock.Anything, revokeTx, tokens[0]).Return(nil).Once()
+		db.On("UpdateRefreshToken", mock.Anything, revokeTx, tokens[1]).Return(boom).Once()
+
+		jtis, err := RevokeRefreshTokens(context.Background(), db, revokeTx, tokens)
+
+		require.ErrorIs(t, err, boom)
+		// Nil, not ["live-1"]. The caller rolls the transaction back, so reporting a JTI as
+		// revoked when the transaction never committed would put a false claim in the audit
+		// log. Returning the partial list is the tempting shape and is wrong.
+		assert.Nil(t, jtis)
+	})
+}
+
+// The session under termination (#129 stage 3). Deliberately a different id and identifier from
+// the #106 fixtures above, so an expectation copied from one of those tests cannot match here by
+// accident.
+const (
+	terminateSessionId = int64(300)
+	terminateSid       = "sid-terminate"
+)
+
+func terminatedSession() *models.UserSession {
+	return &models.UserSession{
+		Id:                terminateSessionId,
+		SessionIdentifier: terminateSid,
+		UserId:            revokeUserId,
+	}
+}
+
+// terminationFixture builds the three refresh tokens the sid-scoped sweep reasons about:
+//
+//	1 rt-session-bound  session-bound, its own session_identifier set
+//	2 rt-offline        OFFLINE, its own session_identifier EMPTY, code id set
+//	3 rt-already-gone   session-bound, ALREADY revoked
+//
+// Token 2 is the load-bearing one. An offline grant is not session-bound, so the row itself
+// carries no sid and only the joined codes row ties it to this session. It is returned here
+// because GetRefreshTokensBySessionIdentifier matches codes.session_identifier, and any
+// implementation that re-filters these rows by rt.SessionIdentifier drops exactly the offline
+// tokens decision 2 exists to revoke.
+func terminationFixture() []*models.RefreshToken {
+	return []*models.RefreshToken{
+		{
+			Id: 1, RefreshTokenJti: "rt-session-bound",
+			SessionIdentifier: terminateSid,
+			RefreshTokenType:  "Refresh",
+			CodeId:            sql.NullInt64{Int64: 21, Valid: true},
+		},
+		{
+			Id: 2, RefreshTokenJti: "rt-offline",
+			SessionIdentifier: "",
+			RefreshTokenType:  "Offline",
+			CodeId:            sql.NullInt64{Int64: 22, Valid: true},
+		},
+		{
+			Id: 3, RefreshTokenJti: "rt-already-gone",
+			SessionIdentifier: terminateSid,
+			RefreshTokenType:  "Refresh",
+			CodeId:            sql.NullInt64{Int64: 23, Valid: true},
+			Revoked:           true,
+		},
+	}
+}
+
+// TestTerminateUserSessionTx_RevokesTheGrantsOfTheSession is the happy path, and the owner of
+// decision 5's write order. Every expectation is registered on a strict mock against the exact
+// transaction BeginTransaction returned, so a write that reached the pool instead, or a call
+// nobody expected, fails the test on its own.
+func TestTerminateUserSessionTx_RevokesTheGrantsOfTheSession(t *testing.T) {
+	db := mocks_data.NewDatabase(t)
+	tokens := terminationFixture()
+
+	mocks_data.ExpectRunInTransaction(db, revokeTx)
+	db.On("DeleteUserSession", mock.Anything, revokeTx, terminateSessionId).Return(nil).Once()
+	db.On("RevokeCodesBySessionIdentifier", mock.Anything, revokeTx, terminateSid).Return(int64(2), nil).Once()
+	db.On("GetRefreshTokensBySessionIdentifier", mock.Anything, revokeTx, terminateSid).Return(tokens, nil).Once()
+	// The two live tokens only. rt-already-gone is not written again.
+	db.On("UpdateRefreshToken", mock.Anything, revokeTx, tokens[0]).Return(nil).Once()
+	db.On("UpdateRefreshToken", mock.Anything, revokeTx, tokens[1]).Return(nil).Once()
+
+	result, err := TerminateUserSessionTx(context.Background(), db, terminatedSession())
+	require.NoError(t, err)
+
+	// The count is the sweep's own, reported as-is: it is what the audit event carries, and
+	// stage 1's data cases pin that it counts rows TRANSITIONED rather than rows matched.
+	assert.Equal(t, int64(2), result.RevokedCodeCount)
+
+	// Two JTIs, not three. rt-already-gone was revoked before the call, so it is neither written
+	// again nor reported, which is the invariant #77's teardown guard depends on.
+	assert.Equal(t, []string{"rt-session-bound", "rt-offline"}, result.RevokedRefreshTokenJtis)
+	assert.NotContains(t, result.RevokedRefreshTokenJtis, "rt-already-gone")
+
+	// The offline token is revoked although its own session_identifier is empty. This is the
+	// assertion that fails against an implementation re-filtering the swept rows by
+	// rt.SessionIdentifier, which would leave an offline grant refreshing after termination:
+	// gap 1, the defect this issue opens with.
+	assert.True(t, tokens[1].Revoked, "the offline token of the terminated session must be revoked")
+	assert.True(t, tokens[0].Revoked)
+
+	// The order, and unlike #129's it IS a correctness property now. DeleteUserSession leads
+	// because it is the statement that takes the user_sessions row, and that row is what makes an
+	// authorization ceremony minting a code wait for this transaction or this transaction wait for
+	// it (#139 decision 2). With the delete last, as #129 wrote it, the code sweep runs before this
+	// transaction has touched anything the ceremony touches, so a code inserted after the sweep and
+	// before the commit escapes it. This assertion is the unit half of that; the interleaving
+	// itself is at the data tier, where two real transactions can be ordered by hand.
+	//
+	// The two sweeps keep their relative order and #129's reason for it, which is about the join
+	// reaching an offline grant's tokens and says nothing about user_sessions.
+	deletion := callIndex(t, db, "DeleteUserSession")
+	codeSweep := callIndex(t, db, "RevokeCodesBySessionIdentifier")
+	tokenSweep := callIndex(t, db, "GetRefreshTokensBySessionIdentifier")
+	assert.Less(t, deletion, codeSweep, "the session row is taken first, by deleting it")
+	assert.Less(t, codeSweep, tokenSweep, "codes are marked before the tokens are swept")
+
+	// The negative control, and the reason this seam is worth having. Terminating one session
+	// must not advance the user's generation nor sweep user-scoped tokens: either would sign out
+	// every other device that user has, which is the opposite of what the action means and the
+	// reason #129 exists separately from #106.
+	db.AssertNotCalled(t, "IncrementUserAuthStateGeneration", mock.Anything, mock.Anything, mock.Anything)
+	db.AssertNotCalled(t, "GetRefreshTokensByUserId", mock.Anything, mock.Anything, mock.Anything)
+	db.AssertNotCalled(t, "PromoteRefreshTokenGenerations", mock.Anything, mock.Anything, mock.Anything, mock.Anything)
+}
+
+// TestTerminateUserSessionTx_NothingToRevoke covers a session with no grants at all. Ending it is
+// not an error, and the event still attests that the action happened, so the result reports zeros
+// rather than the helper refusing.
+func TestTerminateUserSessionTx_NothingToRevoke(t *testing.T) {
+	db := mocks_data.NewDatabase(t)
+
+	mocks_data.ExpectRunInTransaction(db, revokeTx)
+	db.On("DeleteUserSession", mock.Anything, revokeTx, terminateSessionId).Return(nil).Once()
+	db.On("RevokeCodesBySessionIdentifier", mock.Anything, revokeTx, terminateSid).Return(int64(0), nil).Once()
+	db.On("GetRefreshTokensBySessionIdentifier", mock.Anything, revokeTx, terminateSid).
+		Return([]*models.RefreshToken{}, nil).Once()
+
+	result, err := TerminateUserSessionTx(context.Background(), db, terminatedSession())
+	require.NoError(t, err)
+
+	assert.Equal(t, int64(0), result.RevokedCodeCount)
+	assert.Empty(t, result.RevokedRefreshTokenJtis)
+	// Non-nil, so the audit payload carries [] rather than null.
+	assert.NotNil(t, result.RevokedRefreshTokenJtis)
+	// The session still ends. The strict mock proves it: the DeleteUserSession expectation above
+	// is registered Once and an unmet expectation fails the test.
+	db.AssertNotCalled(t, "UpdateRefreshToken", mock.Anything, mock.Anything, mock.Anything)
+}
+
+// TestTerminateUserSessionTx_RejectsAnUnusableSession pins the entry preconditions. Both are
+// refused before the transaction opens, which the strict mock enforces: no expectations are
+// registered at all, so any call whatsoever fails the case.
+func TestTerminateUserSessionTx_RejectsAnUnusableSession(t *testing.T) {
+	t.Run("nil session", func(t *testing.T) {
+		db := mocks_data.NewDatabase(t)
+
+		result, err := TerminateUserSessionTx(context.Background(), db, nil)
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "requires the session to terminate")
+		assert.Equal(t, TerminationResult{}, result)
+		assertNotAttempted(t, db, "RunInTransaction")
+	})
+
+	t.Run("empty session identifier", func(t *testing.T) {
+		db := mocks_data.NewDatabase(t)
+		session := terminatedSession()
+		session.SessionIdentifier = ""
+
+		result, err := TerminateUserSessionTx(context.Background(), db, session)
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "requires a session identifier")
+		assert.Equal(t, TerminationResult{}, result)
+		// RevokeCodesBySessionIdentifier refuses an empty identifier itself, so the outcome would
+		// be the same three statements later. What this pins is that no transaction was opened
+		// and no write attempted, so a bad argument does not read as a database fault.
+		assertNotAttempted(t, db, "RunInTransaction")
+	})
+}
+
+// TestTerminateUserSessionTx_AnyFailureYieldsTheZeroResult walks every failure point and asserts
+// the same two things at each: the error reaches the caller, and the result is the ZERO value
+// rather than a partially populated one. The second is what stops a caller emitting an audit
+// event that claims a revocation the transaction rolled back.
+//
+// Each row registers only the calls its path reaches. The strict mock does the rest in both
+// directions: an unexpected call fails the case, and so does an expectation that was never met.
+func TestTerminateUserSessionTx_AnyFailureYieldsTheZeroResult(t *testing.T) {
+	boom := errors.New("connection refused")
+
+	cases := []struct {
+		name         string
+		setup        func(db *mocks_data.Database)
+		notAttempted []string
+		extraAssert  func(t *testing.T, result TerminationResult)
+	}{
+		{
+			// The helper could not open a transaction, so the body never runs.
+			name: "the transaction cannot be opened",
+			setup: func(db *mocks_data.Database) {
+				mocks_data.ExpectRunInTransactionRefused(db, boom)
+			},
+			notAttempted: []string{"DeleteUserSession"},
+		},
+		{
+			// The FIRST write since #139, and the row it takes is what orders this transaction
+			// against a ceremony issuing a code. A failure here reaches none of the sweeps, which
+			// is what the notAttempted set below says: the delete is not a step the rest of the
+			// transaction can be reached past.
+			name: "the deletion fails",
+			setup: func(db *mocks_data.Database) {
+				mocks_data.ExpectRunInTransaction(db, revokeTx)
+				db.On("DeleteUserSession", mock.Anything, revokeTx, terminateSessionId).Return(boom).Once()
+			},
+			notAttempted: []string{"RevokeCodesBySessionIdentifier",
+				"GetRefreshTokensBySessionIdentifier"},
+		},
+		{
+			name: "the code sweep fails",
+			setup: func(db *mocks_data.Database) {
+				mocks_data.ExpectRunInTransaction(db, revokeTx)
+				db.On("DeleteUserSession", mock.Anything, revokeTx, terminateSessionId).Return(nil).Once()
+				db.On("RevokeCodesBySessionIdentifier", mock.Anything, revokeTx, terminateSid).
+					Return(int64(0), boom).Once()
+			},
+			notAttempted: []string{"GetRefreshTokensBySessionIdentifier"},
+		},
+		{
+			// KEEP THIS ROW. It is the one that names the property: the sweep returned 2, the
+			// transaction rolls back, and a caller auditing that 2 would record a revocation that
+			// never happened. Measured rather than assumed, against a helper mutated to populate
+			// the result as it goes: four of the six rows here fail under it, because the shared
+			// zero-value assertion in the loop below catches every path where a write had already
+			// succeeded. This row is the one that says WHY, and the only one asserting the count
+			// itself, so the failure reads as a contract violation rather than a struct mismatch.
+			name: "the token query fails after the code sweep revoked two codes",
+			setup: func(db *mocks_data.Database) {
+				mocks_data.ExpectRunInTransaction(db, revokeTx)
+				db.On("DeleteUserSession", mock.Anything, revokeTx, terminateSessionId).Return(nil).Once()
+				db.On("RevokeCodesBySessionIdentifier", mock.Anything, revokeTx, terminateSid).
+					Return(int64(2), nil).Once()
+				db.On("GetRefreshTokensBySessionIdentifier", mock.Anything, revokeTx, terminateSid).
+					Return(nil, boom).Once()
+			},
+			notAttempted: []string{"UpdateRefreshToken"},
+			extraAssert: func(t *testing.T, result TerminationResult) {
+				assert.Equal(t, int64(0), result.RevokedCodeCount,
+					"the count must not survive a rolled-back transaction")
+			},
+		},
+		{
+			name: "a token write fails",
+			setup: func(db *mocks_data.Database) {
+				tokens := terminationFixture()
+				mocks_data.ExpectRunInTransaction(db, revokeTx)
+				db.On("DeleteUserSession", mock.Anything, revokeTx, terminateSessionId).Return(nil).Once()
+				db.On("RevokeCodesBySessionIdentifier", mock.Anything, revokeTx, terminateSid).
+					Return(int64(2), nil).Once()
+				db.On("GetRefreshTokensBySessionIdentifier", mock.Anything, revokeTx, terminateSid).
+					Return(tokens, nil).Once()
+				db.On("UpdateRefreshToken", mock.Anything, revokeTx, tokens[0]).Return(boom).Once()
+			},
+		},
+		{
+			// The one failure whose durable outcome is unknowable, per the helper's comment. The
+			// caller still gets the zero result and must still not audit: a commit that reports an
+			// error may in fact have applied.
+			name: "the commit fails",
+			setup: func(db *mocks_data.Database) {
+				mocks_data.ExpectRunInTransactionThenFail(db, revokeTx, boom)
+				db.On("DeleteUserSession", mock.Anything, revokeTx, terminateSessionId).Return(nil).Once()
+				db.On("RevokeCodesBySessionIdentifier", mock.Anything, revokeTx, terminateSid).
+					Return(int64(1), nil).Once()
+				db.On("GetRefreshTokensBySessionIdentifier", mock.Anything, revokeTx, terminateSid).
+					Return([]*models.RefreshToken{}, nil).Once()
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			db := mocks_data.NewDatabase(t)
+			tc.setup(db)
+
+			result, err := TerminateUserSessionTx(context.Background(), db, terminatedSession())
+
+			require.ErrorIs(t, err, boom)
+			assert.Equal(t, TerminationResult{}, result)
+			assert.Nil(t, result.RevokedRefreshTokenJtis,
+				"the error path returns the zero value, and a caller must not audit it")
+			assertNotAttempted(t, db, tc.notAttempted...)
+			if tc.extraAssert != nil {
+				tc.extraAssert(t, result)
+			}
+		})
+	}
+}
+
+// assertNotAttempted fails if any of the named methods appears in the mock's recorded calls. The
+// strict mock would already reject an unexpected call; this states which writes each failure path
+// must not have reached, so the intent survives a later edit to the expectations.
+func assertNotAttempted(t *testing.T, db *mocks_data.Database, methods ...string) {
+	t.Helper()
+	for _, call := range db.Calls {
+		for _, method := range methods {
+			assert.NotEqual(t, method, call.Method, "%v must not be attempted on this path", method)
+		}
+	}
+}
+
+// The client whose grants are revoked (#245 stage 4). A different id from every fixture above,
+// so an expectation copied from one of those tests cannot match here by accident.
+const revokeClientId = int64(4242)
+
+// clientGrantFixture builds the four refresh tokens the client-scoped sweep reasons about:
+//
+//	1 rt-client-session  auth-code, session-bound, its own session_identifier set
+//	2 rt-client-offline  auth-code, OFFLINE, its own session_identifier EMPTY, code id set
+//	3 rt-client-ropc     ROPC, no code at all, reached only through refresh_tokens.client_id
+//	4 rt-client-gone     ALREADY revoked
+//
+// Tokens 2 and 3 are the load-bearing ones, and they are load-bearing for opposite reasons.
+// Token 2 has no sid of its own, so only the joined codes row ties it to anything. Token 3 has no
+// code at all, which is why the code marker cannot reach it and why the sweep is still owed after
+// decision 16 made the marker the boundary.
+func clientGrantFixture() []*models.RefreshToken {
+	return []*models.RefreshToken{
+		{
+			Id: 1, RefreshTokenJti: "rt-client-session",
+			SessionIdentifier: "sid-client",
+			RefreshTokenType:  "Refresh",
+			CodeId:            sql.NullInt64{Int64: 31, Valid: true},
+		},
+		{
+			Id: 2, RefreshTokenJti: "rt-client-offline",
+			SessionIdentifier: "",
+			RefreshTokenType:  "Offline",
+			CodeId:            sql.NullInt64{Int64: 32, Valid: true},
+		},
+		{
+			Id: 3, RefreshTokenJti: "rt-client-ropc",
+			SessionIdentifier: "",
+			RefreshTokenType:  "Offline",
+			CodeId:            sql.NullInt64{Valid: false},
+			ClientId:          sql.NullInt64{Int64: revokeClientId, Valid: true},
+		},
+		{
+			Id: 4, RefreshTokenJti: "rt-client-gone",
+			SessionIdentifier: "sid-client",
+			RefreshTokenType:  "Refresh",
+			CodeId:            sql.NullInt64{Int64: 34, Valid: true},
+			Revoked:           true,
+		},
+	}
+}
+
+// TestRevokeClientGrants_MarksTheCodesThenSweepsTheTokens is the happy path and the owner of
+// decision 16's write order. Every expectation is registered on a strict mock, so a call nobody
+// expected, or one that reached the pool instead of the transaction, fails the test on its own.
+func TestRevokeClientGrants_MarksTheCodesThenSweepsTheTokens(t *testing.T) {
+	db := mocks_data.NewDatabase(t)
+	tokens := clientGrantFixture()
+
+	db.On("RevokeCodesByClientId", mock.Anything, revokeTx, revokeClientId).Return(int64(3), nil).Once()
+	db.On("GetRefreshTokensByClientId", mock.Anything, revokeTx, revokeClientId).Return(tokens, nil).Once()
+	// The three live tokens only. rt-client-gone is not written again.
+	db.On("UpdateRefreshToken", mock.Anything, revokeTx, tokens[0]).Return(nil).Once()
+	db.On("UpdateRefreshToken", mock.Anything, revokeTx, tokens[1]).Return(nil).Once()
+	db.On("UpdateRefreshToken", mock.Anything, revokeTx, tokens[2]).Return(nil).Once()
+
+	result, err := RevokeClientGrants(context.Background(), db, revokeTx, revokeClientId)
+	require.NoError(t, err)
+
+	// The marker's own count, reported as-is: it is what the audit event carries, and stage 3's
+	// data cases pin that it counts rows TRANSITIONED rather than rows matched.
+	assert.Equal(t, int64(3), result.RevokedCodeCount)
+
+	// Three JTIs, not four. rt-client-gone was revoked before the call, so it is neither written
+	// again nor reported, which is the invariant #77's teardown guard depends on.
+	assert.Equal(t, []string{"rt-client-session", "rt-client-offline", "rt-client-ropc"},
+		result.RevokedRefreshTokenJtis)
+	assert.NotContains(t, result.RevokedRefreshTokenJtis, "rt-client-gone")
+
+	// The ROPC token is revoked although it hangs off no code. This is the assertion that fails
+	// against an implementation that leaned on the code marker alone: decision 16 chose the
+	// marker as the boundary, and the single thing it cannot reach is exactly this row.
+	assert.True(t, tokens[2].Revoked, "the client's ROPC token has no code, so only the sweep reaches it")
+	assert.True(t, tokens[1].Revoked, "the offline token carries no sid of its own and must still be revoked")
+	assert.True(t, tokens[0].Revoked)
+
+	// Decision 16's order: the durable marker first, the sweep second. Within one transaction
+	// this is not a safety boundary and neither call reads the other's rows, so the assertion
+	// pins the design's order rather than a correctness property, and is here so reordering has
+	// to be deliberate.
+	marker := callIndex(t, db, "RevokeCodesByClientId")
+	sweep := callIndex(t, db, "GetRefreshTokensByClientId")
+	assert.Less(t, marker, sweep, "the codes are marked before the tokens are swept")
+
+	// The negative controls, and the reason this seam is worth having separately from
+	// RevokeUserAuthState. A client-scoped action must not advance anybody's generation, must not
+	// delete a session, and must not sweep by user: each would sign the client's users out of
+	// every OTHER client they hold, which is the collateral damage decision 4 exists to avoid.
+	db.AssertNotCalled(t, "IncrementUserAuthStateGeneration", mock.Anything, mock.Anything, mock.Anything)
+	db.AssertNotCalled(t, "DeleteUserSession", mock.Anything, mock.Anything, mock.Anything)
+	db.AssertNotCalled(t, "GetUserSessionsByUserId", mock.Anything, mock.Anything, mock.Anything)
+	db.AssertNotCalled(t, "GetRefreshTokensByUserId", mock.Anything, mock.Anything, mock.Anything)
+	db.AssertNotCalled(t, "PromoteRefreshTokenGenerations", mock.Anything, mock.Anything, mock.Anything, mock.Anything)
+}
+
+// TestRevokeClientGrants_NothingToRevoke covers a client with no grants at all. Not an error: the
+// audit event still attests that the flip happened, so the result reports zeros rather than the
+// helper refusing.
+func TestRevokeClientGrants_NothingToRevoke(t *testing.T) {
+	db := mocks_data.NewDatabase(t)
+
+	db.On("RevokeCodesByClientId", mock.Anything, revokeTx, revokeClientId).Return(int64(0), nil).Once()
+	db.On("GetRefreshTokensByClientId", mock.Anything, revokeTx, revokeClientId).
+		Return([]*models.RefreshToken{}, nil).Once()
+
+	result, err := RevokeClientGrants(context.Background(), db, revokeTx, revokeClientId)
+	require.NoError(t, err)
+
+	assert.Equal(t, int64(0), result.RevokedCodeCount)
+	assert.Empty(t, result.RevokedRefreshTokenJtis)
+	// Non-nil, so the audit payload carries [] rather than null.
+	assert.NotNil(t, result.RevokedRefreshTokenJtis)
+	db.AssertNotCalled(t, "UpdateRefreshToken", mock.Anything, mock.Anything, mock.Anything)
+}
+
+// TestRevokeClientGrants_RequiresATransaction pins the entry precondition. No expectations are
+// registered at all, so the strict mock fails the case on any database call whatsoever: the
+// refusal has to happen before the marker, not after it.
+func TestRevokeClientGrants_RequiresATransaction(t *testing.T) {
+	db := mocks_data.NewDatabase(t)
+
+	result, err := RevokeClientGrants(context.Background(), db, nil, revokeClientId)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "requires a transaction")
+	assert.Empty(t, result.RevokedRefreshTokenJtis)
+	assert.Equal(t, int64(0), result.RevokedCodeCount)
+	assertNotAttempted(t, db, "RevokeCodesByClientId", "GetRefreshTokensByClientId",
+		"UpdateRefreshToken")
+}
+
+// TestRevokeClientGrantsTx_WritesAndRevokesInOneTransaction is the wrapper's happy path. What it
+// owns is that the caller's client write and both revocations reach the SAME transaction, which
+// is what stops a client ending up public with its secret deleted while the grants that secret
+// was protecting survive.
+func TestRevokeClientGrantsTx_WritesAndRevokesInOneTransaction(t *testing.T) {
+	db := mocks_data.NewDatabase(t)
+
+	mocks_data.ExpectRunInTransaction(db, revokeTx)
+	db.On("RevokeCodesByClientId", mock.Anything, revokeTx, revokeClientId).Return(int64(1), nil).Once()
+	db.On("GetRefreshTokensByClientId", mock.Anything, revokeTx, revokeClientId).
+		Return([]*models.RefreshToken{}, nil).Once()
+
+	var wroteWith *sql.Tx
+	result, err := RevokeClientGrantsTx(context.Background(), db, revokeClientId, func(tx *sql.Tx) (bool, error) {
+		wroteWith = tx
+		return true, nil
+	})
+	require.NoError(t, err)
+
+	assert.Same(t, revokeTx, wroteWith,
+		"the caller's write must receive the transaction the revocation runs in, not nil")
+	assert.Equal(t, int64(1), result.RevokedCodeCount)
+
+	// The write happens BEFORE the revocation, so the marker and the sweep observe the client as
+	// it will be after the commit rather than as it was.
+	// RunInTransaction is recorded at entry, before the body runs, so it stands for the opening;
+	// the commit is the helper's and never reaches the mock.
+	assert.Less(t, callIndex(t, db, "RunInTransaction"), callIndex(t, db, "RevokeCodesByClientId"))
+}
+
+// TestRevokeClientGrantsTx_AWriteThatIsNotATransitionCommitsAndRevokesNothing is the other half of
+// the wrapper's contract, and the reason the write reports a bool at all.
+//
+// The decision "is this write the one that removes the client's obligation to authenticate" can
+// only be taken against the row inside the transaction, so it is taken by the write function and
+// reported back. A write answering false still commits: a save of an already-public client is a
+// legitimate write and must not be refused, and it must not revoke, because there is no
+// transition to answer for and the grants belong to a client that was already public before the
+// request arrived.
+//
+// The strict mock is the assertion. RevokeCodesByClientId and GetRefreshTokensByClientId are
+// never registered, so reaching either fails the test.
+func TestRevokeClientGrantsTx_AWriteThatIsNotATransitionCommitsAndRevokesNothing(t *testing.T) {
+	db := mocks_data.NewDatabase(t)
+
+	mocks_data.ExpectRunInTransaction(db, revokeTx)
+
+	wrote := false
+	result, err := RevokeClientGrantsTx(context.Background(), db, revokeClientId, func(tx *sql.Tx) (bool, error) {
+		wrote = true
+		return false, nil
+	})
+	require.NoError(t, err)
+
+	assert.True(t, wrote, "the write still runs and still commits; only the revocation is skipped")
+	assert.Equal(t, int64(0), result.RevokedCodeCount)
+	assert.Empty(t, result.RevokedRefreshTokenJtis)
+	// A list rather than nil, like the success path, so a caller that audits it anyway logs []
+	// rather than null.
+	assert.NotNil(t, result.RevokedRefreshTokenJtis)
+	assertNotAttempted(t, db, "RevokeCodesByClientId", "GetRefreshTokensByClientId",
+		"UpdateRefreshToken")
+}
+
+// TestRevokeClientGrantsTx_AnyFailureYieldsTheZeroResult walks every failure point and asserts the
+// same two things at each: the error reaches the caller, and the result is the ZERO value rather
+// than a partially populated one. The second is what stops a caller emitting an audit event that
+// claims a revocation the transaction rolled back.
+//
+// Each row registers only the calls its path reaches. The strict mock does the rest in both
+// directions: an unexpected call fails the case, and so does an expectation that was never met.
+func TestRevokeClientGrantsTx_AnyFailureYieldsTheZeroResult(t *testing.T) {
+	boom := errors.New("connection refused")
+
+	cases := []struct {
+		name         string
+		setup        func(db *mocks_data.Database)
+		write        func(tx *sql.Tx) (bool, error)
+		notAttempted []string
+		extraAssert  func(t *testing.T, result ClientGrantRevocationResult)
+	}{
+		{
+			// The helper could not open a transaction, so the body never runs.
+			name: "the transaction cannot be opened",
+			setup: func(db *mocks_data.Database) {
+				mocks_data.ExpectRunInTransactionRefused(db, boom)
+			},
+			notAttempted: []string{"RevokeCodesByClientId"},
+		},
+		{
+			// The client write itself failing, which is the case that must not revoke: refusing
+			// the flip and revoking the grants anyway would sign users out of a client that is
+			// still confidential.
+			name: "the client write fails",
+			setup: func(db *mocks_data.Database) {
+				mocks_data.ExpectRunInTransaction(db, revokeTx)
+			},
+			write:        func(tx *sql.Tx) (bool, error) { return false, boom },
+			notAttempted: []string{"RevokeCodesByClientId", "GetRefreshTokensByClientId"},
+		},
+		{
+			name: "the code marker fails",
+			setup: func(db *mocks_data.Database) {
+				mocks_data.ExpectRunInTransaction(db, revokeTx)
+				db.On("RevokeCodesByClientId", mock.Anything, revokeTx, revokeClientId).Return(int64(0), boom).Once()
+			},
+			notAttempted: []string{"GetRefreshTokensByClientId"},
+		},
+		{
+			// KEEP THIS ROW. It is the one that names the property: the marker returned 2, the
+			// transaction rolls back, and a caller auditing that 2 would record a revocation that
+			// never happened. It is also the only row asserting the count itself, so the failure
+			// reads as a contract violation rather than a struct mismatch.
+			name: "the token query fails after the marker revoked two codes",
+			setup: func(db *mocks_data.Database) {
+				mocks_data.ExpectRunInTransaction(db, revokeTx)
+				db.On("RevokeCodesByClientId", mock.Anything, revokeTx, revokeClientId).Return(int64(2), nil).Once()
+				db.On("GetRefreshTokensByClientId", mock.Anything, revokeTx, revokeClientId).Return(nil, boom).Once()
+			},
+			notAttempted: []string{"UpdateRefreshToken"},
+			extraAssert: func(t *testing.T, result ClientGrantRevocationResult) {
+				assert.Equal(t, int64(0), result.RevokedCodeCount,
+					"the count must not survive a rolled-back transaction")
+			},
+		},
+		{
+			name: "a token write fails",
+			setup: func(db *mocks_data.Database) {
+				tokens := clientGrantFixture()
+				mocks_data.ExpectRunInTransaction(db, revokeTx)
+				db.On("RevokeCodesByClientId", mock.Anything, revokeTx, revokeClientId).Return(int64(1), nil).Once()
+				db.On("GetRefreshTokensByClientId", mock.Anything, revokeTx, revokeClientId).Return(tokens, nil).Once()
+				db.On("UpdateRefreshToken", mock.Anything, revokeTx, tokens[0]).Return(boom).Once()
+			},
+		},
+		{
+			name: "the commit fails",
+			setup: func(db *mocks_data.Database) {
+				mocks_data.ExpectRunInTransactionThenFail(db, revokeTx, boom)
+				db.On("RevokeCodesByClientId", mock.Anything, revokeTx, revokeClientId).Return(int64(1), nil).Once()
+				db.On("GetRefreshTokensByClientId", mock.Anything, revokeTx, revokeClientId).
+					Return([]*models.RefreshToken{}, nil).Once()
+			},
+			extraAssert: func(t *testing.T, result ClientGrantRevocationResult) {
+				// The honest contract, documented on the helper: a reported commit failure means
+				// the durable outcome is INDETERMINATE and may in fact have applied. What the
+				// zero result buys is that no audit event claims it did.
+				assert.Nil(t, result.RevokedRefreshTokenJtis)
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			db := mocks_data.NewDatabase(t)
+			tc.setup(db)
+
+			write := tc.write
+			if write == nil {
+				write = func(tx *sql.Tx) (bool, error) { return true, nil }
+			}
+
+			result, err := RevokeClientGrantsTx(context.Background(), db, revokeClientId, write)
+
+			require.ErrorIs(t, err, boom)
+			assert.Equal(t, ClientGrantRevocationResult{}, result,
+				"the error path returns the zero value, and a caller must not audit it")
+			assertNotAttempted(t, db, tc.notAttempted...)
+			if tc.extraAssert != nil {
+				tc.extraAssert(t, result)
+			}
+		})
+	}
+}
+
+// methodOrder is the sequence of database methods a call issued. Every other assertion in this
+// file is about WHAT a function wrote; the two tests below are about WHEN, so the order is what
+// has to be pinned, and testify records it whether or not the expectations were registered in
+// that order.
+func methodOrder(db *mocks_data.Database) []string {
+	order := make([]string, 0, len(db.Calls))
+	for _, call := range db.Calls {
+		order = append(order, call.Method)
+	}
+	return order
+}
+
+// TestRevokeUserAuthState_TakesTheSessionRowsBeforeTheTokenSweep pins the one order this
+// transaction keeps on purpose: the session rows are written before the token sweep, under the
+// generation increment.
+//
+// The reason is local to this transaction and obliges no other site. A termination of one of
+// these sessions deletes the session row as its first statement, so with the session block
+// leading the two serialize on that row and one waits; written the other way round this one
+// takes refresh_tokens and then user_sessions while the termination takes them in the opposite
+// order, and the pair deadlocks on MySQL and SQL Server. The retry would answer that by rerunning
+// the victim, so what the order buys is a wait instead of a rerun on every such race (#139, #301).
+//
+// Order is the only thing a mock can answer here, and it is the thing that matters: what two real
+// transactions of these shapes do to each other is the data tier's.
+func TestRevokeUserAuthState_TakesTheSessionRowsBeforeTheTokenSweep(t *testing.T) {
+	t.Run("the session block precedes both refresh-token reads", func(t *testing.T) {
+		db := mocks_data.NewDatabase(t)
+		token := &models.RefreshToken{Id: 1, RefreshTokenJti: "rt-1"}
+
+		db.On("IncrementUserAuthStateGeneration", mock.Anything, revokeTx, revokeUserId).
+			Return(revokeNewGeneration, nil).Once()
+		db.On("GetUserSessionsByUserId", mock.Anything, revokeTx, revokeUserId).Return([]models.UserSession{
+			{Id: 10, SessionIdentifier: revokeKeepSid},
+			{Id: 20, SessionIdentifier: revokeOtherSid},
+		}, nil).Once()
+		db.On("PromoteUserSessionGeneration", mock.Anything, revokeTx, int64(10), revokeNewGeneration).
+			Return(nil).Once()
+		db.On("DeleteUserSession", mock.Anything, revokeTx, int64(20)).Return(nil).Once()
+		db.On("GetRefreshTokensByUserId", mock.Anything, revokeTx, revokeUserId).
+			Return([]*models.RefreshToken{token}, nil).Once()
+		db.On("GetRefreshTokensBySessionIdentifier", mock.Anything, revokeTx, revokeKeepSid).
+			Return([]*models.RefreshToken{}, nil).Once()
+		db.On("UpdateRefreshToken", mock.Anything, revokeTx, token).Return(nil).Once()
+		db.On("PromoteRefreshTokenGenerations", mock.Anything, revokeTx, []int64{}, revokeNewGeneration).
+			Return(nil).Once()
+
+		result, err := RevokeUserAuthState(context.Background(), db, revokeTx, revokeUserId, revokeKeepSid)
+
+		require.NoError(t, err)
+		assert.Equal(t, []string{revokeOtherSid}, result.TerminatedSessionIdentifiers)
+		assert.Equal(t, []string{"rt-1"}, result.RevokedRefreshTokenJtis)
+		assert.Equal(t, []string{
+			"IncrementUserAuthStateGeneration",
+			"GetUserSessionsByUserId",
+			"PromoteUserSessionGeneration",
+			"DeleteUserSession",
+			"GetRefreshTokensByUserId",
+			"GetRefreshTokensBySessionIdentifier",
+			"UpdateRefreshToken",
+			"PromoteRefreshTokenGenerations",
+		}, methodOrder(db),
+			"the session writes must precede both refresh-token reads, under the increment")
+	})
+
+	t.Run("several sessions are taken in ascending id order", func(t *testing.T) {
+		db := mocks_data.NewDatabase(t)
+
+		db.On("IncrementUserAuthStateGeneration", mock.Anything, revokeTx, revokeUserId).
+			Return(revokeNewGeneration, nil).Once()
+		// The order the engine chose to return them in. GetUserSessionsByUserId carries no
+		// ORDER BY, so this is a shape it really can produce.
+		db.On("GetUserSessionsByUserId", mock.Anything, revokeTx, revokeUserId).Return([]models.UserSession{
+			{Id: 30, SessionIdentifier: "sid-c"},
+			{Id: 10, SessionIdentifier: "sid-a"},
+			{Id: 20, SessionIdentifier: "sid-b"},
+		}, nil).Once()
+		db.On("DeleteUserSession", mock.Anything, revokeTx, mock.AnythingOfType("int64")).Return(nil).Times(3)
+		db.On("GetRefreshTokensByUserId", mock.Anything, revokeTx, revokeUserId).
+			Return([]*models.RefreshToken{}, nil).Once()
+		db.On("PromoteRefreshTokenGenerations", mock.Anything, revokeTx, []int64{}, revokeNewGeneration).
+			Return(nil).Once()
+
+		result, err := RevokeUserAuthState(context.Background(), db, revokeTx, revokeUserId, "")
+
+		require.NoError(t, err)
+
+		// Two transactions of this shape taking the same two rows in opposite orders deadlock
+		// on nothing but the order the engine returned them in, which is why the loop sorts
+		// rather than trusting the query (#139).
+		var deleted []int64
+		for _, call := range db.Calls {
+			if call.Method == "DeleteUserSession" {
+				deleted = append(deleted, call.Arguments.Get(2).(int64))
+			}
+		}
+		assert.Equal(t, []int64{10, 20, 30}, deleted,
+			"the session rows must be taken in a fixed order, whatever order the query returned them in")
+
+		// And the reported list follows the same order, which is what an auditor reads.
+		assert.Equal(t, []string{"sid-a", "sid-b", "sid-c"}, result.TerminatedSessionIdentifiers)
+	})
+}

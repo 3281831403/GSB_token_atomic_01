@@ -1,0 +1,350 @@
+package integrationtests
+
+import (
+	"context"
+	"testing"
+
+	"github.com/leodip/goiabada/authserver/internal/models"
+	"github.com/leodip/goiabada/authserver/internal/passwordhash"
+	"github.com/leodip/goiabada/authserver/internal/testutil/fake"
+	"github.com/pquerna/otp/totp"
+	"github.com/stretchr/testify/assert"
+)
+
+func TestAuthOtp_ClientDisplay_ShowDisplayName_Enabled(t *testing.T) {
+	// Create client with display name enabled
+	client := createClientWithDisplaySettings(t, ClientDisplaySettings{
+		ClientIdentifier: "test-app-" + fake.LetterN(8),
+		DisplayName:      "My Awesome Application",
+		ShowDisplayName:  true,
+		ShowLogo:         false,
+		ShowDescription:  false,
+		ShowWebsiteURL:   false,
+		ConsentRequired:  false,
+		DefaultAcrLevel:  models.AcrLevel2Mandatory, // Requires OTP
+	})
+
+	redirectUri := &models.RedirectURI{
+		ClientId: client.Id,
+		URI:      fake.URL(),
+	}
+	err := database.CreateRedirectURI(context.Background(), nil, redirectUri)
+	assert.NoError(t, err)
+
+	// Create user with OTP enabled
+	password := fake.Password(8)
+	passwordHashed, err := passwordhash.Hash(password)
+	assert.NoError(t, err)
+
+	userEmail := fake.Email()
+	key, err := totp.Generate(totp.GenerateOpts{
+		Issuer:      "Goiabada",
+		AccountName: userEmail,
+	})
+	assert.NoError(t, err)
+
+	user := &models.User{
+		Subject:            fake.UUID(),
+		Enabled:            true,
+		Email:              userEmail,
+		PasswordHash:       passwordHashed,
+		OTPSecretEncrypted: encryptOTPSecretForTest(t, key.Secret()),
+		OTPEnabled:         true,
+	}
+	err = database.CreateUser(context.Background(), nil, user)
+	assert.NoError(t, err)
+
+	// Navigate to OTP screen
+	httpClient := createHttpClient(t)
+	resp := navigateToOtpScreen(t, httpClient, client, user, password, redirectUri.URI)
+	defer func() { _ = resp.Body.Close() }()
+
+	// Parse HTML
+	doc := parseHTMLResponse(t, resp)
+
+	// Assert display name is shown
+	assertClientNameInHTML(t, doc, "My Awesome Application")
+	assertClientLogoInHTML(t, doc, client.ClientIdentifier, false)
+	assertClientDescriptionInHTML(t, doc, "", false)
+	assertClientWebsiteUrlInHTML(t, doc, "", false)
+}
+
+func TestAuthOtp_ClientDisplay_AllEnabled_Enabled(t *testing.T) {
+	// Create client with all display settings enabled
+	client := createClientWithDisplaySettings(t, ClientDisplaySettings{
+		ClientIdentifier: "test-app-" + fake.LetterN(8),
+		DisplayName:      "My Awesome Application",
+		Description:      "The best app for testing OAuth flows",
+		WebsiteURL:       "https://example.com",
+		ShowLogo:         true,
+		ShowDisplayName:  true,
+		ShowDescription:  true,
+		ShowWebsiteURL:   true,
+		UploadLogo:       true,
+		ConsentRequired:  false,
+		DefaultAcrLevel:  models.AcrLevel2Mandatory,
+	})
+
+	redirectUri := &models.RedirectURI{
+		ClientId: client.Id,
+		URI:      fake.URL(),
+	}
+	err := database.CreateRedirectURI(context.Background(), nil, redirectUri)
+	assert.NoError(t, err)
+
+	// Create user with OTP enabled
+	password := fake.Password(8)
+	passwordHashed, err := passwordhash.Hash(password)
+	assert.NoError(t, err)
+
+	userEmail := fake.Email()
+	key, err := totp.Generate(totp.GenerateOpts{
+		Issuer:      "Goiabada",
+		AccountName: userEmail,
+	})
+	assert.NoError(t, err)
+
+	user := &models.User{
+		Subject:            fake.UUID(),
+		Enabled:            true,
+		Email:              userEmail,
+		PasswordHash:       passwordHashed,
+		OTPSecretEncrypted: encryptOTPSecretForTest(t, key.Secret()),
+		OTPEnabled:         true,
+	}
+	err = database.CreateUser(context.Background(), nil, user)
+	assert.NoError(t, err)
+
+	// Navigate to OTP screen
+	httpClient := createHttpClient(t)
+	resp := navigateToOtpScreen(t, httpClient, client, user, password, redirectUri.URI)
+	defer func() { _ = resp.Body.Close() }()
+
+	// Parse HTML
+	doc := parseHTMLResponse(t, resp)
+
+	// Assert all elements are visible
+	assertClientNameInHTML(t, doc, "My Awesome Application")
+	assertClientLogoInHTML(t, doc, client.ClientIdentifier, true)
+	assertClientDescriptionInHTML(t, doc, "The best app for testing OAuth flows", true)
+	assertClientWebsiteUrlInHTML(t, doc, "https://example.com", true)
+}
+
+func TestAuthOtp_ClientDisplay_AllDisabled_Enabled(t *testing.T) {
+	// Create client with all display settings disabled
+	clientId := "test-app-" + fake.LetterN(8)
+	client := createClientWithDisplaySettings(t, ClientDisplaySettings{
+		ClientIdentifier: clientId,
+		DisplayName:      "My Awesome Application",
+		Description:      "The best app for testing OAuth flows",
+		WebsiteURL:       "https://example.com",
+		ShowLogo:         false,
+		ShowDisplayName:  false,
+		ShowDescription:  false,
+		ShowWebsiteURL:   false,
+		UploadLogo:       true,
+		ConsentRequired:  false,
+		DefaultAcrLevel:  models.AcrLevel2Mandatory,
+	})
+
+	redirectUri := &models.RedirectURI{
+		ClientId: client.Id,
+		URI:      fake.URL(),
+	}
+	err := database.CreateRedirectURI(context.Background(), nil, redirectUri)
+	assert.NoError(t, err)
+
+	// Create user with OTP enabled
+	password := fake.Password(8)
+	passwordHashed, err := passwordhash.Hash(password)
+	assert.NoError(t, err)
+
+	userEmail := fake.Email()
+	key, err := totp.Generate(totp.GenerateOpts{
+		Issuer:      "Goiabada",
+		AccountName: userEmail,
+	})
+	assert.NoError(t, err)
+
+	user := &models.User{
+		Subject:            fake.UUID(),
+		Enabled:            true,
+		Email:              userEmail,
+		PasswordHash:       passwordHashed,
+		OTPSecretEncrypted: encryptOTPSecretForTest(t, key.Secret()),
+		OTPEnabled:         true,
+	}
+	err = database.CreateUser(context.Background(), nil, user)
+	assert.NoError(t, err)
+
+	// Navigate to OTP screen
+	httpClient := createHttpClient(t)
+	resp := navigateToOtpScreen(t, httpClient, client, user, password, redirectUri.URI)
+	defer func() { _ = resp.Body.Close() }()
+
+	// Parse HTML
+	doc := parseHTMLResponse(t, resp)
+
+	// Only client identifier should be visible
+	assertClientNameInHTML(t, doc, clientId)
+	assertClientLogoInHTML(t, doc, client.ClientIdentifier, false)
+	assertClientDescriptionInHTML(t, doc, "The best app for testing OAuth flows", false)
+	assertClientWebsiteUrlInHTML(t, doc, "https://example.com", false)
+}
+
+func TestAuthOtp_ClientDisplay_ShowDisplayName_Enrollment(t *testing.T) {
+	// Create client with display name enabled
+	client := createClientWithDisplaySettings(t, ClientDisplaySettings{
+		ClientIdentifier: "test-app-" + fake.LetterN(8),
+		DisplayName:      "My Awesome Application",
+		ShowDisplayName:  true,
+		ShowLogo:         false,
+		ShowDescription:  false,
+		ShowWebsiteURL:   false,
+		ConsentRequired:  false,
+		DefaultAcrLevel:  models.AcrLevel2Mandatory, // Requires OTP
+	})
+
+	redirectUri := &models.RedirectURI{
+		ClientId: client.Id,
+		URI:      fake.URL(),
+	}
+	err := database.CreateRedirectURI(context.Background(), nil, redirectUri)
+	assert.NoError(t, err)
+
+	// Create user WITHOUT OTP (enrollment scenario)
+	password := fake.Password(8)
+	passwordHashed, err := passwordhash.Hash(password)
+	assert.NoError(t, err)
+
+	user := &models.User{
+		Subject:      fake.UUID(),
+		Enabled:      true,
+		Email:        fake.Email(),
+		PasswordHash: passwordHashed,
+		OTPEnabled:   false, // No OTP yet
+	}
+	err = database.CreateUser(context.Background(), nil, user)
+	assert.NoError(t, err)
+
+	// Navigate to OTP screen (will show enrollment page)
+	httpClient := createHttpClient(t)
+	resp := navigateToOtpScreen(t, httpClient, client, user, password, redirectUri.URI)
+	defer func() { _ = resp.Body.Close() }()
+
+	// Parse HTML
+	doc := parseHTMLResponse(t, resp)
+
+	// Assert display name is shown on enrollment page
+	assertClientNameInHTML(t, doc, "My Awesome Application")
+	assertClientLogoInHTML(t, doc, client.ClientIdentifier, false)
+	assertClientDescriptionInHTML(t, doc, "", false)
+	assertClientWebsiteUrlInHTML(t, doc, "", false)
+}
+
+func TestAuthOtp_ClientDisplay_AllEnabled_Enrollment(t *testing.T) {
+	// Create client with all display settings enabled
+	client := createClientWithDisplaySettings(t, ClientDisplaySettings{
+		ClientIdentifier: "test-app-" + fake.LetterN(8),
+		DisplayName:      "My Awesome Application",
+		Description:      "The best app for testing OAuth flows",
+		WebsiteURL:       "https://example.com",
+		ShowLogo:         true,
+		ShowDisplayName:  true,
+		ShowDescription:  true,
+		ShowWebsiteURL:   true,
+		UploadLogo:       true,
+		ConsentRequired:  false,
+		DefaultAcrLevel:  models.AcrLevel2Mandatory,
+	})
+
+	redirectUri := &models.RedirectURI{
+		ClientId: client.Id,
+		URI:      fake.URL(),
+	}
+	err := database.CreateRedirectURI(context.Background(), nil, redirectUri)
+	assert.NoError(t, err)
+
+	// Create user WITHOUT OTP (enrollment scenario)
+	password := fake.Password(8)
+	passwordHashed, err := passwordhash.Hash(password)
+	assert.NoError(t, err)
+
+	user := &models.User{
+		Subject:      fake.UUID(),
+		Enabled:      true,
+		Email:        fake.Email(),
+		PasswordHash: passwordHashed,
+		OTPEnabled:   false,
+	}
+	err = database.CreateUser(context.Background(), nil, user)
+	assert.NoError(t, err)
+
+	// Navigate to OTP screen (enrollment)
+	httpClient := createHttpClient(t)
+	resp := navigateToOtpScreen(t, httpClient, client, user, password, redirectUri.URI)
+	defer func() { _ = resp.Body.Close() }()
+
+	// Parse HTML
+	doc := parseHTMLResponse(t, resp)
+
+	// Assert all elements are visible on enrollment page
+	assertClientNameInHTML(t, doc, "My Awesome Application")
+	assertClientLogoInHTML(t, doc, client.ClientIdentifier, true)
+	assertClientDescriptionInHTML(t, doc, "The best app for testing OAuth flows", true)
+	assertClientWebsiteUrlInHTML(t, doc, "https://example.com", true)
+}
+
+func TestAuthOtp_ClientDisplay_AllDisabled_Enrollment(t *testing.T) {
+	// Create client with all display settings disabled
+	clientId := "test-app-" + fake.LetterN(8)
+	client := createClientWithDisplaySettings(t, ClientDisplaySettings{
+		ClientIdentifier: clientId,
+		DisplayName:      "My Awesome Application",
+		Description:      "The best app for testing OAuth flows",
+		WebsiteURL:       "https://example.com",
+		ShowLogo:         false,
+		ShowDisplayName:  false,
+		ShowDescription:  false,
+		ShowWebsiteURL:   false,
+		UploadLogo:       true,
+		ConsentRequired:  false,
+		DefaultAcrLevel:  models.AcrLevel2Mandatory,
+	})
+
+	redirectUri := &models.RedirectURI{
+		ClientId: client.Id,
+		URI:      fake.URL(),
+	}
+	err := database.CreateRedirectURI(context.Background(), nil, redirectUri)
+	assert.NoError(t, err)
+
+	// Create user WITHOUT OTP (enrollment scenario)
+	password := fake.Password(8)
+	passwordHashed, err := passwordhash.Hash(password)
+	assert.NoError(t, err)
+
+	user := &models.User{
+		Subject:      fake.UUID(),
+		Enabled:      true,
+		Email:        fake.Email(),
+		PasswordHash: passwordHashed,
+		OTPEnabled:   false,
+	}
+	err = database.CreateUser(context.Background(), nil, user)
+	assert.NoError(t, err)
+
+	// Navigate to OTP screen (enrollment)
+	httpClient := createHttpClient(t)
+	resp := navigateToOtpScreen(t, httpClient, client, user, password, redirectUri.URI)
+	defer func() { _ = resp.Body.Close() }()
+
+	// Parse HTML
+	doc := parseHTMLResponse(t, resp)
+
+	// Only client identifier should be visible on enrollment page
+	assertClientNameInHTML(t, doc, clientId)
+	assertClientLogoInHTML(t, doc, client.ClientIdentifier, false)
+	assertClientDescriptionInHTML(t, doc, "The best app for testing OAuth flows", false)
+	assertClientWebsiteUrlInHTML(t, doc, "https://example.com", false)
+}

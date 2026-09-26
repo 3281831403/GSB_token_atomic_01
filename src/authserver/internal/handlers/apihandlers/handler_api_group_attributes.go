@@ -1,0 +1,379 @@
+package apihandlers
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"net/http"
+	"strconv"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/leodip/goiabada/authserver/internal/accountvalidation"
+	"github.com/leodip/goiabada/authserver/internal/apimapping"
+	"github.com/leodip/goiabada/authserver/internal/audit"
+	"github.com/leodip/goiabada/authserver/internal/models"
+	"github.com/leodip/goiabada/core/api"
+	"github.com/leodip/goiabada/core/errs"
+	"github.com/leodip/goiabada/core/i18n"
+	"github.com/leodip/goiabada/core/validators"
+)
+
+// groupAttributesDatabase is what the group attribute endpoints need: the group and the
+// attributes hanging off it.
+type groupAttributesDatabase interface {
+	CreateGroupAttribute(ctx context.Context, tx *sql.Tx, groupAttribute *models.GroupAttribute) error
+	DeleteGroupAttribute(ctx context.Context, tx *sql.Tx, groupAttributeId int64) error
+	GetGroupAttributeById(ctx context.Context, tx *sql.Tx, groupAttributeId int64) (*models.GroupAttribute, error)
+	GetGroupAttributesByGroupId(ctx context.Context, tx *sql.Tx, groupId int64) ([]models.GroupAttribute, error)
+	GetGroupById(ctx context.Context, tx *sql.Tx, groupId int64) (*models.Group, error)
+	UpdateGroupAttribute(ctx context.Context, tx *sql.Tx, groupAttribute *models.GroupAttribute) error
+}
+
+func HandleAPIGroupAttributesGet(
+	database groupAttributesDatabase,
+) http.HandlerFunc {
+
+	return func(w http.ResponseWriter, r *http.Request) {
+
+		idStr := chi.URLParam(r, "id")
+		if idStr == "" {
+			writeJSONError(w, "Group ID is required", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		id, err := strconv.ParseInt(idStr, 10, 64)
+		if err != nil {
+			writeJSONError(w, "Invalid group ID", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		// Verify group exists
+		group, err := database.GetGroupById(r.Context(), nil, id)
+		if err != nil {
+			writeInternalServerError(w, r, errs.Wrap(err, "database error getting group by ID for attributes"), "group_id", id)
+			return
+		}
+		if group == nil {
+			writeJSONError(w, "Group not found", "NOT_FOUND", http.StatusNotFound)
+			return
+		}
+
+		// Get group attributes
+		attributes, err := database.GetGroupAttributesByGroupId(r.Context(), nil, id)
+		if err != nil {
+			writeInternalServerError(w, r, errs.Wrap(err, "database error getting group attributes by group ID"), "group_id", id)
+			return
+		}
+
+		response := api.GetGroupAttributesResponse{
+			Attributes: apimapping.ToGroupAttributeResponses(attributes),
+		}
+
+		// Ensure we never return a nil slice
+		if response.Attributes == nil {
+			response.Attributes = []api.GroupAttributeResponse{}
+		}
+
+		writeJSON(w, r, http.StatusOK, response)
+	}
+}
+
+func HandleAPIGroupAttributeGet(
+	database groupAttributesDatabase,
+) http.HandlerFunc {
+
+	return func(w http.ResponseWriter, r *http.Request) {
+
+		idStr := chi.URLParam(r, "id")
+		if idStr == "" {
+			writeJSONError(w, "Group attribute ID is required", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		id, err := strconv.ParseInt(idStr, 10, 64)
+		if err != nil {
+			writeJSONError(w, "Invalid group attribute ID", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		if id < 0 {
+			writeJSONError(w, "Group attribute not found", "NOT_FOUND", http.StatusNotFound)
+			return
+		}
+
+		// Get group attribute
+		attribute, err := database.GetGroupAttributeById(r.Context(), nil, id)
+		if err != nil {
+			writeInternalServerError(w, r, errs.Wrap(err, "database error getting group attribute by ID"), "attribute_id", id)
+			return
+		}
+		if attribute == nil {
+			writeJSONError(w, "Group attribute not found", "NOT_FOUND", http.StatusNotFound)
+			return
+		}
+
+		response := api.GetGroupAttributeResponse{
+			Attribute: *apimapping.ToGroupAttributeResponse(attribute),
+		}
+
+		writeJSON(w, r, http.StatusOK, response)
+	}
+}
+
+func HandleAPIGroupAttributeCreatePost(
+	database groupAttributesDatabase,
+	identifierValidator *validators.IdentifierValidator,
+	auditLogger AuditLogger,
+) http.HandlerFunc {
+
+	return func(w http.ResponseWriter, r *http.Request) {
+
+		var createReq api.CreateGroupAttributeRequest
+		err := json.NewDecoder(r.Body).Decode(&createReq)
+		if err != nil {
+			writeJSONError(w, "Invalid request body", "INVALID_REQUEST_BODY", http.StatusBadRequest)
+			return
+		}
+
+		// Validate required fields
+		if createReq.Key == "" {
+			writeJSONError(w, "Attribute key is required", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		if createReq.GroupId <= 0 {
+			writeJSONError(w, "Group ID is required", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		// Validate key format
+		err = identifierValidator.ValidateIdentifier(createReq.Key, false)
+		if err != nil {
+			writeValidationError(w, r, err)
+			return
+		}
+
+		// Validate value length
+		const maxLengthAttrValue = 250
+		if len(createReq.Value) > maxLengthAttrValue {
+			writeJSONError(w, "The attribute value cannot exceed a maximum length of "+strconv.Itoa(maxLengthAttrValue)+" characters", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		if validateNoAngleBracketsErr := accountvalidation.ValidateNoAngleBrackets(createReq.Value, i18n.ErrCodeAttributeValueAngleBrackets); validateNoAngleBracketsErr != nil {
+			writeValidationError(w, r, validateNoAngleBracketsErr)
+			return
+		}
+
+		// Verify group exists
+		group, err := database.GetGroupById(r.Context(), nil, createReq.GroupId)
+		if err != nil {
+			writeInternalServerError(w, r, err)
+			return
+		}
+		if group == nil {
+			writeJSONError(w, "Group not found", "NOT_FOUND", http.StatusNotFound)
+			return
+		}
+
+		// Create group attribute
+		groupAttribute := &models.GroupAttribute{
+			Key:                  createReq.Key,
+			Value:                createReq.Value,
+			IncludeInIdToken:     createReq.IncludeInIdToken,
+			IncludeInAccessToken: createReq.IncludeInAccessToken,
+			GroupId:              createReq.GroupId,
+		}
+
+		err = database.CreateGroupAttribute(r.Context(), nil, groupAttribute)
+		if err != nil {
+			writeInternalServerError(w, r, errs.Wrap(err, "database error creating group attribute"), "group_id", groupAttribute.GroupId, "key", groupAttribute.Key)
+			return
+		}
+
+		// Audit log
+		auditLogger.Log(r.Context(), audit.AuditAddedGroupAttribute, map[string]interface{}{
+			"groupAttributeId": groupAttribute.Id,
+			"groupId":          group.Id,
+			"groupIdentifier":  group.GroupIdentifier,
+			"loggedInUser":     callerSubject(r),
+		})
+
+		// Return created attribute
+		response := api.CreateGroupAttributeResponse{
+			Attribute: *apimapping.ToGroupAttributeResponse(groupAttribute),
+		}
+
+		writeJSON(w, r, http.StatusCreated, response)
+	}
+}
+
+func HandleAPIGroupAttributeUpdatePut(
+	database groupAttributesDatabase,
+	identifierValidator *validators.IdentifierValidator,
+	auditLogger AuditLogger,
+) http.HandlerFunc {
+
+	return func(w http.ResponseWriter, r *http.Request) {
+
+		idStr := chi.URLParam(r, "id")
+		if idStr == "" {
+			writeJSONError(w, "Group attribute ID is required", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		id, err := strconv.ParseInt(idStr, 10, 64)
+		if err != nil {
+			writeJSONError(w, "Invalid group attribute ID", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		if id < 0 {
+			writeJSONError(w, "Group attribute not found", "NOT_FOUND", http.StatusNotFound)
+			return
+		}
+
+		// Get existing attribute
+		attribute, err := database.GetGroupAttributeById(r.Context(), nil, id)
+		if err != nil {
+			writeInternalServerError(w, r, errs.Wrap(err, "database error getting group attribute by ID"), "attribute_id", id)
+			return
+		}
+		if attribute == nil {
+			writeJSONError(w, "Group attribute not found", "NOT_FOUND", http.StatusNotFound)
+			return
+		}
+
+		var updateReq api.UpdateGroupAttributeRequest
+		err = json.NewDecoder(r.Body).Decode(&updateReq)
+		if err != nil {
+			writeJSONError(w, "Invalid request body", "INVALID_REQUEST_BODY", http.StatusBadRequest)
+			return
+		}
+
+		// Validate required fields
+		if updateReq.Key == "" {
+			writeJSONError(w, "Attribute key is required", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		// Validate key format
+		err = identifierValidator.ValidateIdentifier(updateReq.Key, false)
+		if err != nil {
+			writeValidationError(w, r, err)
+			return
+		}
+
+		// Validate value length
+		const maxLengthAttrValue = 250
+		if len(updateReq.Value) > maxLengthAttrValue {
+			writeJSONError(w, "The attribute value cannot exceed a maximum length of "+strconv.Itoa(maxLengthAttrValue)+" characters", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		if validateNoAngleBracketsErr := accountvalidation.ValidateNoAngleBrackets(updateReq.Value, i18n.ErrCodeAttributeValueAngleBrackets); validateNoAngleBracketsErr != nil {
+			writeValidationError(w, r, validateNoAngleBracketsErr)
+			return
+		}
+
+		// Get group for audit log
+		group, err := database.GetGroupById(r.Context(), nil, attribute.GroupId)
+		if err != nil {
+			writeInternalServerError(w, r, err)
+			return
+		}
+
+		// Update attribute
+		attribute.Key = updateReq.Key
+		attribute.Value = updateReq.Value
+		attribute.IncludeInIdToken = updateReq.IncludeInIdToken
+		attribute.IncludeInAccessToken = updateReq.IncludeInAccessToken
+
+		err = database.UpdateGroupAttribute(r.Context(), nil, attribute)
+		if err != nil {
+			writeInternalServerError(w, r, errs.Wrap(err, "database error updating group attribute"), "attribute_id", attribute.Id, "group_id", attribute.GroupId, "key", attribute.Key)
+			return
+		}
+
+		// Audit log
+		auditLogger.Log(r.Context(), audit.AuditUpdatedGroupAttribute, map[string]interface{}{
+			"groupAttributeId": attribute.Id,
+			"groupId":          attribute.GroupId,
+			"groupIdentifier":  group.GroupIdentifier,
+			"loggedInUser":     callerSubject(r),
+		})
+
+		// Return updated attribute
+		response := api.UpdateGroupAttributeResponse{
+			Attribute: *apimapping.ToGroupAttributeResponse(attribute),
+		}
+
+		writeJSON(w, r, http.StatusOK, response)
+	}
+}
+
+func HandleAPIGroupAttributeDelete(
+	database groupAttributesDatabase,
+	auditLogger AuditLogger,
+) http.HandlerFunc {
+
+	return func(w http.ResponseWriter, r *http.Request) {
+
+		idStr := chi.URLParam(r, "id")
+		if idStr == "" {
+			writeJSONError(w, "Group attribute ID is required", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		id, err := strconv.ParseInt(idStr, 10, 64)
+		if err != nil {
+			writeJSONError(w, "Invalid group attribute ID", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		if id < 0 {
+			writeJSONError(w, "Group attribute not found", "NOT_FOUND", http.StatusNotFound)
+			return
+		}
+
+		// Get existing attribute for audit log
+		attribute, err := database.GetGroupAttributeById(r.Context(), nil, id)
+		if err != nil {
+			writeInternalServerError(w, r, errs.Wrap(err, "database error getting group attribute by ID"), "attribute_id", id)
+			return
+		}
+		if attribute == nil {
+			writeJSONError(w, "Group attribute not found", "NOT_FOUND", http.StatusNotFound)
+			return
+		}
+
+		// Get group for audit log
+		group, err := database.GetGroupById(r.Context(), nil, attribute.GroupId)
+		if err != nil {
+			writeInternalServerError(w, r, err)
+			return
+		}
+
+		// Delete attribute
+		err = database.DeleteGroupAttribute(r.Context(), nil, id)
+		if err != nil {
+			writeInternalServerError(w, r, errs.Wrap(err, "database error deleting group attribute"), "attribute_id", id, "group_id", attribute.GroupId, "key", attribute.Key)
+			return
+		}
+
+		// Audit log
+		auditLogger.Log(r.Context(), audit.AuditDeleteGroupAttribute, map[string]interface{}{
+			"groupAttributeId": id,
+			"groupId":          attribute.GroupId,
+			"groupIdentifier":  group.GroupIdentifier,
+			"loggedInUser":     callerSubject(r),
+		})
+
+		// Return success response
+		response := api.SuccessResponse{
+			Success: true,
+		}
+
+		writeJSON(w, r, http.StatusOK, response)
+	}
+}

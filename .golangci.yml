@@ -1,0 +1,159 @@
+# golangci-lint configuration for all four Go modules.
+#
+# `default: none` is load-bearing. Without it, `enable` only ADDS to the
+# `standard` set, so the gate would silently widen whenever an upstream release
+# changes what `standard` means -- and a linter nobody chose could redden every
+# open PR. Listing the linters explicitly makes that an intentional, reviewable
+# commit instead.
+#
+# The first five below are exactly golangci-lint 2.12.2's `standard` set, pinned
+# as of the CI/CD v2 stage 0 cleanup. Four deliberate widenings follow. sloglint
+# was added by #320: it holds the logging convention CLAUDE.md pattern 8
+# states, type-checked, and its settings below are that convention spelled in
+# its vocabulary. govet's shadow analyzer was added by #425, under govet's
+# settings below. gosec was added by #426 with every rule on: a server with no
+# timeouts and a setup wizard writing its secrets world-readable were both
+# gosec findings nobody had run gosec to see. nolintlint was added beside it,
+# because gosec's false positives are suppressed inline, and it holds every
+# suppression to naming its linter and its reason and to still being needed.
+# The binary itself is pinned in src/authserver/versions.yaml
+# (tools.golangci-lint).
+#
+# Note that golangci-lint's bundled staticcheck includes the QF (quickfix)
+# family, which the standalone `staticcheck` binary does not ship at all. This
+# file is therefore the wider gate and the single definition of "lint-clean".
+version: "2"
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - sloglint
+    - gosec
+    - nolintlint
+  settings:
+    nolintlint:
+      # Every //nolint names the linter it silences and says why, and one that
+      # silences nothing is itself a finding, so a suppression cannot outlive
+      # the code it was written for (#426 decision 10).
+      require-explanation: true
+      require-specific: true
+      allow-unused: false
+    govet:
+      enable:
+        # A := in an inner scope that redeclares an outer variable. The logout
+        # endpoint wrote such an inner err's outer twin, which is nil there,
+        # instead of the error it had just caught (#414, fixed in #425). Default
+        # (non-strict) mode, and no exclusion for tests: a shadowed err in a test
+        # can make an assertion pass whatever the code did. A finding is
+        # resolved by renaming the inner variable for what it holds, never by
+        # turning := into = and never by //nolint (#425 decisions 12 and 13).
+        - shadow
+    unused:
+      # A field the constructor writes and nothing ever reads is dead, and the
+      # default (field-writes-are-uses: true) calls the write a use, so the
+      # check is silent on exactly the shape #333 was filed about. It had hidden
+      # four production fields: the unread `database` on AddressValidator and on
+      # PhoneValidator, UserSessionManager's `codeIssuer` -- which was the whole
+      # of the production usersession -> core/oauth edge -- and SettingsCache's
+      # `lastFetchErr`. All four are gone; this setting is what stops the fifth.
+      # A field that is genuinely consumed whole rather than by selector, a
+      # reflection fixture or a struct compared against a positional literal,
+      # keeps a //nolint:unused naming why the linter cannot see the use.
+      field-writes-are-uses: false
+      # exported-is-used is deliberately NOT set here. Measured on a tree that
+      # still contained all nine dead interfaces #333 deleted, it reported zero
+      # findings in all three modules, so it is inert in this build and the line
+      # would be one nobody could attribute a behaviour to. The dead-interface
+      # half of #333 is held by a guard in core/testutil instead, which resolves
+      # references by package rather than by name and so cannot be fooled the
+      # way a bare-name census was.
+    sloglint:
+      # A slog call inside any function, at any enclosing depth, that has a
+      # context.Context or an *http.Request parameter is a *Context variant, so
+      # the installed handler can append request_id (#320 decision 2). "scope"
+      # is exactly that reading: sloglint walks the enclosing FuncDecl and
+      # FuncLit parameters and matches both types by their checked type.
+      context: scope
+      # The message is a string literal or a constant, so a record is greppable
+      # by its message and its values ride as attributes (#320 decision 4). A
+      # constant is admitted here and msg-style below reads literals only, so
+      # testutil.AssertSlogConvention refuses any message that is not a literal
+      # at the call: otherwise a constant is how an opener gets past every guard.
+      static-msg: true
+      # First rune lowercase (#320 decision 4). The component prefix and the
+      # "failed to" / "error " openers the same decision refuses are text
+      # sloglint has no option for, so testutil.AssertSlogConvention holds them.
+      msg-style: lowercased
+      # snake_case keys, one spelling per concept (#320 decision 3).
+      key-naming-case: snake
+      # err is spelled error, the name the JSON handler rewrites to keep the
+      # core/errs stack. request_id is never written by a call site: the
+      # handler injects it from the context, and a site writing its own puts
+      # the key in the record twice. core/logging, which IS the injector, is
+      # exempted under exclusions below (#320 decisions 2 and 3).
+      forbidden-keys:
+        - err
+        - request_id
+        - request-id
+      # Functions that take the caller's key/value run and hand it to one
+      # record. Registering them is what makes sloglint read the keys at their
+      # call sites, which is where 328 API 500s and 20 id_token_hint refusals
+      # write theirs. msg-pos is -1 because none of them takes a message; the
+      # run begins at args-pos. testutil.AssertSlogConvention checks this list
+      # against slogSpreadSites, so a forwarder cannot be registered on one
+      # side only.
+      custom-funcs:
+        - name: github.com/leodip/goiabada/authserver/internal/apiresponse.WriteInternalServerError
+          msg-pos: -1
+          args-pos: 3
+        - name: github.com/leodip/goiabada/authserver/internal/apiresponse.LogInternalServerError
+          msg-pos: -1
+          args-pos: 2
+        - name: github.com/leodip/goiabada/authserver/internal/handlers/apihandlers.writeInternalServerError
+          msg-pos: -1
+          args-pos: 3
+        - name: github.com/leodip/goiabada/authserver/internal/handlers.rejectIdTokenHint
+          msg-pos: -1
+          args-pos: 2
+  exclusions:
+    rules:
+      # Test files read records through testutil.CaptureSlog rather than
+      # writing them, and the integration harnesses log however they like.
+      # Mocks are generated scaffolding. Both match AssertNoLegacyErrors'
+      # notion of production code, so one answer holds for every guard.
+      - path: _test\.go
+        linters: [sloglint]
+      - path: /mocks/
+        linters: [sloglint]
+      # core/logging is the package that injects request_id, so it is the one
+      # place the forbidden key is written on purpose.
+      - path: core/logging/
+        linters: [sloglint]
+        text: request_id
+      # gosec holds the code a server binary ships. A test reads fixtures by
+      # path, dials httptest servers and writes temporary files as it likes,
+      # and 174 findings there would bury the one that matters (#426
+      # decision 10).
+      - path: _test\.go
+        linters: [gosec]
+      # The tree-wide guards read the source tree by path and call the test
+      # mail server; no binary imports them.
+      - path: core/testutil/
+        linters: [gosec]
+      # The generators and dump tools run by hand in the dev container, read
+      # only the tree or a download named in their source, and write
+      # repository files, which are 0644 on purpose. No server binary contains
+      # them. The timezones generator is rebuilt by #432.
+      - path: core/timezones/generate/
+        linters: [gosec]
+      - path: core/countries/generate/
+        linters: [gosec]
+      - path: core/cmd/
+        linters: [gosec]
+      - path: authserver/cmd/schemadump/
+        linters: [gosec]

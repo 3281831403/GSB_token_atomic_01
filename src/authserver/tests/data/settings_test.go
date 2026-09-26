@@ -1,0 +1,249 @@
+package datatests
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/leodip/goiabada/authserver/internal/models"
+)
+
+func TestCreateSettings(t *testing.T) {
+	settings := &models.Settings{
+		AppName:                 "TestApp",
+		Issuer:                  "https://test.com",
+		UITheme:                 "default",
+		PasswordPolicy:          models.PasswordPolicyMedium,
+		SelfRegistrationEnabled: true,
+		SelfRegistrationRequiresEmailVerification: true,
+		TokenExpirationInSeconds:                  3600,
+		RefreshTokenOfflineIdleTimeoutInSeconds:   86400,
+		RefreshTokenOfflineMaxLifetimeInSeconds:   604800,
+		UserSessionIdleTimeoutInSeconds:           1800,
+		UserSessionMaxLifetimeInSeconds:           43200,
+		IncludeOpenIDConnectClaimsInAccessToken:   true,
+		IncludeOpenIDConnectClaimsInIdToken:       true,
+		AESEncryptionKeyLegacy:                    []byte("testaes"),
+		SMTPHost:                                  "smtp.test.com",
+		SMTPPort:                                  587,
+		SMTPUsername:                              "testuser",
+		SMTPPasswordEncrypted:                     []byte("testpassword"),
+		SMTPFromName:                              "Test Sender",
+		SMTPFromEmail:                             "sender@test.com",
+		SMTPEncryption:                            "starttls",
+		SMTPEnabled:                               true,
+		DynamicClientRegistrationEnabled:          true,
+		PKCERequired:                              true,
+		ImplicitFlowEnabled:                       true,
+		ResourceOwnerPasswordCredentialsEnabled:   true,
+	}
+
+	err := database.CreateSettings(context.Background(), nil, settings)
+	if err != nil {
+		t.Fatalf("Failed to create settings: %v", err)
+	}
+
+	if settings.Id == 0 {
+		t.Error("Expected non-zero ID after creation")
+	}
+	if !settings.CreatedAt.Valid || settings.CreatedAt.Time.IsZero() {
+		t.Error("Expected CreatedAt to be set")
+	}
+	if !settings.UpdatedAt.Valid || settings.UpdatedAt.Time.IsZero() {
+		t.Error("Expected UpdatedAt to be set")
+	}
+
+	retrievedSettings, err := database.GetSettingsById(context.Background(), nil, settings.Id)
+	if err != nil {
+		t.Fatalf("Failed to retrieve created settings: %v", err)
+	}
+
+	compareSettings(t, settings, retrievedSettings)
+}
+
+func TestUpdateSettings(t *testing.T) {
+	settings := createTestSettings(t)
+
+	settings.AppName = "UpdatedApp"
+	settings.Issuer = "https://updated.com"
+	settings.UITheme = "dark"
+	settings.PasswordPolicy = models.PasswordPolicyHigh
+	settings.SelfRegistrationEnabled = false
+	settings.SelfRegistrationRequiresEmailVerification = false
+	settings.TokenExpirationInSeconds = 7200
+	settings.RefreshTokenOfflineIdleTimeoutInSeconds = 172800
+	settings.RefreshTokenOfflineMaxLifetimeInSeconds = 1209600
+	settings.UserSessionIdleTimeoutInSeconds = 3600
+	settings.UserSessionMaxLifetimeInSeconds = 86400
+	settings.IncludeOpenIDConnectClaimsInAccessToken = false
+	settings.IncludeOpenIDConnectClaimsInIdToken = false
+	// AESEncryptionKeyLegacy is migration-only (dont-update); UpdateSettings must
+	// leave it unchanged, so we don't modify it here and the comparison below
+	// verifies it still equals the created value.
+	settings.SMTPHost = "smtp.updated.com"
+	settings.SMTPPort = 465
+	settings.SMTPUsername = "updateduser"
+	settings.SMTPPasswordEncrypted = []byte("updatedpassword")
+	settings.SMTPFromName = "Updated Sender"
+	settings.SMTPFromEmail = "updated@test.com"
+	settings.SMTPEncryption = "ssltls"
+	settings.SMTPEnabled = false
+	settings.DynamicClientRegistrationEnabled = false
+	settings.PKCERequired = false
+	settings.ImplicitFlowEnabled = false
+	settings.ResourceOwnerPasswordCredentialsEnabled = false
+
+	time.Sleep(timestampTick)
+
+	err := database.UpdateSettings(context.Background(), nil, settings)
+	if err != nil {
+		t.Fatalf("Failed to update settings: %v", err)
+	}
+
+	updatedSettings, err := database.GetSettingsById(context.Background(), nil, settings.Id)
+	if err != nil {
+		t.Fatalf("Failed to retrieve updated settings: %v", err)
+	}
+
+	compareSettings(t, settings, updatedSettings)
+
+	if !updatedSettings.UpdatedAt.Time.After(updatedSettings.CreatedAt.Time) {
+		t.Error("Expected UpdatedAt to be after CreatedAt")
+	}
+}
+
+func TestGetSettingsById(t *testing.T) {
+	settings := createTestSettings(t)
+
+	retrievedSettings, err := database.GetSettingsById(context.Background(), nil, settings.Id)
+	if err != nil {
+		t.Fatalf("Failed to get settings by ID: %v", err)
+	}
+
+	compareSettings(t, settings, retrievedSettings)
+
+	nonExistentSettings, err := database.GetSettingsById(context.Background(), nil, 99999)
+	if err != nil {
+		t.Errorf("Expected no error for non-existent settings, got: %v", err)
+	}
+	if nonExistentSettings != nil {
+		t.Errorf("Expected nil for non-existent settings, got settings with ID: %d", nonExistentSettings.Id)
+	}
+}
+
+func createTestSettings(t *testing.T) *models.Settings {
+	settings := &models.Settings{
+		AppName:                 "TestApp",
+		Issuer:                  "https://test.com",
+		UITheme:                 "default",
+		PasswordPolicy:          models.PasswordPolicyMedium,
+		SelfRegistrationEnabled: true,
+		SelfRegistrationRequiresEmailVerification: true,
+		TokenExpirationInSeconds:                  3600,
+		RefreshTokenOfflineIdleTimeoutInSeconds:   86400,
+		RefreshTokenOfflineMaxLifetimeInSeconds:   604800,
+		UserSessionIdleTimeoutInSeconds:           1800,
+		UserSessionMaxLifetimeInSeconds:           43200,
+		IncludeOpenIDConnectClaimsInAccessToken:   true,
+		IncludeOpenIDConnectClaimsInIdToken:       true,
+		AESEncryptionKeyLegacy:                    []byte("testaes"),
+		SMTPHost:                                  "smtp.test.com",
+		SMTPPort:                                  587,
+		SMTPUsername:                              "testuser",
+		SMTPPasswordEncrypted:                     []byte("testpassword"),
+		SMTPFromName:                              "Test Sender",
+		SMTPFromEmail:                             "sender@test.com",
+		SMTPEncryption:                            "starttls",
+		SMTPEnabled:                               true,
+		DynamicClientRegistrationEnabled:          true,
+		PKCERequired:                              true,
+		ImplicitFlowEnabled:                       true,
+		ResourceOwnerPasswordCredentialsEnabled:   true,
+	}
+	err := database.CreateSettings(context.Background(), nil, settings)
+	if err != nil {
+		t.Fatalf("Failed to create test settings: %v", err)
+	}
+	return settings
+}
+
+func compareSettings(t *testing.T, expected, actual *models.Settings) {
+	if actual.AppName != expected.AppName {
+		t.Errorf("Expected AppName %s, got %s", expected.AppName, actual.AppName)
+	}
+	if actual.Issuer != expected.Issuer {
+		t.Errorf("Expected Issuer %s, got %s", expected.Issuer, actual.Issuer)
+	}
+	if actual.UITheme != expected.UITheme {
+		t.Errorf("Expected UITheme %s, got %s", expected.UITheme, actual.UITheme)
+	}
+	if actual.PasswordPolicy != expected.PasswordPolicy {
+		t.Errorf("Expected PasswordPolicy %v, got %v", expected.PasswordPolicy, actual.PasswordPolicy)
+	}
+	if actual.SelfRegistrationEnabled != expected.SelfRegistrationEnabled {
+		t.Errorf("Expected SelfRegistrationEnabled %v, got %v", expected.SelfRegistrationEnabled, actual.SelfRegistrationEnabled)
+	}
+	if actual.SelfRegistrationRequiresEmailVerification != expected.SelfRegistrationRequiresEmailVerification {
+		t.Errorf("Expected SelfRegistrationRequiresEmailVerification %v, got %v", expected.SelfRegistrationRequiresEmailVerification, actual.SelfRegistrationRequiresEmailVerification)
+	}
+	if actual.TokenExpirationInSeconds != expected.TokenExpirationInSeconds {
+		t.Errorf("Expected TokenExpirationInSeconds %d, got %d", expected.TokenExpirationInSeconds, actual.TokenExpirationInSeconds)
+	}
+	if actual.RefreshTokenOfflineIdleTimeoutInSeconds != expected.RefreshTokenOfflineIdleTimeoutInSeconds {
+		t.Errorf("Expected RefreshTokenOfflineIdleTimeoutInSeconds %d, got %d", expected.RefreshTokenOfflineIdleTimeoutInSeconds, actual.RefreshTokenOfflineIdleTimeoutInSeconds)
+	}
+	if actual.RefreshTokenOfflineMaxLifetimeInSeconds != expected.RefreshTokenOfflineMaxLifetimeInSeconds {
+		t.Errorf("Expected RefreshTokenOfflineMaxLifetimeInSeconds %d, got %d", expected.RefreshTokenOfflineMaxLifetimeInSeconds, actual.RefreshTokenOfflineMaxLifetimeInSeconds)
+	}
+	if actual.UserSessionIdleTimeoutInSeconds != expected.UserSessionIdleTimeoutInSeconds {
+		t.Errorf("Expected UserSessionIdleTimeoutInSeconds %d, got %d", expected.UserSessionIdleTimeoutInSeconds, actual.UserSessionIdleTimeoutInSeconds)
+	}
+	if actual.UserSessionMaxLifetimeInSeconds != expected.UserSessionMaxLifetimeInSeconds {
+		t.Errorf("Expected UserSessionMaxLifetimeInSeconds %d, got %d", expected.UserSessionMaxLifetimeInSeconds, actual.UserSessionMaxLifetimeInSeconds)
+	}
+	if actual.IncludeOpenIDConnectClaimsInAccessToken != expected.IncludeOpenIDConnectClaimsInAccessToken {
+		t.Errorf("Expected IncludeOpenIDConnectClaimsInAccessToken %v, got %v", expected.IncludeOpenIDConnectClaimsInAccessToken, actual.IncludeOpenIDConnectClaimsInAccessToken)
+	}
+	if actual.IncludeOpenIDConnectClaimsInIdToken != expected.IncludeOpenIDConnectClaimsInIdToken {
+		t.Errorf("Expected IncludeOpenIDConnectClaimsInIdToken %v, got %v", expected.IncludeOpenIDConnectClaimsInIdToken, actual.IncludeOpenIDConnectClaimsInIdToken)
+	}
+	if string(actual.AESEncryptionKeyLegacy) != string(expected.AESEncryptionKeyLegacy) {
+		t.Errorf("Expected AESEncryptionKeyLegacy %s, got %s", string(expected.AESEncryptionKeyLegacy), string(actual.AESEncryptionKeyLegacy))
+	}
+	if actual.SMTPHost != expected.SMTPHost {
+		t.Errorf("Expected SMTPHost %s, got %s", expected.SMTPHost, actual.SMTPHost)
+	}
+	if actual.SMTPPort != expected.SMTPPort {
+		t.Errorf("Expected SMTPPort %d, got %d", expected.SMTPPort, actual.SMTPPort)
+	}
+	if actual.SMTPUsername != expected.SMTPUsername {
+		t.Errorf("Expected SMTPUsername %s, got %s", expected.SMTPUsername, actual.SMTPUsername)
+	}
+	if string(actual.SMTPPasswordEncrypted) != string(expected.SMTPPasswordEncrypted) {
+		t.Errorf("Expected SMTPPasswordEncrypted %s, got %s", string(expected.SMTPPasswordEncrypted), string(actual.SMTPPasswordEncrypted))
+	}
+	if actual.SMTPFromName != expected.SMTPFromName {
+		t.Errorf("Expected SMTPFromName %s, got %s", expected.SMTPFromName, actual.SMTPFromName)
+	}
+	if actual.SMTPFromEmail != expected.SMTPFromEmail {
+		t.Errorf("Expected SMTPFromEmail %s, got %s", expected.SMTPFromEmail, actual.SMTPFromEmail)
+	}
+	if actual.SMTPEncryption != expected.SMTPEncryption {
+		t.Errorf("Expected SMTPEncryption %s, got %s", expected.SMTPEncryption, actual.SMTPEncryption)
+	}
+	if actual.SMTPEnabled != expected.SMTPEnabled {
+		t.Errorf("Expected SMTPEnabled %v, got %v", expected.SMTPEnabled, actual.SMTPEnabled)
+	}
+	if actual.DynamicClientRegistrationEnabled != expected.DynamicClientRegistrationEnabled {
+		t.Errorf("Expected DynamicClientRegistrationEnabled %v, got %v", expected.DynamicClientRegistrationEnabled, actual.DynamicClientRegistrationEnabled)
+	}
+	if actual.PKCERequired != expected.PKCERequired {
+		t.Errorf("Expected PKCERequired %v, got %v", expected.PKCERequired, actual.PKCERequired)
+	}
+	if actual.ImplicitFlowEnabled != expected.ImplicitFlowEnabled {
+		t.Errorf("Expected ImplicitFlowEnabled %v, got %v", expected.ImplicitFlowEnabled, actual.ImplicitFlowEnabled)
+	}
+	if actual.ResourceOwnerPasswordCredentialsEnabled != expected.ResourceOwnerPasswordCredentialsEnabled {
+		t.Errorf("Expected ResourceOwnerPasswordCredentialsEnabled %v, got %v", expected.ResourceOwnerPasswordCredentialsEnabled, actual.ResourceOwnerPasswordCredentialsEnabled)
+	}
+}

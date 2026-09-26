@@ -1,0 +1,129 @@
+{{define "title"}}{{ .appName }} - {{ T $.ctx "adminconsole.admin_settings.audit_log_viewer.page_title" }}{{end}}
+{{define "pageTitle"}}{{ T $.ctx "adminconsole.admin_settings.common.page_title_root" }}{{end}}
+{{define "subTitle"}}
+    <div class="text-xl font-semibold">{{ T $.ctx "adminconsole.admin_settings.audit_log_viewer.subtitle" }}</div>
+    <div class="mt-2 divider"></div>
+{{end}}
+{{define "menu"}}
+    {{template "admin_menu" . }}
+{{end}}
+
+{{define "head"}}
+<script>
+    function filterAuditLogs(element, event) {
+        event.preventDefault();
+        // URLSearchParams escapes each value: a request id is whatever the client put in
+        // X-Request-Id, so it can carry an & or a # that string concatenation would turn
+        // into another parameter or a fragment.
+        var params = new URLSearchParams();
+        var selectedEvent = document.getElementById("auditEventFilter").value;
+        if (selectedEvent) {
+            params.set("auditEvent", selectedEvent);
+        }
+        var requestId = document.getElementById("requestIdFilter").value.trim();
+        if (requestId) {
+            params.set("requestId", requestId);
+        }
+        var query = params.toString();
+        window.location.href = "/admin/settings/audit-log-viewer" + (query ? "?" + query : "");
+    }
+</script>
+{{end}}
+
+{{define "body"}}
+
+<div class="grid grid-cols-1 gap-6 mt-4 lg:grid-cols-2">
+    <div class="table">
+        <div class="table-cell w-5/12">
+            <select id="auditEventFilter" class="w-full select select-bordered">
+                <option value="">{{ T $.ctx "adminconsole.admin_settings.audit_log_viewer.all_events" }}</option>
+                {{range .auditEventTypes}}
+                    <option value="{{.}}" {{if eq $.selectedEvent .}}selected{{end}}>{{.}}</option>
+                {{end}}
+            </select>
+        </div>
+        <div class="table-cell w-5/12 pl-4">
+            <input type="text" id="requestIdFilter" class="w-full input input-bordered"
+                placeholder="{{ T $.ctx "adminconsole.admin_settings.audit_log_viewer.request_id_placeholder" }}"
+                value="{{ .selectedRequestId }}" />
+        </div>
+        <div class="table-cell w-full whitespace-nowrap">
+            <button onclick="filterAuditLogs(this, event);" class="ml-4 btn btn-sm btn-secondary">{{ T $.ctx "adminconsole.admin_settings.audit_log_viewer.filter_button" }}</button>
+            {{if or .selectedEvent .selectedRequestId}}
+                <a class="ml-2 link link-secondary link-hover" href="/admin/settings/audit-log-viewer">{{ T $.ctx "adminconsole.admin_settings.audit_log_viewer.clear_link" }}</a>
+            {{end}}
+        </div>
+    </div>
+</div>
+
+<div class="grid grid-cols-1 gap-6 mt-3">
+    <div class="w-full h-full pb-6 bg-base-100">
+        <table id="auditLogsTable" class="table mt-2">
+            <thead>
+                <tr>
+                    <th>{{ T $.ctx "adminconsole.admin_settings.audit_log_viewer.col_timestamp" }}</th>
+                    <th>{{ T $.ctx "adminconsole.admin_settings.audit_log_viewer.col_event" }}</th>
+                    <th>{{ T $.ctx "adminconsole.admin_settings.audit_log_viewer.col_request_id" }}</th>
+                    <th>{{ T $.ctx "adminconsole.admin_settings.audit_log_viewer.col_details" }}</th>
+                </tr>
+            </thead>
+            <tbody>
+                {{range .pageResult.AuditLogs}}
+                    <tr>
+                        {{/* The datetime attribute is the machine value the HTML <time> element
+                             defines, so it stays RFC3339 under every locale; the text beside it is
+                             the one a reader sees, and that one is localized (#373). */}}
+                        <td><time datetime="{{.CreatedAt.Format "2006-01-02T15:04:05Z07:00"}}">{{ DateTime $.ctx .CreatedAt }}</time></td>
+                        <td><span class="badge badge-neutral">{{.AuditEvent}}</span></td>
+                        <td class="whitespace-nowrap">{{if .RequestId}}{{.RequestId}}{{else}}-{{end}}</td>
+                        <td class="audit-details" data-details="{{.Details}}"></td>
+                    </tr>
+                {{end}}
+                {{if eq (len .pageResult.AuditLogs) 0}}
+                    <tr>
+                        <td colspan="4" class="text-center"><span class='p-1 rounded text-warning-content bg-warning'>{{ T $.ctx "adminconsole.admin_settings.audit_log_viewer.empty" }}</span></td>
+                    </tr>
+                {{end}}
+            </tbody>
+        </table>
+    </div>
+</div>
+
+<div class="flex justify-between mt-2">
+    <div>
+    </div>
+    <div class="mr-14">
+        {{template "paginator" (args .paginator .paginatorLink) }}
+    </div>
+</div>
+
+<script>
+document.addEventListener('DOMContentLoaded', function () {
+    // Parse and display JSON details (XSS-safe via createElement)
+    document.querySelectorAll('.audit-details').forEach(el => {
+        try {
+            const details = JSON.parse(el.dataset.details);
+            const entries = Object.entries(details);
+            if (entries.length === 0) {
+                el.textContent = '-';
+            } else {
+                // Use createElement to avoid XSS from innerHTML
+                el.textContent = ''; // Clear existing content
+                entries.forEach(([k, v]) => {
+                    const div = document.createElement('div');
+                    const strong = document.createElement('strong');
+                    strong.textContent = String(k) + ':';
+                    div.appendChild(strong);
+                    div.appendChild(document.createTextNode(' ' + String(v)));
+                    el.appendChild(div);
+                });
+            }
+        } catch {
+            // Fallback to raw JSON string
+            el.textContent = el.dataset.details || '-';
+        }
+    });
+});
+</script>
+
+{{end}}

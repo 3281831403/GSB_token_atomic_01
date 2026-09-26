@@ -1,0 +1,435 @@
+package handlers
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+
+	"github.com/leodip/goiabada/authserver/internal/apiresponse"
+	"github.com/leodip/goiabada/authserver/internal/audit"
+	"github.com/leodip/goiabada/authserver/internal/constants"
+	"github.com/leodip/goiabada/authserver/internal/encryption"
+	"github.com/leodip/goiabada/authserver/internal/models"
+	"github.com/leodip/goiabada/authserver/internal/oidc"
+	"github.com/leodip/goiabada/authserver/internal/urlutil"
+	"github.com/leodip/goiabada/authserver/internal/uuidutil"
+	"github.com/leodip/goiabada/core/errs"
+	"github.com/leodip/goiabada/core/stringutil"
+	"github.com/leodip/goiabada/core/validators"
+)
+
+// dynamicClientRegistrationDatabase is what RFC 7591 registration needs: the client and redirect
+// URIs it creates, and the delete that undoes a half-built one.
+// dcrRollbackTimeout bounds the compensating delete once it has been detached from the caller's
+// cancellation. Ten seconds, matching every other bounded wait on a dependency in this
+// repository's request path rather than introducing a value nobody chose against the others.
+const dcrRollbackTimeout = 10 * time.Second
+
+type dynamicClientRegistrationDatabase interface {
+	CreateClient(ctx context.Context, tx *sql.Tx, client *models.Client) error
+	CreateRedirectURI(ctx context.Context, tx *sql.Tx, redirectURI *models.RedirectURI) error
+	DeleteClient(ctx context.Context, tx *sql.Tx, clientId int64) error
+}
+
+// HandleDynamicClientRegistrationPost implements RFC 7591 §3 Client Registration Endpoint
+func HandleDynamicClientRegistrationPost(
+	httpHelper HttpHelper,
+	database dynamicClientRegistrationDatabase,
+	auditLogger AuditLogger,
+) http.HandlerFunc {
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		settings := r.Context().Value(constants.ContextKeySettings).(*models.Settings)
+
+		// 1. Check if DCR is enabled (RFC 7591 §3)
+		if !settings.DynamicClientRegistrationEnabled {
+			writeDCRError(w, "access_denied", "Dynamic client registration is not enabled", http.StatusForbidden)
+			return
+		}
+
+		// 2. Parse request (RFC 7591 §3.1)
+		var req oidc.DynamicClientRegistrationRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeDCRError(w, oidc.DCRErrorInvalidClientMetadata, "Invalid request body", http.StatusBadRequest)
+			return
+		}
+
+		// 3. Apply defaults (RFC 7591 §2)
+		applyDCRDefaults(&req)
+
+		// 4. Validate request
+		if err := validateDCRRequest(&req); err != nil {
+			writeDCRError(w, oidc.DCRErrorInvalidClientMetadata, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		// 5. Validate redirect URIs (RFC 7591 §5)
+		if err := validateDCRRedirectURIs(&req); err != nil {
+			writeDCRError(w, oidc.DCRErrorInvalidRedirectURI, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		// 6. Generate client identifier (RFC 7591 §3.2.1)
+		clientIdentifier := generateDCRClientIdentifier()
+
+		// 7. Determine if public or confidential client
+		isPublic := req.TokenEndpointAuthMethod == "none"
+
+		// A public client always requires PKCE, and the server enforces that whatever this
+		// column holds. It is written explicitly all the same, and only on the public path: a
+		// nil column is handed raw to the admin API's client response and to the admin console's
+		// template, where it renders as "inherit from the global setting" and so reports the
+		// opposite of what the server does whenever that global is off. A confidential client
+		// keeps writing nothing, because inheriting the global is what the setting is for
+		// (#245).
+		var pkceRequired *bool
+		if isPublic {
+			required := true
+			pkceRequired = &required
+		}
+
+		// 8. Generate client secret for confidential clients (RFC 7591 §3.2.1)
+		var clientSecretEncrypted []byte
+		var clientSecret string
+
+		if !isPublic {
+			clientSecret = stringutil.GenerateSecurityRandomString(60)
+			var err error
+			clientSecretEncrypted, err = encryption.EncryptData(clientSecret)
+			if err != nil {
+				apiresponse.LogInternalServerError(r, errs.Wrap(err, "DCR: failed to encrypt client secret"))
+				writeDCRError(w, "server_error", "Internal server error", http.StatusInternalServerError)
+				return
+			}
+		}
+
+		// 9. Create client model
+		client := &models.Client{
+			ClientIdentifier:      clientIdentifier,
+			ClientSecretEncrypted: clientSecretEncrypted,
+			Description:           req.ClientName,
+			IsPublic:              isPublic,
+			PKCERequired:          pkceRequired,
+			Enabled:               true,
+			// A self-registered client is one nobody here has vetted, and RFC 7591 section 5
+			// requires all of its metadata be treated as self-asserted. Consent is the only
+			// control that binds such a client's identity to the user's authority, so it is on
+			// by default: RFC 6749 section 10.2 says the server SHOULD engage the resource owner
+			// to identify a client it cannot authenticate, and SHOULD NOT process repeated
+			// authorization requests without active resource owner interaction. An administrator
+			// who has reviewed a specific client can untick it on the client settings page.
+			// Turning this back off by default makes every self-registered client silently
+			// grantable for any scope the user holds (#108).
+			ConsentRequired: true,
+			// Set here and nowhere else. Nothing on the update path can change it, deliberately:
+			// it is a fact about where the client came from, not a trust setting (#108).
+			CreatedViaDCR:                           true,
+			AuthorizationCodeEnabled:                containsGrantType(req.GrantTypes, "authorization_code"),
+			ClientCredentialsEnabled:                containsGrantType(req.GrantTypes, "client_credentials"),
+			DefaultAcrLevel:                         models.AcrLevel2Optional,
+			IncludeOpenIDConnectClaimsInAccessToken: models.ThreeStateSettingDefault.String(),
+			// Token expiration settings use global defaults from settings
+			TokenExpirationInSeconds:                settings.TokenExpirationInSeconds,
+			RefreshTokenOfflineIdleTimeoutInSeconds: settings.RefreshTokenOfflineIdleTimeoutInSeconds,
+			RefreshTokenOfflineMaxLifetimeInSeconds: settings.RefreshTokenOfflineMaxLifetimeInSeconds,
+		}
+
+		// 10. Save client to database
+		if err := database.CreateClient(r.Context(), nil, client); err != nil {
+			apiresponse.LogInternalServerError(r, errs.Wrap(err, "DCR: database error creating client"))
+			writeDCRError(w, "server_error", "Failed to register client", http.StatusInternalServerError)
+			return
+		}
+
+		// 11. Save redirect URIs
+		for _, uri := range req.RedirectURIs {
+			redirectURI := &models.RedirectURI{
+				ClientId: client.Id,
+				URI:      uri,
+			}
+			if err := database.CreateRedirectURI(r.Context(), nil, redirectURI); err != nil {
+				apiresponse.LogInternalServerError(r, errs.Wrap(err, "DCR: failed to create redirect URI"), "uri", uri)
+				// Rollback client creation, on a context of its own rather than the request's.
+				// The client row above is already committed and there is no transaction across
+				// the two writes, so this is the only thing that withdraws it -- and a cancelled
+				// request is one of the reasons the write above fails, which would leave the
+				// compensation unable to run in precisely the case it exists for. WithoutCancel
+				// keeps the request id on the record, and the bound is what the cancellation used
+				// to supply (#386 decision 6, and final review round 1 finding 9; the same rule
+				// as audit.Log and usersession.abandonUserSession).
+				rollbackCtx, cancelRollback := context.WithTimeout(
+					context.WithoutCancel(r.Context()), dcrRollbackTimeout)
+				_ = database.DeleteClient(rollbackCtx, nil, client.Id)
+				cancelRollback()
+				writeDCRError(w, "server_error", "Failed to register redirect URIs", http.StatusInternalServerError)
+				return
+			}
+		}
+
+		// 12. Audit log
+		auditLogger.Log(r.Context(), audit.AuditDynamicClientRegistration, map[string]interface{}{
+			"clientId":         client.Id,
+			"clientIdentifier": client.ClientIdentifier,
+			"grantTypes":       req.GrantTypes,
+			"isPublic":         isPublic,
+			"sourceIP":         getClientIP(r),
+		})
+
+		// 13. Build response (RFC 7591 §3.2.1)
+		response := oidc.DynamicClientRegistrationResponse{
+			ClientID:                clientIdentifier,
+			ClientIDIssuedAt:        time.Now().Unix(),
+			ClientSecretExpiresAt:   0, // Never expires
+			RedirectURIs:            req.RedirectURIs,
+			TokenEndpointAuthMethod: req.TokenEndpointAuthMethod,
+			GrantTypes:              req.GrantTypes,
+			ClientName:              req.ClientName,
+		}
+
+		// Only include secret for confidential clients (RFC 7591 §3.2.1)
+		if !isPublic {
+			response.ClientSecret = clientSecret
+		}
+
+		// 14. Send response
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Pragma", "no-cache")
+		w.WriteHeader(http.StatusCreated)
+		httpHelper.EncodeJson(w, r, response)
+	}
+}
+
+// applyDCRDefaults applies RFC 7591 §2 default values
+func applyDCRDefaults(req *oidc.DynamicClientRegistrationRequest) {
+	// Default token_endpoint_auth_method (RFC 7591 §2)
+	if req.TokenEndpointAuthMethod == "" {
+		req.TokenEndpointAuthMethod = "client_secret_basic"
+	}
+
+	// Default grant_types (RFC 7591 §2)
+	if len(req.GrantTypes) == 0 {
+		req.GrantTypes = []string{"authorization_code"}
+	}
+}
+
+// validateDCRRequest validates request per RFC 7591 §2
+func validateDCRRequest(req *oidc.DynamicClientRegistrationRequest) error {
+	// Validate token_endpoint_auth_method
+	allowedAuthMethods := map[string]bool{
+		"none":                true,
+		"client_secret_basic": true,
+		"client_secret_post":  true,
+	}
+	if !allowedAuthMethods[req.TokenEndpointAuthMethod] {
+		return errs.Errorf("unsupported token_endpoint_auth_method: %s", req.TokenEndpointAuthMethod)
+	}
+
+	// Validate grant_types
+	supportedGrants := map[string]bool{
+		"authorization_code": true,
+		"client_credentials": true,
+		"refresh_token":      true,
+	}
+	for _, gt := range req.GrantTypes {
+		if !supportedGrants[gt] {
+			return errs.Errorf("unsupported grant_type: %s", gt)
+		}
+	}
+
+	// Validate client_name length if provided (matches database column size)
+	if len(req.ClientName) > 128 {
+		return errs.Errorf("client_name cannot exceed 128 characters")
+	}
+
+	// client_name is written to clients.description, the same column the admin API refuses
+	// angle brackets in, so every write path to it applies one rule and a self-registered
+	// client cannot hold markup the admin API would have refused (#275). RFC 7591 section
+	// 3.2.2 defines invalid_client_metadata for a rejected metadata value, and the caller
+	// answers with it. The message is English like the handler's other refusals: DCR errors
+	// are protocol responses and are not localized.
+	if validators.ContainsAngleBrackets(req.ClientName) {
+		return errs.Errorf("client_name cannot contain the characters < or >")
+	}
+
+	return nil
+}
+
+// validateDCRRedirectURIs validates redirect URIs per RFC 7591 §5
+func validateDCRRedirectURIs(req *oidc.DynamicClientRegistrationRequest) error {
+	// Check if redirect URIs are required
+	requiresRedirectURIs := containsGrantType(req.GrantTypes, "authorization_code")
+
+	if requiresRedirectURIs && len(req.RedirectURIs) == 0 {
+		return errs.Errorf("redirect_uris required for authorization_code grant type")
+	}
+
+	// Validate each redirect URI
+	isPublic := req.TokenEndpointAuthMethod == "none"
+
+	for _, uri := range req.RedirectURIs {
+		if err := validateRedirectURI(uri, isPublic); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// excludedURIChars are the characters RFC 3986 excludes from URIs. They must be
+// percent-encoded to appear at all, so a redirect URI carrying one literally is malformed.
+const excludedURIChars = "<>\"{}|\\^` "
+
+// deniedRedirectURISchemes are schemes a redirect URI may not use. Three groups, and the
+// reason differs per group, which is why they are commented separately rather than merged
+// into one anonymous list.
+var deniedRedirectURISchemes = map[string]bool{
+	// Script or local execution.
+	"javascript": true, "data": true, "vbscript": true,
+	"file": true, "blob": true, "about": true,
+	// Browser-internal schemes. Not app callbacks, and view-source is a navigation
+	// primitive.
+	"chrome": true, "chrome-extension": true, "moz-extension": true,
+	"view-source": true, "filesystem": true, "resource": true,
+	// Network protocols a browser cannot deliver an authorization response to. ftp is the
+	// one that matters: without it, a public client could register a remote callback, which
+	// is exactly what the loopback restriction above exists to prevent.
+	"ftp": true, "ftps": true, "ws": true, "wss": true,
+	"gopher": true, "telnet": true,
+}
+
+// validateRedirectURI validates a single redirect URI per RFC 7591 §5
+func validateRedirectURI(uri string, isPublic bool) error {
+	parsed, err := url.ParseRequestURI(uri)
+	if err != nil {
+		return errs.Errorf("invalid redirect_uri format: %s", uri)
+	}
+
+	// RFC 6749 section 3.1.2 requires an absolute-URI (RFC 3986 section 4.3) and forbids a
+	// fragment. The shared predicate checks both, and also refuses an http or https URI with
+	// no host, which is a value the grammar admits but a browser resolves to somewhere else
+	// entirely. Without it, "//evil.example/cb" and "https:///evil.example/cb" register
+	// cleanly and are later emitted verbatim into a Location, handing the authorization code
+	// to that host.
+	//
+	// This is one of three intakes rather than the only one. The admin API applies the same
+	// predicate, and the authorization endpoint applies it to the requested URI before
+	// matching, which is what covers rows stored before any of these rules existed. Keep the
+	// rule in the predicate rather than here, so the three cannot drift (#122).
+	if !urlutil.IsAbsoluteRedirectURI(uri) {
+		return errs.Errorf("redirect_uri must be an absolute URI: a scheme is required, a fragment is not permitted, percent-escapes must be well formed, and an http or https URI must name a host: %s", uri)
+	}
+
+	// Characters RFC 3986 excludes from URIs entirely. A redirect URI carrying them is
+	// malformed, and it is also how markup reaches the admin console, which renders stored
+	// redirect URIs into the page.
+	//
+	// Checked ahead of the client-type branches on purpose: an https URI on a confidential
+	// client reaches the same place, so gating this inside the custom-scheme branch would
+	// miss it.
+	if strings.ContainsAny(uri, excludedURIChars) {
+		return errs.Errorf("redirect_uri contains characters that are not permitted in a URI: %s", uri)
+	}
+
+	// Schemes that cannot receive an authorization response, or that execute script.
+	//
+	// This denylist cannot be the primary defence and is not one: the verified markup
+	// payload used the scheme "x", which no list of names would catch. The character gate
+	// above is what stops that class. This gate stops the schemes that carry no excluded
+	// characters at all, such as javascript: and ftp:.
+	if deniedRedirectURISchemes[strings.ToLower(parsed.Scheme)] {
+		return errs.Errorf("redirect_uri scheme %q is not permitted: %s", parsed.Scheme, uri)
+	}
+
+	// For public clients (MCP use case), only allow loopback http or custom schemes.
+	//
+	// The host comparison is exact, via the shared predicate in authserver/internal/urlutil. It used to be
+	// a strings.HasPrefix test, which accepted any host merely starting with a loopback
+	// name, localhost.attacker.com included. See issue #105.
+	if isPublic {
+		// Allow loopback HTTP (MCP use case)
+		if parsed.Scheme == "http" {
+			if urlutil.IsLoopbackHost(parsed.Host) {
+				return nil
+			}
+			return errs.Errorf("public clients can only use http redirect_uris on the loopback hosts 127.0.0.1, [::1] or localhost: %s", uri)
+		}
+
+		// Allow custom schemes (native apps)
+		if parsed.Scheme != "https" {
+			return nil
+		}
+
+		// Reject HTTPS for public clients registered via DCR
+		return errs.Errorf("public clients registered via DCR cannot use https redirect_uris (security restriction): %s", uri)
+	}
+
+	// For confidential clients, allow HTTPS or loopback http. Same exact-host comparison as
+	// the public branch above: the prefix bug was duplicated across both.
+	if parsed.Scheme == "https" {
+		return nil
+	}
+
+	if parsed.Scheme == "http" {
+		if urlutil.IsLoopbackHost(parsed.Host) {
+			return nil
+		}
+		return errs.Errorf("http redirect_uris must use the loopback hosts 127.0.0.1, [::1] or localhost: %s", uri)
+	}
+
+	// Custom schemes are for public clients only, which is what this branch not accepting
+	// them means. The message used to offer "custom scheme" here, which was never true.
+	return errs.Errorf("confidential clients must use an https redirect_uri, or http on a loopback host: %s", uri)
+}
+
+// generateDCRClientIdentifier generates unique client identifier (RFC 7591 §3.2.1)
+//
+// The dcr_ prefix is cosmetic: it is useful to a human reading a client list or a log line, and
+// nothing may depend on it. An administrator can name a client dcr_anything through the admin
+// console, so testing the prefix answers "was this named like a self-registered client", not
+// "did this client register itself". The clients.created_via_dcr column answers the second, and
+// it is what every such test reads (#108).
+//
+// The identifier a client is registered under is fixed from here on: HandleAPIClientUpdatePut
+// refuses to rename a client whose created_via_dcr is set. That is not what makes the prefix
+// trustworthy, since it never was; it keeps the prefix and the column from drifting apart for
+// the human reading them, which is the only thing the prefix is for (#108, decision 16).
+func generateDCRClientIdentifier() string {
+	return "dcr_" + uuidutil.New()
+}
+
+// containsGrantType checks if grant type is in the list
+func containsGrantType(grantTypes []string, grantType string) bool {
+	for _, gt := range grantTypes {
+		if gt == grantType {
+			return true
+		}
+	}
+	return false
+}
+
+// getClientIP returns the client IP for audit logging. The RealIP middleware
+// (MiddlewareRealIP) has already resolved r.RemoteAddr to the trustworthy client
+// IP from the socket peer and, when configured, the forwarded headers, so we do
+// not re-parse X-Forwarded-For here (doing so would reintroduce a spoofable path).
+func getClientIP(r *http.Request) string {
+	return r.RemoteAddr
+}
+
+// writeDCRError writes RFC 7591 §3.2.2 error response
+func writeDCRError(w http.ResponseWriter, errorCode, description string, statusCode int) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
+	w.WriteHeader(statusCode)
+
+	errorResp := oidc.DynamicClientRegistrationError{
+		Error:            errorCode,
+		ErrorDescription: description,
+	}
+	_ = json.NewEncoder(w).Encode(errorResp)
+}

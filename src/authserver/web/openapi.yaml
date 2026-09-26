@@ -1,0 +1,5747 @@
+openapi: 3.0.3
+info:
+  title: Goiabada API
+  description: |
+    REST API for Goiabada authentication and authorization server.
+
+    ## Authentication
+
+    Every operation under `/api/v1` requires a valid JWT access token in the
+    `Authorization` header:
+    ```
+    Authorization: Bearer <access_token>
+    ```
+    `getClientLogoImage` is the exception and is marked `security: []`: it is public.
+
+    ## API Groups
+
+    - **Admin API** (`/api/v1/admin/*`): administrative control. Each operation accepts any
+      one of a small set of scopes rather than a single one: reads accept
+      `authserver:admin-read` alongside the domain's own scope, and writes accept the
+      domain scope (`authserver:manage-users`, `authserver:manage-clients` or
+      `authserver:manage-settings`). `authserver:manage` is accepted everywhere.
+      A token from the client credentials flow is accepted here.
+    - **Account API** (`/api/v1/account/*`): Self-service account management. Requires
+      `authserver:manage-account` scope, **and** a token issued for a user: these operations
+      resolve the acting user from `sub`, so a client credentials token is refused with 403
+      and `error_code` `USER_CONTEXT_REQUIRED`.
+
+    ## Caching
+
+    Every response from an operation in either API group carries these headers, error
+    responses and the token and scope refusals included:
+    ```
+    Cache-Control: no-store
+    Pragma: no-cache
+    ```
+
+    Do not cache these responses. Two operations return a credential in the body:
+    `getClient` returns the client secret decrypted, and `getAccountOTPEnrollment` returns
+    a new authenticator's setup key. The bearer token on the request does not make a
+    cached copy safe: a private cache may still store a response it authenticated.
+
+    A few responses under these paths are answered before an operation is selected and
+    carry neither header: a CORS preflight, and the errors returned when the server cannot
+    read its own settings or the caller's session. None of them carries a credential, and
+    none of them is described by this document.
+
+    The headers are not declared per operation, since every operation sends them.
+  version: 1.0.0
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+  contact:
+    name: Goiabada
+    url: https://goiabada.dev
+
+servers:
+  - url: '{baseUrl}'
+    description: Auth server base URL
+    variables:
+      baseUrl:
+        default: http://localhost:9090
+        description: The base URL of your Goiabada auth server
+
+tags:
+  - name: Users
+    description: User management (Admin API)
+  - name: User Attributes
+    description: Custom user attributes (Admin API)
+  - name: User Sessions
+    description: User session management (Admin API)
+  - name: User Consents
+    description: OAuth consent management (Admin API)
+  - name: Groups
+    description: Group management (Admin API)
+  - name: Group Members
+    description: Group membership management (Admin API)
+  - name: Group Attributes
+    description: Custom group attributes (Admin API)
+  - name: Resources
+    description: Resource management (Admin API)
+  - name: Permissions
+    description: Permission management (Admin API)
+  - name: Clients
+    description: OAuth client management (Admin API)
+  - name: Audit Logs
+    description: Audit log query (Admin API)
+  - name: Settings
+    description: System settings (Admin API)
+  - name: Account
+    description: Self-service account management (Account API)
+  - name: Browser Sessions
+    description: |
+      Browser session storage for the admin console (Internal API). The admin console keeps no
+      database connection of its own, so the browser session it used to hold in a cookie lives in
+      a row on the auth server and it reaches that row through these operations. Not a public
+      surface: it is the network transport of one internal interface between the two applications
+      that ship together, and it is authenticated with a permission of its own that grants nothing
+      else.
+
+security:
+  - BearerAuth: []
+
+paths:
+  # =============================================================================
+  # ADMIN API - USERS
+  # =============================================================================
+  /api/v1/admin/users/search:
+    get:
+      tags: [Users]
+      summary: Search users
+      description: |
+        Search for users with pagination.
+
+        Each returned user can be annotated against one group or one permission. The two
+        annotations are mutually exclusive: sending both is refused with 400.
+      operationId: searchUsers
+      parameters:
+        - name: query
+          in: query
+          description: Search term (matches email, username, name)
+          schema:
+            type: string
+        - name: annotateGroupMembership
+          in: query
+          description: |
+            Group id to annotate each returned user against. Selects the
+            SearchUsersWithGroupAnnotationResponse shape. A group id that matches nothing is
+            answered 404.
+          schema:
+            type: integer
+            format: int64
+        - name: annotatePermissionId
+          in: query
+          description: |
+            Permission id to annotate each returned user against. Selects the
+            SearchUsersWithPermissionAnnotationResponse shape. A permission id that matches
+            nothing is answered 404, and the authserver `userinfo` permission is refused with
+            400.
+          schema:
+            type: integer
+            format: int64
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/SizeParam'
+      responses:
+        '200':
+          description: |
+            Search results. The shape depends on the annotation parameter: neither gives
+            SearchUsersResponse, annotateGroupMembership gives
+            SearchUsersWithGroupAnnotationResponse, annotatePermissionId gives
+            SearchUsersWithPermissionAnnotationResponse.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/SearchUsersResponse'
+                  - $ref: '#/components/schemas/SearchUsersWithGroupAnnotationResponse'
+                  - $ref: '#/components/schemas/SearchUsersWithPermissionAnnotationResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/admin/users/create:
+    post:
+      tags: [Users]
+      summary: Create user
+      description: Create a new user as admin
+      operationId: createUser
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateUserRequest'
+      responses:
+        '201':
+          description: User created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateUserResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          description: |
+            The email address is already registered. error_code is
+            EMAIL_ALREADY_EXISTS. Answered both by the explicit duplicate check
+            and by the user creator, which derives the username from the email.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/admin/users/{id}:
+    get:
+      tags: [Users]
+      summary: Get user
+      description: Get user details by ID
+      operationId: getUser
+      parameters:
+        - $ref: '#/components/parameters/UserIdParam'
+      responses:
+        '200':
+          description: User details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetUserResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    delete:
+      tags: [Users]
+      summary: Delete user
+      description: Delete a user by ID
+      operationId: deleteUser
+      parameters:
+        - $ref: '#/components/parameters/UserIdParam'
+      responses:
+        '200':
+          description: User deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/admin/users/{id}/profile:
+    put:
+      tags: [Users]
+      summary: Update user profile
+      description: Update user profile information
+      operationId: updateUserProfile
+      parameters:
+        - $ref: '#/components/parameters/UserIdParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateUserProfileRequest'
+      responses:
+        '200':
+          description: Profile updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpdateUserResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/admin/users/{id}/email:
+    put:
+      tags: [Users]
+      summary: Update user email
+      description: Update user email address and verification status
+      operationId: updateUserEmail
+      parameters:
+        - $ref: '#/components/parameters/UserIdParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateUserEmailRequest'
+      responses:
+        '200':
+          description: Email updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpdateUserResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: |
+            The email address was registered to another user between the
+            duplicate check and the write. error_code is EMAIL_ALREADY_EXISTS.
+            An address already taken when the request arrives is a 400 with
+            error_code validator.email.already_registered.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/admin/users/{id}/email/verification-code:
+    post:
+      tags: [Users]
+      summary: Generate email verification code
+      description: |
+        Generate a new email verification code for a user and return it in the response.
+
+        Note: This call sets the user's emailVerified flag to false.
+      operationId: generateUserEmailVerificationCode
+      parameters:
+        - $ref: '#/components/parameters/UserIdParam'
+      responses:
+        '200':
+          description: Verification code generated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenerateUserEmailVerificationCodeResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/admin/users/{id}/phone:
+    put:
+      tags: [Users]
+      summary: Update user phone
+      description: Update user phone number
+      operationId: updateUserPhone
+      parameters:
+        - $ref: '#/components/parameters/UserIdParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateUserPhoneRequest'
+      responses:
+        '200':
+          description: Phone updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpdateUserResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/admin/users/{id}/address:
+    put:
+      tags: [Users]
+      summary: Update user address
+      description: Update user address information
+      operationId: updateUserAddress
+      parameters:
+        - $ref: '#/components/parameters/UserIdParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateUserAddressRequest'
+      responses:
+        '200':
+          description: Address updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpdateUserResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/admin/users/{id}/password:
+    put:
+      tags: [Users]
+      summary: Update user password
+      description: Set a new password for the user
+      operationId: updateUserPassword
+      parameters:
+        - $ref: '#/components/parameters/UserIdParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateUserPasswordRequest'
+      responses:
+        '200':
+          description: Password updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpdateUserResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/admin/users/{id}/enabled:
+    put:
+      tags: [Users]
+      summary: Enable/disable user
+      description: Enable or disable a user account
+      operationId: updateUserEnabled
+      parameters:
+        - $ref: '#/components/parameters/UserIdParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateUserEnabledRequest'
+      responses:
+        '200':
+          description: User status updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpdateUserResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/admin/users/{id}/otp:
+    put:
+      tags: [Users]
+      summary: Disable user OTP
+      description: Disable OTP (two-factor authentication) for a user. OTP can only be disabled via Admin API, not enabled.
+      operationId: updateUserOtp
+      parameters:
+        - $ref: '#/components/parameters/UserIdParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateUserOTPRequest'
+      responses:
+        '200':
+          description: OTP disabled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpdateUserResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/admin/users/{id}/profile-picture:
+    get:
+      tags: [Users]
+      summary: Get user profile picture info
+      description: Check whether a user has a profile picture and get the picture URL
+      operationId: getUserProfilePictureInfo
+      parameters:
+        - $ref: '#/components/parameters/UserIdParam'
+      responses:
+        '200':
+          description: Profile picture info
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProfilePictureInfoResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    post:
+      tags: [Users]
+      summary: Upload user profile picture
+      description: Upload or replace the user's profile picture. Supports JPEG, PNG, GIF, and WebP formats up to the configured maximum size.
+      operationId: uploadUserProfilePicture
+      parameters:
+        - $ref: '#/components/parameters/UserIdParam'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+                - picture
+              properties:
+                picture:
+                  type: string
+                  format: binary
+                  description: Profile picture file (JPEG, PNG, GIF, or WebP)
+      responses:
+        '200':
+          description: Profile picture uploaded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProfilePictureUploadResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    delete:
+      tags: [Users]
+      summary: Delete user profile picture
+      description: Remove the user's profile picture
+      operationId: deleteUserProfilePicture
+      parameters:
+        - $ref: '#/components/parameters/UserIdParam'
+      responses:
+        '200':
+          description: Profile picture deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/admin/users/{id}/groups:
+    get:
+      tags: [Users]
+      summary: Get user groups
+      description: Get groups that a user belongs to
+      operationId: getUserGroups
+      parameters:
+        - $ref: '#/components/parameters/UserIdParam'
+      responses:
+        '200':
+          description: User groups
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetUserGroupsResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    put:
+      tags: [Users]
+      summary: Set user groups
+      description: Replace all groups for a user
+      operationId: updateUserGroups
+      parameters:
+        - $ref: '#/components/parameters/UserIdParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateUserGroupsRequest'
+      responses:
+        '200':
+          description: Groups updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/admin/users/{id}/permissions:
+    get:
+      tags: [Permissions]
+      summary: Get user permissions
+      description: Get permissions assigned to a user
+      operationId: getUserPermissions
+      parameters:
+        - $ref: '#/components/parameters/UserIdParam'
+      responses:
+        '200':
+          description: User permissions
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetUserPermissionsResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    put:
+      tags: [Permissions]
+      summary: Set user permissions
+      description: Replace all permissions for a user
+      operationId: updateUserPermissions
+      parameters:
+        - $ref: '#/components/parameters/UserIdParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateUserPermissionsRequest'
+      responses:
+        '200':
+          description: Permissions updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  # =============================================================================
+  # ADMIN API - USER ATTRIBUTES
+  # =============================================================================
+  /api/v1/admin/users/{id}/attributes:
+    get:
+      tags: [User Attributes]
+      summary: List user attributes
+      description: Get all custom attributes for a user
+      operationId: getUserAttributes
+      parameters:
+        - $ref: '#/components/parameters/UserIdParam'
+      responses:
+        '200':
+          description: User attributes
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetUserAttributesResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/admin/user-attributes:
+    post:
+      tags: [User Attributes]
+      summary: Create user attribute
+      description: Create a new custom attribute for a user
+      operationId: createUserAttribute
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateUserAttributeRequest'
+      responses:
+        '201':
+          description: Attribute created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateUserAttributeResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/admin/user-attributes/{id}:
+    get:
+      tags: [User Attributes]
+      summary: Get user attribute
+      description: Get a specific user attribute by ID
+      operationId: getUserAttribute
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Attribute ID
+          schema:
+            type: integer
+            format: int64
+      responses:
+        '200':
+          description: Attribute details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetUserAttributeResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    put:
+      tags: [User Attributes]
+      summary: Update user attribute
+      description: Update a user attribute
+      operationId: updateUserAttribute
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Attribute ID
+          schema:
+            type: integer
+            format: int64
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateUserAttributeRequest'
+      responses:
+        '200':
+          description: Attribute updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpdateUserAttributeResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    delete:
+      tags: [User Attributes]
+      summary: Delete user attribute
+      description: Delete a user attribute
+      operationId: deleteUserAttribute
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Attribute ID
+          schema:
+            type: integer
+            format: int64
+      responses:
+        '200':
+          description: Attribute deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  # =============================================================================
+  # ADMIN API - USER SESSIONS
+  # =============================================================================
+  /api/v1/admin/users/{id}/sessions:
+    get:
+      tags: [User Sessions]
+      summary: List user sessions
+      description: Get all active sessions for a user
+      operationId: getUserSessions
+      parameters:
+        - $ref: '#/components/parameters/UserIdParam'
+      responses:
+        '200':
+          description: User sessions
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetUserSessionsResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/admin/user-sessions/{sessionIdentifier}:
+    get:
+      tags: [User Sessions]
+      summary: Get session
+      description: Get session details by identifier
+      operationId: getUserSession
+      parameters:
+        - name: sessionIdentifier
+          in: path
+          required: true
+          description: Session identifier
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Session details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetUserSessionResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    delete:
+      tags: [User Sessions]
+      summary: Delete session
+      description: |
+        Terminate a user session. The session's authorization codes are marked revoked and the
+        refresh tokens descended from them are swept, in one transaction.
+
+        Note: while GET takes the sessionIdentifier, DELETE takes the numeric session id at the
+        same position. It does not accept the identifier: a value that is not an integer is
+        refused with 400 and error_code VALIDATION_ERROR.
+      operationId: deleteUserSession
+      parameters:
+        - name: sessionIdentifier
+          in: path
+          required: true
+          description: Session ID (numeric)
+          schema:
+            type: integer
+            format: int64
+      responses:
+        '200':
+          description: Session deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  # =============================================================================
+  # ADMIN API - USER CONSENTS
+  # =============================================================================
+  /api/v1/admin/users/{id}/consents:
+    get:
+      tags: [User Consents]
+      summary: List user consents
+      description: Get all OAuth consents granted by a user
+      operationId: getUserConsents
+      parameters:
+        - $ref: '#/components/parameters/UserIdParam'
+      responses:
+        '200':
+          description: User consents
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetUserConsentsResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/admin/user-consents/{id}:
+    delete:
+      tags: [User Consents]
+      summary: Revoke consent
+      description: Revoke an OAuth consent
+      operationId: deleteUserConsent
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Consent ID
+          schema:
+            type: integer
+            format: int64
+      responses:
+        '200':
+          description: Consent revoked
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  # =============================================================================
+  # ADMIN API - GROUPS
+  # =============================================================================
+  /api/v1/admin/groups:
+    get:
+      tags: [Groups]
+      summary: List groups
+      description: Get all groups
+      operationId: getGroups
+      responses:
+        '200':
+          description: Groups list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetGroupsResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    post:
+      tags: [Groups]
+      summary: Create group
+      description: Create a new group
+      operationId: createGroup
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateGroupRequest'
+      responses:
+        '201':
+          description: Group created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateGroupResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/admin/groups/search:
+    get:
+      tags: [Groups]
+      summary: Search groups annotated with a permission
+      description: |
+        Get a page of groups, each annotated with whether it has the given
+        permission assigned. The annotation permission is required: without it
+        there is nothing to annotate and the request is refused.
+      operationId: searchGroupsWithPermissionAnnotation
+      parameters:
+        - name: annotatePermissionId
+          in: query
+          required: true
+          description: The permission each returned group is annotated against
+          schema:
+            type: integer
+            format: int64
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/SizeParam'
+      responses:
+        '200':
+          description: Annotated groups
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SearchGroupsWithPermissionAnnotationResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/admin/groups/{id}:
+    get:
+      tags: [Groups]
+      summary: Get group
+      description: Get group details by ID
+      operationId: getGroup
+      parameters:
+        - $ref: '#/components/parameters/GroupIdParam'
+      responses:
+        '200':
+          description: Group details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetGroupResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    put:
+      tags: [Groups]
+      summary: Update group
+      description: Update group details
+      operationId: updateGroup
+      parameters:
+        - $ref: '#/components/parameters/GroupIdParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateGroupRequest'
+      responses:
+        '200':
+          description: Group updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpdateGroupResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    delete:
+      tags: [Groups]
+      summary: Delete group
+      description: Delete a group
+      operationId: deleteGroup
+      parameters:
+        - $ref: '#/components/parameters/GroupIdParam'
+      responses:
+        '200':
+          description: Group deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/admin/groups/{id}/members:
+    get:
+      tags: [Group Members]
+      summary: List group members
+      description: Get members of a group with pagination
+      operationId: getGroupMembers
+      parameters:
+        - $ref: '#/components/parameters/GroupIdParam'
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/SizeParam'
+      responses:
+        '200':
+          description: Group members
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetGroupMembersResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    post:
+      tags: [Group Members]
+      summary: Add group member
+      description: Add a user to a group
+      operationId: addGroupMember
+      parameters:
+        - $ref: '#/components/parameters/GroupIdParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AddGroupMemberRequest'
+      responses:
+        '201':
+          description: Member added
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/admin/groups/{id}/members/{userId}:
+    delete:
+      tags: [Group Members]
+      summary: Remove group member
+      description: Remove a user from a group
+      operationId: removeGroupMember
+      parameters:
+        - $ref: '#/components/parameters/GroupIdParam'
+        - name: userId
+          in: path
+          required: true
+          description: User ID to remove
+          schema:
+            type: integer
+            format: int64
+      responses:
+        '200':
+          description: Member removed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/admin/groups/{id}/permissions:
+    get:
+      tags: [Permissions]
+      summary: Get group permissions
+      description: Get permissions assigned to a group
+      operationId: getGroupPermissions
+      parameters:
+        - $ref: '#/components/parameters/GroupIdParam'
+      responses:
+        '200':
+          description: Group permissions
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetGroupPermissionsResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    put:
+      tags: [Permissions]
+      summary: Set group permissions
+      description: Replace all permissions for a group
+      operationId: updateGroupPermissions
+      parameters:
+        - $ref: '#/components/parameters/GroupIdParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateGroupPermissionsRequest'
+      responses:
+        '200':
+          description: Permissions updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  # =============================================================================
+  # ADMIN API - GROUP ATTRIBUTES
+  # =============================================================================
+  /api/v1/admin/groups/{id}/attributes:
+    get:
+      tags: [Group Attributes]
+      summary: List group attributes
+      description: Get all custom attributes for a group
+      operationId: getGroupAttributes
+      parameters:
+        - $ref: '#/components/parameters/GroupIdParam'
+      responses:
+        '200':
+          description: Group attributes
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetGroupAttributesResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/admin/group-attributes:
+    post:
+      tags: [Group Attributes]
+      summary: Create group attribute
+      description: Create a new custom attribute for a group
+      operationId: createGroupAttribute
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateGroupAttributeRequest'
+      responses:
+        '201':
+          description: Attribute created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateGroupAttributeResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/admin/group-attributes/{id}:
+    get:
+      tags: [Group Attributes]
+      summary: Get group attribute
+      description: Get a specific group attribute by ID
+      operationId: getGroupAttribute
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Attribute ID
+          schema:
+            type: integer
+            format: int64
+      responses:
+        '200':
+          description: Attribute details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetGroupAttributeResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    put:
+      tags: [Group Attributes]
+      summary: Update group attribute
+      description: Update a group attribute
+      operationId: updateGroupAttribute
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Attribute ID
+          schema:
+            type: integer
+            format: int64
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateGroupAttributeRequest'
+      responses:
+        '200':
+          description: Attribute updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpdateGroupAttributeResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    delete:
+      tags: [Group Attributes]
+      summary: Delete group attribute
+      description: Delete a group attribute
+      operationId: deleteGroupAttribute
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Attribute ID
+          schema:
+            type: integer
+            format: int64
+      responses:
+        '200':
+          description: Attribute deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  # =============================================================================
+  # ADMIN API - RESOURCES
+  # =============================================================================
+  /api/v1/admin/resources:
+    get:
+      tags: [Resources]
+      summary: List resources
+      description: Get all resources
+      operationId: getResources
+      responses:
+        '200':
+          description: Resources list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetResourcesResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    post:
+      tags: [Resources]
+      summary: Create resource
+      description: Create a new resource
+      operationId: createResource
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateResourceRequest'
+      responses:
+        '201':
+          description: Resource created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateResourceResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/admin/resources/{id}:
+    get:
+      tags: [Resources]
+      summary: Get resource
+      description: Get resource details by ID
+      operationId: getResource
+      parameters:
+        - $ref: '#/components/parameters/ResourceIdParam'
+      responses:
+        '200':
+          description: Resource details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetResourceResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    put:
+      tags: [Resources]
+      summary: Update resource
+      description: Update resource details
+      operationId: updateResource
+      parameters:
+        - $ref: '#/components/parameters/ResourceIdParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateResourceRequest'
+      responses:
+        '200':
+          description: Resource updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpdateResourceResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    delete:
+      tags: [Resources]
+      summary: Delete resource
+      description: Delete a resource
+      operationId: deleteResource
+      parameters:
+        - $ref: '#/components/parameters/ResourceIdParam'
+      responses:
+        '200':
+          description: Resource deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/admin/resources/{id}/permissions:
+    get:
+      tags: [Resources]
+      summary: Get resource permissions
+      description: Get permissions defined for a resource
+      operationId: getResourcePermissions
+      parameters:
+        - $ref: '#/components/parameters/ResourceIdParam'
+      responses:
+        '200':
+          description: |
+            Resource permissions. An id that matches no resource is answered
+            here with an empty list rather than a 404: the handler queries the
+            permissions by resource id and never looks the resource up.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetPermissionsByResourceResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    put:
+      tags: [Resources]
+      summary: Update resource permissions
+      description: Replace permissions for a resource
+      operationId: updateResourcePermissions
+      parameters:
+        - $ref: '#/components/parameters/ResourceIdParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateResourcePermissionsRequest'
+      responses:
+        '200':
+          description: Permissions updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/admin/permissions/{id}/users:
+    get:
+      tags: [Permissions]
+      summary: Get users with permission
+      description: Get users that have a specific permission
+      operationId: getUsersByPermission
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Permission ID
+          schema:
+            type: integer
+            format: int64
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/SizeParam'
+      responses:
+        '200':
+          description: Users with permission
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetUsersByPermissionResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  # =============================================================================
+  # ADMIN API - CLIENTS
+  # =============================================================================
+  /api/v1/admin/clients:
+    get:
+      tags: [Clients]
+      summary: List clients
+      description: Get all OAuth2/OIDC clients
+      operationId: getClients
+      responses:
+        '200':
+          description: Clients list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetClientsResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    post:
+      tags: [Clients]
+      summary: Create client
+      description: Create a new OAuth2/OIDC client
+      operationId: createClient
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateClientRequest'
+      responses:
+        '201':
+          description: Client created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateClientResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/admin/clients/{id}:
+    get:
+      tags: [Clients]
+      summary: Get client
+      description: Get client details by ID
+      operationId: getClient
+      parameters:
+        - $ref: '#/components/parameters/ClientIdParam'
+      responses:
+        '200':
+          description: Client details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetClientResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    put:
+      tags: [Clients]
+      summary: Update client settings
+      description: Update client general settings
+      operationId: updateClientSettings
+      parameters:
+        - $ref: '#/components/parameters/ClientIdParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateClientSettingsRequest'
+      responses:
+        '200':
+          description: Client updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpdateClientResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    delete:
+      tags: [Clients]
+      summary: Delete client
+      description: Delete an OAuth2/OIDC client
+      operationId: deleteClient
+      parameters:
+        - $ref: '#/components/parameters/ClientIdParam'
+      responses:
+        '200':
+          description: Client deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/admin/clients/{id}/authentication:
+    put:
+      tags: [Clients]
+      summary: Update client authentication
+      description: |
+        Update client public/confidential mode and secret.
+
+        Switching a confidential client to public also revokes every authorization code and
+        refresh token the client holds, in the same transaction as the write: after it the
+        client authenticates with nothing, so the grants issued on the understanding that
+        redeeming them took a secret are no longer honoured. It sets pkceRequired to true for
+        the same reason, and disables the client credentials flow. The reverse transition and a
+        secret rotation revoke nothing.
+      operationId: updateClientAuthentication
+      parameters:
+        - $ref: '#/components/parameters/ClientIdParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateClientAuthenticationRequest'
+      responses:
+        '200':
+          description: Authentication updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpdateClientResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/admin/clients/{id}/oauth2-flows:
+    put:
+      tags: [Clients]
+      summary: Update OAuth2 flows
+      description: Enable/disable OAuth2 flows for a client
+      operationId: updateClientOAuth2Flows
+      parameters:
+        - $ref: '#/components/parameters/ClientIdParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateClientOAuth2FlowsRequest'
+      responses:
+        '200':
+          description: Flows updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpdateClientResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/admin/clients/{id}/redirect-uris:
+    put:
+      tags: [Clients]
+      summary: Update redirect URIs
+      description: Replace redirect URIs for a client
+      operationId: updateClientRedirectURIs
+      parameters:
+        - $ref: '#/components/parameters/ClientIdParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateClientRedirectURIsRequest'
+      responses:
+        '200':
+          description: Redirect URIs updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpdateClientResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/admin/clients/{id}/web-origins:
+    put:
+      tags: [Clients]
+      summary: Update web origins
+      description: Replace web origins for a client
+      operationId: updateClientWebOrigins
+      parameters:
+        - $ref: '#/components/parameters/ClientIdParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateClientWebOriginsRequest'
+      responses:
+        '200':
+          description: Web origins updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpdateClientResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/admin/clients/{id}/tokens:
+    put:
+      tags: [Clients]
+      summary: Update token settings
+      description: Update token expiration settings for a client
+      operationId: updateClientTokens
+      parameters:
+        - $ref: '#/components/parameters/ClientIdParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateClientTokensRequest'
+      responses:
+        '200':
+          description: Token settings updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpdateClientResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/admin/clients/{id}/permissions:
+    get:
+      tags: [Clients]
+      summary: Get client permissions
+      description: Get permissions assigned to a client
+      operationId: getClientPermissions
+      parameters:
+        - $ref: '#/components/parameters/ClientIdParam'
+      responses:
+        '200':
+          description: Client permissions
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetClientPermissionsResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    put:
+      tags: [Clients]
+      summary: Set client permissions
+      description: Replace all permissions for a client
+      operationId: updateClientPermissions
+      parameters:
+        - $ref: '#/components/parameters/ClientIdParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateClientPermissionsRequest'
+      responses:
+        '200':
+          description: Permissions updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/admin/clients/{id}/sessions:
+    get:
+      tags: [Clients]
+      summary: List client sessions
+      description: |
+        Get a page of the user sessions associated with a client, together with
+        the people they belong to. Sessions that have passed the configured idle
+        timeout or maximum lifetime are left out, so the list is the live ones.
+
+        A session's `userId` resolves against the normalized `users` array, where
+        a person holding several sessions appears once. Those records carry the
+        name parts and the email and nothing else, because this route is reached
+        with the clients scopes alone.
+      operationId: getClientSessions
+      parameters:
+        - $ref: '#/components/parameters/ClientIdParam'
+        - $ref: '#/components/parameters/PageParam'
+        - name: size
+          in: query
+          description: Results per page (default 50, capped at 100)
+          schema:
+            type: integer
+            default: 50
+            maximum: 100
+      responses:
+        '200':
+          description: Client sessions
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetClientSessionsResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/admin/clients/{id}/logo:
+    get:
+      tags: [Clients]
+      summary: Get client logo info
+      description: Check if a client has a logo and get the logo URL
+      operationId: getClientLogoInfo
+      parameters:
+        - $ref: '#/components/parameters/ClientIdParam'
+      responses:
+        '200':
+          description: Client logo info
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClientLogoInfoResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    post:
+      tags: [Clients]
+      summary: Upload client logo
+      description: Upload or replace the client logo image. Supports JPEG, PNG, GIF, and WebP formats up to the configured maximum size (3MB by default).
+      operationId: uploadClientLogo
+      parameters:
+        - $ref: '#/components/parameters/ClientIdParam'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+                - picture
+              properties:
+                picture:
+                  type: string
+                  format: binary
+                  description: Logo image file (JPEG, PNG, GIF, or WebP), up to the configured maximum size
+      responses:
+        '200':
+          description: Logo uploaded successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClientLogoUploadResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    delete:
+      tags: [Clients]
+      summary: Delete client logo
+      description: Remove the client logo
+      operationId: deleteClientLogo
+      parameters:
+        - $ref: '#/components/parameters/ClientIdParam'
+      responses:
+        '200':
+          description: Logo deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /client/logo/{clientIdentifier}:
+    get:
+      tags: [Clients]
+      summary: Get client logo image
+      description: Serve the client logo image. This is a public endpoint that does not require authentication. Supports ETag-based caching.
+      operationId: getClientLogoImage
+      security: []
+      parameters:
+        - name: clientIdentifier
+          in: path
+          required: true
+          description: The OAuth2 client identifier
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Logo image
+          headers:
+            ETag:
+              schema:
+                type: string
+              description: Content hash for caching
+            Cache-Control:
+              schema:
+                type: string
+              description: "public, max-age=300, must-revalidate"
+          content:
+            image/*:
+              schema:
+                type: string
+                format: binary
+        '304':
+          description: Not modified (ETag match)
+        '404':
+          description: Client or logo not found
+        '500':
+          description: |
+            The request failed inside the server. Unlike every other failure on
+            this endpoint, the body is the server's HTML error page rather than
+            the JSON error envelope, because this handler renders the shared
+            error template.
+          content:
+            text/html:
+              schema:
+                type: string
+
+  # =============================================================================
+  # ADMIN API - SETTINGS
+  # =============================================================================
+  /api/v1/admin/settings/general:
+    get:
+      tags: [Settings]
+      summary: Get general settings
+      description: Get general system settings
+      operationId: getSettingsGeneral
+      responses:
+        '200':
+          description: General settings
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SettingsGeneralResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    put:
+      tags: [Settings]
+      summary: Update general settings
+      description: Update general system settings
+      operationId: updateSettingsGeneral
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateSettingsGeneralRequest'
+      responses:
+        '200':
+          description: Settings updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SettingsGeneralResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/admin/settings/email:
+    get:
+      tags: [Settings]
+      summary: Get email settings
+      description: Get SMTP/email settings
+      operationId: getSettingsEmail
+      responses:
+        '200':
+          description: Email settings
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SettingsEmailResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    put:
+      tags: [Settings]
+      summary: Update email settings
+      description: Update SMTP/email settings
+      operationId: updateSettingsEmail
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateSettingsEmailRequest'
+      responses:
+        '200':
+          description: Settings updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SettingsEmailResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/admin/settings/email/send-test:
+    post:
+      tags: [Settings]
+      summary: Send test email
+      description: Send a test email to verify SMTP settings
+      operationId: sendTestEmail
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SendTestEmailRequest'
+      responses:
+        '200':
+          description: Test email sent
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/admin/settings/sessions:
+    get:
+      tags: [Settings]
+      summary: Get session settings
+      description: Get session timeout settings
+      operationId: getSettingsSessions
+      responses:
+        '200':
+          description: Session settings
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SettingsSessionsResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    put:
+      tags: [Settings]
+      summary: Update session settings
+      description: Update session timeout settings
+      operationId: updateSettingsSessions
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateSettingsSessionsRequest'
+      responses:
+        '200':
+          description: Settings updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SettingsSessionsResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/admin/settings/ui-theme:
+    get:
+      tags: [Settings]
+      summary: Get UI theme
+      description: Get current UI theme and available themes
+      operationId: getSettingsUITheme
+      responses:
+        '200':
+          description: UI theme settings
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SettingsUIThemeResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    put:
+      tags: [Settings]
+      summary: Update UI theme
+      description: Update UI theme
+      operationId: updateSettingsUITheme
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateSettingsUIThemeRequest'
+      responses:
+        '200':
+          description: Theme updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SettingsUIThemeResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/admin/settings/tokens:
+    get:
+      tags: [Settings]
+      summary: Get token settings
+      description: Get default token expiration settings
+      operationId: getSettingsTokens
+      responses:
+        '200':
+          description: Token settings
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SettingsTokensResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    put:
+      tags: [Settings]
+      summary: Update token settings
+      description: Update default token expiration settings
+      operationId: updateSettingsTokens
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateSettingsTokensRequest'
+      responses:
+        '200':
+          description: Settings updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SettingsTokensResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/admin/settings/audit-logs:
+    get:
+      tags: [Settings]
+      summary: Get audit log settings
+      description: Get audit log destinations and retention
+      operationId: getSettingsAuditLogs
+      responses:
+        '200':
+          description: Audit log settings
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SettingsAuditLogsResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    put:
+      tags: [Settings]
+      summary: Update audit log settings
+      description: Update audit log destinations and retention
+      operationId: updateSettingsAuditLogs
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateSettingsAuditLogsRequest'
+      responses:
+        '200':
+          description: Audit log settings updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SettingsAuditLogsResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/admin/settings/keys:
+    get:
+      tags: [Settings]
+      summary: Get signing keys
+      description: Get all signing keys (public key material only)
+      operationId: getSettingsKeys
+      responses:
+        '200':
+          description: Signing keys
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetSettingsKeysResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/admin/settings/keys/rotate:
+    post:
+      tags: [Settings]
+      summary: Rotate signing keys
+      description: Generate a new signing key. Old key remains for validation.
+      operationId: rotateSettingsKeys
+      responses:
+        '200':
+          description: Keys rotated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          description: |
+            Another rotation won the race and this call rotated nothing.
+            error_code is ROTATION_IN_PROGRESS. Do not retry: the rotation
+            it conflicted with already happened.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: |
+            error_code is KEY_SET_INCOMPLETE when the deployment has no current
+            or no next key, which is an operator problem rather than a
+            transient one and a retry will not clear it, or INTERNAL_SERVER_ERROR
+            for a storage or key generation failure. Either way the description
+            ends with the request id of the log line, and nothing was rotated:
+            the whole transition is one transaction.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/admin/settings/keys/{id}:
+    delete:
+      tags: [Settings]
+      summary: Delete signing key
+      description: Delete a signing key
+      operationId: deleteSettingsKey
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Key ID
+          schema:
+            type: integer
+            format: int64
+      responses:
+        '200':
+          description: Key deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+        '400':
+          description: |
+            error_code is VALIDATION_ERROR. The id is malformed, matches no
+            key, or names a key that is not in the previous state, since only a
+            previous key can be revoked. A key that does not exist is answered
+            here rather than with a 404.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/admin/phone-countries:
+    get:
+      tags: [Settings]
+      summary: Get phone countries
+      description: Get list of countries with calling codes
+      operationId: getPhoneCountries
+      responses:
+        '200':
+          description: Phone countries
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetPhoneCountriesResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  # =============================================================================
+  # ADMIN API - AUDIT LOGS
+  # =============================================================================
+  /api/v1/admin/audit-logs:
+    get:
+      tags: [Audit Logs]
+      summary: Query audit logs
+      description: |
+        Get a page of audit log entries, most recent first, optionally narrowed to
+        a single audit event, a single request id, or both. Entries are only present
+        when audit logging to the database is enabled.
+      operationId: getAuditLogs
+      parameters:
+        - name: auditEvent
+          in: query
+          description: Return only entries for this audit event
+          schema:
+            type: string
+        - name: requestId
+          in: query
+          description: Return only entries carrying this request id, matched exactly
+          schema:
+            type: string
+        - $ref: '#/components/parameters/PageParam'
+        - name: size
+          in: query
+          description: |
+            Results per page. A value outside 1 to 200 is not clamped to the
+            nearest bound, it is discarded and the default of 20 is used, so a
+            caller asking for 500 gets 20 rather than 200.
+          schema:
+            type: integer
+            default: 20
+            maximum: 200
+      responses:
+        '200':
+          description: Audit log entries
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetAuditLogsResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/admin/audit-logs/event-types:
+    get:
+      tags: [Audit Logs]
+      summary: Get audit event types
+      description: |
+        Get the catalog of audit event names this server can write, which is the set the
+        auditEvent filter on GET /api/v1/admin/audit-logs accepts. The list is fixed at build
+        time, not derived from the rows present, so it includes events that have not yet
+        occurred on this deployment.
+      operationId: getAuditEventTypes
+      responses:
+        '200':
+          description: Audit event types
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetAuditEventTypesResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  # =============================================================================
+  # ACCOUNT API
+  # =============================================================================
+  /api/v1/account/profile:
+    get:
+      tags: [Account]
+      summary: Get own profile
+      description: Get the authenticated user's profile
+      operationId: getAccountProfile
+      responses:
+        '200':
+          description: User profile
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetUserResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    put:
+      tags: [Account]
+      summary: Update own profile
+      description: Update the authenticated user's profile
+      operationId: updateAccountProfile
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateUserProfileRequest'
+      responses:
+        '200':
+          description: Profile updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpdateUserResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/account/email:
+    put:
+      tags: [Account]
+      summary: Update own email
+      description: Update the authenticated user's email (marks as unverified)
+      operationId: updateAccountEmail
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateAccountEmailRequest'
+      responses:
+        '200':
+          description: Email updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpdateUserResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: |
+            The email address was registered to another user between the
+            duplicate check and the write. error_code is EMAIL_ALREADY_EXISTS.
+            An address already taken when the request arrives is a 400 with
+            error_code validator.email.already_registered.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/account/email/verification/send:
+    post:
+      tags: [Account]
+      summary: Send verification email
+      description: Send email verification code (rate limited to 60s)
+      operationId: sendAccountEmailVerification
+      responses:
+        '200':
+          description: Verification status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountEmailVerificationSendResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/account/email/verification:
+    post:
+      tags: [Account]
+      summary: Verify email
+      description: Verify email with code (expires in 5 minutes)
+      operationId: verifyAccountEmail
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VerifyAccountEmailRequest'
+      responses:
+        '200':
+          description: Email verified
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpdateUserResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/account/phone:
+    put:
+      tags: [Account]
+      summary: Update own phone
+      description: Update the authenticated user's phone number
+      operationId: updateAccountPhone
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateAccountPhoneRequest'
+      responses:
+        '200':
+          description: Phone updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpdateUserResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/account/address:
+    put:
+      tags: [Account]
+      summary: Update own address
+      description: Update the authenticated user's address
+      operationId: updateAccountAddress
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateUserAddressRequest'
+      responses:
+        '200':
+          description: Address updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpdateUserResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/account/password:
+    put:
+      tags: [Account]
+      summary: Change own password
+      description: Change password (requires current password)
+      operationId: updateAccountPassword
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateAccountPasswordRequest'
+      responses:
+        '200':
+          description: Password changed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpdateUserResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/account/otp/enrollment:
+    get:
+      tags: [Account]
+      summary: Start OTP enrollment
+      description: |
+        Issues the TOTP enrollment for the authenticated user and returns the QR code and secret to
+        set up an authenticator with. Fails if OTP is already enabled.
+
+        The server records what it issued, and `PUT /api/v1/account/otp` enrolls that seed and no
+        other. While an enrollment is pending the call is idempotent: repeating it returns the same
+        secret and the same QR code, so reloading an enrollment page does not invalidate a code the
+        user has already scanned. A pending enrollment lasts 15 minutes, after which the next call
+        issues a new one.
+      operationId: getAccountOTPEnrollment
+      responses:
+        '200':
+          description: OTP enrollment data
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountOTPEnrollmentResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/account/otp:
+    put:
+      tags: [Account]
+      summary: Enable/disable OTP
+      description: |
+        Enables or disables TOTP for the authenticated user. Requires password verification, and
+        when enabling, a current code from the authenticator.
+
+        Enabling completes the enrollment issued by `GET /api/v1/account/otp/enrollment`: the code
+        is verified against the seed the server issued and that seed is what gets enrolled. Call the
+        enrollment endpoint first. Returns 400 if no enrollment is pending or the one started has
+        expired (`OTP_ENROLLMENT_NOT_PENDING`).
+
+        This request must not carry a `secretKey`. One that does is refused with 400
+        (`SECRET_KEY_NOT_ACCEPTED`) rather than having the field ignored, because a caller sending
+        one believes it is choosing which authenticator is installed, and it is not.
+      operationId: updateAccountOTP
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateAccountOTPRequest'
+      responses:
+        '200':
+          description: OTP status updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpdateUserResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/account/consents:
+    get:
+      tags: [Account]
+      summary: List own consents
+      description: Get all OAuth consents granted by the authenticated user
+      operationId: getAccountConsents
+      responses:
+        '200':
+          description: User consents
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetUserConsentsResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/account/consents/{id}:
+    delete:
+      tags: [Account]
+      summary: Revoke own consent
+      description: Revoke an OAuth consent
+      operationId: deleteAccountConsent
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Consent ID
+          schema:
+            type: integer
+            format: int64
+      responses:
+        '200':
+          description: Consent revoked
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/account/sessions:
+    get:
+      tags: [Account]
+      summary: List own sessions
+      description: Get all active sessions for the authenticated user
+      operationId: getAccountSessions
+      responses:
+        '200':
+          description: User sessions
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetUserSessionsResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/account/sessions/{id}:
+    delete:
+      tags: [Account]
+      summary: Terminate own session
+      description: Terminate a session
+      operationId: deleteAccountSession
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Session ID
+          schema:
+            type: integer
+            format: int64
+      responses:
+        '200':
+          description: Session terminated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/account/logout-request:
+    post:
+      tags: [Account]
+      summary: Prepare a logout
+      description: >-
+        Validate the logout target, mint a short-lived id_token_hint and return the prepared
+        logout operation, as either a self-submitting form's parameters or a URL to follow.
+      operationId: requestAccountLogout
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AccountLogoutRequest'
+      responses:
+        '200':
+          description: |
+            The prepared logout. The shape depends on the responseMode field of the request:
+            "form_post" gives AccountLogoutFormPostResponse, and anything else, absent
+            included, gives AccountLogoutRedirectResponse.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/AccountLogoutRedirectResponse'
+                  - $ref: '#/components/schemas/AccountLogoutFormPostResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+  /api/v1/account/profile-picture:
+    get:
+      tags: [Account]
+      summary: Get own profile picture info
+      description: Check whether the authenticated user has a profile picture and get the picture URL
+      operationId: getAccountProfilePictureInfo
+      responses:
+        '200':
+          description: Profile picture info
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProfilePictureInfoResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    post:
+      tags: [Account]
+      summary: Upload own profile picture
+      description: Upload or replace the authenticated user's profile picture. Supports JPEG, PNG, GIF, and WebP formats up to the configured maximum size.
+      operationId: uploadAccountProfilePicture
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+                - picture
+              properties:
+                picture:
+                  type: string
+                  format: binary
+                  description: Profile picture file (JPEG, PNG, GIF, or WebP)
+      responses:
+        '200':
+          description: Profile picture uploaded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProfilePictureUploadResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    delete:
+      tags: [Account]
+      summary: Delete own profile picture
+      description: Remove the authenticated user's profile picture
+      operationId: deleteAccountProfilePicture
+      responses:
+        '200':
+          description: Profile picture deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  # =============================================================================
+  # INTERNAL API - BROWSER SESSIONS
+  # =============================================================================
+  # Five operations, one per method of the store interface behind them. Every one is a POST
+  # carrying the session identifier in the body and never in the request line: a session handle
+  # in a path lands in this server's access log, in the Referer of anything a page loads, and in
+  # every proxy in front of the deployment.
+  #
+  # `data` is opaque here in the strongest sense. The admin console encrypts it with its own
+  # session keys before sending it, so the auth server stores bytes it holds no key for and a
+  # dump of this database yields no administrator token.
+  #
+  # None of these operations names an owner. The handler fixes it, so a request cannot ask for
+  # a session belonging to the auth server; one that names a correct identifier for such a
+  # session is answered 404, exactly as if it did not exist.
+
+  /api/v1/sessions/load:
+    post:
+      tags: [Browser Sessions]
+      summary: Read a browser session
+      description: |
+        Return one stored browser session. 404 means the session is gone: no such session, one
+        that was logged out or reaped, or one that has expired. It is distinct from 500, which
+        means the lookup could not be performed; a caller must treat 404 as "start a fresh
+        session" and 500 as a refused request, never the other way round.
+      operationId: loadBrowserSession
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SessionLoadRequest'
+      responses:
+        '200':
+          description: The stored session
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionLoadResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/sessions/create:
+    post:
+      tags: [Browser Sessions]
+      summary: Create a browser session
+      description: |
+        Store a session under an identifier the caller generated. No 404: creating names no
+        existing session, so there is nothing here that can be absent.
+      operationId: createBrowserSession
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SessionWriteRequest'
+      responses:
+        '200':
+          description: The deadline chosen for the new session
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionWriteResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/sessions/update:
+    post:
+      tags: [Browser Sessions]
+      summary: Replace a browser session's contents
+      description: |
+        Replace the contents of a session that already exists. It never inserts, and that is
+        load bearing rather than incidental: a session that is gone was most likely removed by a
+        request rotating the identifier, so re-creating its row would undo that rotation from a
+        request still in flight under the old identifier. A caller meeting 404 must fail its save
+        rather than fall back to creating.
+      operationId: updateBrowserSession
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SessionWriteRequest'
+      responses:
+        '200':
+          description: The deadline chosen for the session
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionWriteResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/sessions/touch:
+    post:
+      tags: [Browser Sessions]
+      summary: Record that a browser session was used
+      description: |
+        Move a live session's last-accessed stamp and its deadline, without sending its contents.
+        Both move together because the idle window is expressed in the deadline: a touch that
+        left it alone would never extend the session and the idle timeout would behave as an
+        absolute one.
+      operationId: touchBrowserSession
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SessionTouchRequest'
+      responses:
+        '200':
+          description: The deadline chosen for the session
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionWriteResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /api/v1/sessions/delete:
+    post:
+      tags: [Browser Sessions]
+      summary: Delete a browser session
+      description: |
+        Remove a session. 204 whether or not a row was there, so there is no 404: deleting a
+        session that is already gone is the outcome the caller asked for, and reporting a failure
+        would make a logout that raced the reaper look like one.
+      operationId: deleteBrowserSession
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SessionLoadRequest'
+      responses:
+        '204':
+          description: The session is gone
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        JWT access token.
+
+        Admin API: any one of `authserver:admin-read`, the domain scope for the operation
+        (`authserver:manage-users`, `authserver:manage-clients`, `authserver:manage-settings`)
+        or `authserver:manage`. A client credentials token is accepted.
+
+        Account API: scope `authserver:manage-account`, on a token issued for a user. A client
+        credentials token carries no `auth_time` claim and is refused with 403
+        `USER_CONTEXT_REQUIRED`.
+
+        Browser sessions: scope `authserver:browser-sessions`, and only that scope. It is
+        deliberately not one of the manage-* scopes, so holding the admin console's client secret
+        is not a way to drive the admin API with no user present.
+
+  parameters:
+    UserIdParam:
+      name: id
+      in: path
+      required: true
+      description: User ID
+      schema:
+        type: integer
+        format: int64
+    GroupIdParam:
+      name: id
+      in: path
+      required: true
+      description: Group ID
+      schema:
+        type: integer
+        format: int64
+    ResourceIdParam:
+      name: id
+      in: path
+      required: true
+      description: Resource ID
+      schema:
+        type: integer
+        format: int64
+    ClientIdParam:
+      name: id
+      in: path
+      required: true
+      description: Client ID
+      schema:
+        type: integer
+        format: int64
+    PageParam:
+      name: page
+      in: query
+      description: Page number (default 1)
+      schema:
+        type: integer
+        default: 1
+    SizeParam:
+      name: size
+      in: query
+      description: Results per page (default 10)
+      schema:
+        type: integer
+        default: 10
+
+  responses:
+    Unauthorized:
+      description: Missing or invalid bearer token
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    BadRequest:
+      description: Invalid request body or parameters
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    Forbidden:
+      description: |
+        The token is valid but does not authorise this request. Three checks
+        answer here, and a caller distinguishes them by error_code.
+
+        INSUFFICIENT_SCOPE comes from the route's authorisation middleware,
+        before the handler runs: an Admin operation needs one of the scopes
+        its route names, and an Account operation needs
+        `authserver:manage-account`.
+
+        USER_CONTEXT_REQUIRED comes from the same middleware on the Account
+        operations, which also require the token to have been issued for a
+        user: one obtained through the client credentials grant carries no
+        auth_time claim and is refused here.
+
+        FORBIDDEN comes from the handler, on the account endpoints that
+        resolve a resource by id and then check it belongs to the caller, so
+        a valid token for the wrong user reaches this rather than a 404.
+
+        Every operation this document secures declares a 403. The public
+        client logo endpoint, which carries `security: []` and authorises
+        nothing, is the one that does not.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    TooManyRequests:
+      description: |
+        Rate limit reached. Returned only when rate limiting is enabled
+        (GOIABADA_AUTHSERVER_RATELIMITER_ENABLED). error_code is
+        TOO_MANY_REQUESTS and a Retry-After header carries the window length
+        in seconds.
+      headers:
+        Retry-After:
+          description: Seconds to wait before retrying
+          schema:
+            type: integer
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    InternalServerError:
+      description: |
+        The request failed inside the server, most often a storage error.
+        error_code is INTERNAL_SERVER_ERROR: no detail about the failure, only
+        the request id an operator can find the log line by, and retrying is
+        reasonable. Key rotation's 500 also answers KEY_SET_INCOMPLETE, which
+        names its cause and no retry clears.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+
+  schemas:
+    # =========================================================================
+    # Common Responses
+    # =========================================================================
+    SessionLoadRequest:
+      type: object
+      description: |
+        Names the browser session to read or remove. There is deliberately no owner field: the
+        handler fixes the owner, which is what makes reaching another application's session
+        impossible to ask for rather than merely refused.
+      required: [id]
+      properties:
+        id:
+          type: string
+          description: |
+            The session identifier, 64 hexadecimal characters. It is a handle and not a name:
+            only its SHA-256 digest is stored, so the value here is never written to a column.
+
+    SessionWriteRequest:
+      type: object
+      description: A browser session's contents, for create and update.
+      required: [id, data, authenticated]
+      properties:
+        id:
+          type: string
+          description: The session identifier, 64 hexadecimal characters.
+        data:
+          type: string
+          description: |
+            The session contents, encrypted by the caller with its own session keys. The auth
+            server stores these bytes and holds no key for them.
+        authenticated:
+          type: boolean
+          description: |
+            Whether the caller considers this session signed in. It is a fact about the container
+            and not about its contents, and it is what decides which of the two lifetimes applies:
+            a session that has not authenticated gets a short fixed window, and one that has gets
+            the deployment's configured idle timeout and maximum lifetime. The caller answers it
+            because only the caller can see inside the blob; the auth server turns it into a
+            deadline because only the auth server can read those settings.
+
+    SessionTouchRequest:
+      type: object
+      description: Records that a live browser session was used, without sending its contents.
+      required: [id, authenticated]
+      properties:
+        id:
+          type: string
+          description: The session identifier, 64 hexadecimal characters.
+        authenticated:
+          type: boolean
+          description: As for SessionWriteRequest.
+
+    SessionLoadResponse:
+      type: object
+      description: One stored browser session.
+      required: [data, lastAccessed, expiresAt]
+      properties:
+        data:
+          type: string
+          description: The session contents, as the caller encrypted them.
+        lastAccessed:
+          type: string
+          format: date-time
+          description: |
+            When this session was last recorded as used. The caller needs it because it decides
+            whether to touch against a staleness threshold rather than on every read, which is
+            what keeps ordinary browsing from putting a write in front of every page.
+        expiresAt:
+          type: string
+          format: date-time
+          description: When this session stops being usable.
+
+    SessionWriteResponse:
+      type: object
+      description: |
+        The deadline the auth server chose for a session it just wrote. A caller sets its
+        cookie's own expiry from this, so the browser never holds a handle that outlives what it
+        names.
+      required: [expiresAt]
+      properties:
+        expiresAt:
+          type: string
+          format: date-time
+          description: When this session stops being usable.
+
+    ErrorResponse:
+      type: object
+      description: |
+        Admin/account API error envelope. Routing by HTTP status code:
+        4xx is a client-correctable failure (validation, not found,
+        permission denied, rate limited); 5xx is a server-side problem.
+        The body provides a stable error_code, optional error_args, and
+        an English error_description for non-localizing consumers.
+        Protocol endpoints (/auth/token, /auth/authorize, /connect/register,
+        /userinfo) use their RFC-defined error envelopes instead of this one.
+      properties:
+        error_code:
+          type: string
+          description: |
+            Stable identifier for the failure. UPPER_SNAKE for legacy codes
+            (e.g. VALIDATION_ERROR), dotted lowercase for catalog-keyed
+            localized codes (e.g. validator.email.required).
+        error_args:
+          type: object
+          additionalProperties: true
+          description: Substitution values for the localized message template.
+        error_description:
+          type: string
+          description: Rendered English message. Stable for non-localizing consumers.
+      required:
+        - error_description
+
+    SuccessResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+      required:
+        - success
+
+    # =========================================================================
+    # User Schemas
+    # =========================================================================
+    UserResponse:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int64
+        createdAt:
+          type: string
+          format: date-time
+          nullable: true
+        updatedAt:
+          type: string
+          format: date-time
+          nullable: true
+        enabled:
+          type: boolean
+        subject:
+          type: string
+          format: uuid
+        username:
+          type: string
+        givenName:
+          type: string
+        middleName:
+          type: string
+        familyName:
+          type: string
+        nickname:
+          type: string
+        website:
+          type: string
+        gender:
+          type: string
+        email:
+          type: string
+          format: email
+        emailVerified:
+          type: boolean
+        zoneInfoCountryName:
+          type: string
+        zoneInfo:
+          type: string
+        locale:
+          type: string
+        birthDate:
+          type: string
+          format: date-time
+          nullable: true
+        phoneNumberCountryUniqueId:
+          type: string
+        phoneNumberCountryCallingCode:
+          type: string
+        phoneNumber:
+          type: string
+        phoneNumberVerified:
+          type: boolean
+        addressLine1:
+          type: string
+        addressLine2:
+          type: string
+        addressLocality:
+          type: string
+        addressRegion:
+          type: string
+        addressPostalCode:
+          type: string
+        addressCountry:
+          type: string
+          pattern: '^([A-Z]{2})?$'
+          description: ISO 3166-1 alpha-2 country code (e.g. US, BR), or empty string.
+        otpEnabled:
+          type: boolean
+      required:
+        - id
+        - createdAt
+        - updatedAt
+        - enabled
+        - subject
+        - username
+        - givenName
+        - middleName
+        - familyName
+        - nickname
+        - website
+        - gender
+        - email
+        - emailVerified
+        - zoneInfoCountryName
+        - zoneInfo
+        - locale
+        - birthDate
+        - phoneNumberCountryUniqueId
+        - phoneNumberCountryCallingCode
+        - phoneNumber
+        - phoneNumberVerified
+        - addressLine1
+        - addressLine2
+        - addressLocality
+        - addressRegion
+        - addressPostalCode
+        - addressCountry
+        - otpEnabled
+
+    SearchUsersResponse:
+      type: object
+      properties:
+        users:
+          type: array
+          items:
+            $ref: '#/components/schemas/UserResponse'
+        total:
+          type: integer
+        page:
+          type: integer
+        size:
+          type: integer
+        query:
+          type: string
+      required:
+        - users
+        - total
+        - page
+        - size
+        - query
+
+    UserWithGroupMembershipResponse:
+      allOf:
+        - $ref: '#/components/schemas/UserResponse'
+        - type: object
+          properties:
+            inGroup:
+              type: boolean
+              description: Whether this user belongs to the annotated group
+          required:
+            - inGroup
+
+    SearchUsersWithGroupAnnotationResponse:
+      type: object
+      description: Answered by searchUsers when annotateGroupMembership is set.
+      properties:
+        users:
+          type: array
+          items:
+            $ref: '#/components/schemas/UserWithGroupMembershipResponse'
+        total:
+          type: integer
+        page:
+          type: integer
+        size:
+          type: integer
+        query:
+          type: string
+      required:
+        - users
+        - total
+        - page
+        - size
+        - query
+
+    UserWithPermissionResponse:
+      allOf:
+        - $ref: '#/components/schemas/UserResponse'
+        - type: object
+          properties:
+            hasPermission:
+              type: boolean
+              description: Whether this user has the annotated permission assigned
+          required:
+            - hasPermission
+
+    SearchUsersWithPermissionAnnotationResponse:
+      type: object
+      description: Answered by searchUsers when annotatePermissionId is set.
+      properties:
+        users:
+          type: array
+          items:
+            $ref: '#/components/schemas/UserWithPermissionResponse'
+        total:
+          type: integer
+        page:
+          type: integer
+        size:
+          type: integer
+        query:
+          type: string
+      required:
+        - users
+        - total
+        - page
+        - size
+        - query
+
+    GetUserResponse:
+      type: object
+      properties:
+        user:
+          $ref: '#/components/schemas/UserResponse'
+      required:
+        - user
+
+    CreateUserResponse:
+      type: object
+      properties:
+        user:
+          $ref: '#/components/schemas/UserResponse'
+      required:
+        - user
+
+    UpdateUserResponse:
+      type: object
+      properties:
+        user:
+          $ref: '#/components/schemas/UserResponse'
+      required:
+        - user
+
+    GenerateUserEmailVerificationCodeResponse:
+      type: object
+      properties:
+        verificationCode:
+          type: string
+        verificationCodeExpiresAt:
+          type: string
+          format: date-time
+        userId:
+          type: integer
+          format: int64
+        email:
+          type: string
+          format: email
+      required:
+        - verificationCode
+        - verificationCodeExpiresAt
+        - userId
+        - email
+
+    CreateUserRequest:
+      type: object
+      required:
+        - email
+      properties:
+        email:
+          type: string
+          format: email
+        emailVerified:
+          type: boolean
+        givenName:
+          type: string
+        middleName:
+          type: string
+        familyName:
+          type: string
+        setPasswordType:
+          type: string
+          enum: [now, email]
+          default: now
+          description: >-
+            "now" to set the password immediately, "email" to send a setup link. Optional:
+            absent is treated as "now". A present value outside the two is refused with 400.
+        password:
+          type: string
+          description: >-
+            Required if setPasswordType is "now", and required whatever setPasswordType says on
+            a deployment with no SMTP configured, since the setup email cannot be sent.
+
+    UpdateUserProfileRequest:
+      type: object
+      properties:
+        username:
+          type: string
+        givenName:
+          type: string
+        middleName:
+          type: string
+        familyName:
+          type: string
+        nickname:
+          type: string
+        website:
+          type: string
+        gender:
+          type: string
+        dateOfBirth:
+          type: string
+          description: Format YYYY-MM-DD
+        zoneInfoCountryName:
+          type: string
+        zoneInfo:
+          type: string
+        locale:
+          type: string
+
+    UpdateUserEmailRequest:
+      type: object
+      properties:
+        email:
+          type: string
+          format: email
+        emailVerified:
+          type: boolean
+
+    UpdateUserPhoneRequest:
+      type: object
+      properties:
+        phoneCountryUniqueId:
+          type: string
+        phoneNumber:
+          type: string
+        phoneNumberVerified:
+          type: boolean
+
+    UpdateUserAddressRequest:
+      type: object
+      properties:
+        addressLine1:
+          type: string
+        addressLine2:
+          type: string
+        addressLocality:
+          type: string
+        addressRegion:
+          type: string
+        addressPostalCode:
+          type: string
+        addressCountry:
+          type: string
+          pattern: '^([A-Z]{2})?$'
+          description: ISO 3166-1 alpha-2 country code (e.g. US, BR), or empty string.
+
+    UpdateUserPasswordRequest:
+      type: object
+      required:
+        - newPassword
+      properties:
+        newPassword:
+          type: string
+
+    UpdateUserEnabledRequest:
+      type: object
+      properties:
+        enabled:
+          type: boolean
+
+    UpdateUserOTPRequest:
+      type: object
+      properties:
+        enabled:
+          type: boolean
+          description: Can only be set to false (disable OTP)
+
+    UpdateUserGroupsRequest:
+      type: object
+      properties:
+        groupIds:
+          type: array
+          maxItems: 1000
+          description: >-
+            The complete set of groups the user belongs to after the call. An array naming more
+            than 1000 groups is refused with VALIDATION_ERROR before any of them is read back,
+            because every id is validated against the database and the list is read in
+            statement-sized batches.
+          items:
+            type: integer
+            format: int64
+
+    UpdateUserPermissionsRequest:
+      type: object
+      properties:
+        permissionIds:
+          type: array
+          items:
+            type: integer
+            format: int64
+
+    # =========================================================================
+    # User Attribute Schemas
+    # =========================================================================
+    UserAttributeResponse:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int64
+        createdAt:
+          type: string
+          format: date-time
+          nullable: true
+        updatedAt:
+          type: string
+          format: date-time
+          nullable: true
+        key:
+          type: string
+        value:
+          type: string
+        includeInIdToken:
+          type: boolean
+        includeInAccessToken:
+          type: boolean
+        userId:
+          type: integer
+          format: int64
+      required:
+        - id
+        - createdAt
+        - updatedAt
+        - key
+        - value
+        - includeInIdToken
+        - includeInAccessToken
+        - userId
+
+    GetUserAttributesResponse:
+      type: object
+      properties:
+        attributes:
+          type: array
+          items:
+            $ref: '#/components/schemas/UserAttributeResponse'
+      required:
+        - attributes
+
+    GetUserAttributeResponse:
+      type: object
+      properties:
+        attribute:
+          $ref: '#/components/schemas/UserAttributeResponse'
+      required:
+        - attribute
+
+    CreateUserAttributeRequest:
+      type: object
+      required:
+        - key
+        - value
+        - userId
+      properties:
+        key:
+          type: string
+        value:
+          type: string
+        includeInIdToken:
+          type: boolean
+        includeInAccessToken:
+          type: boolean
+        userId:
+          type: integer
+          format: int64
+
+    CreateUserAttributeResponse:
+      type: object
+      properties:
+        attribute:
+          $ref: '#/components/schemas/UserAttributeResponse'
+      required:
+        - attribute
+
+    UpdateUserAttributeRequest:
+      type: object
+      properties:
+        key:
+          type: string
+        value:
+          type: string
+        includeInIdToken:
+          type: boolean
+        includeInAccessToken:
+          type: boolean
+
+    UpdateUserAttributeResponse:
+      type: object
+      properties:
+        attribute:
+          $ref: '#/components/schemas/UserAttributeResponse'
+      required:
+        - attribute
+
+    # =========================================================================
+    # Session Schemas
+    # =========================================================================
+    UserSessionResponse:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int64
+        createdAt:
+          type: string
+          format: date-time
+          nullable: true
+        updatedAt:
+          type: string
+          format: date-time
+          nullable: true
+        sessionIdentifier:
+          type: string
+        started:
+          type: string
+          format: date-time
+          nullable: true
+        lastAccessed:
+          type: string
+          format: date-time
+          nullable: true
+        authMethods:
+          type: string
+        acrLevel:
+          type: string
+        authTime:
+          type: string
+          format: date-time
+          nullable: true
+        ipAddress:
+          type: string
+        deviceName:
+          type: string
+        deviceType:
+          type: string
+        deviceOS:
+          type: string
+        userAgent:
+          type: string
+        userId:
+          type: integer
+          format: int64
+      required:
+        - id
+        - createdAt
+        - updatedAt
+        - sessionIdentifier
+        - started
+        - lastAccessed
+        - authMethods
+        - acrLevel
+        - authTime
+        - ipAddress
+        - deviceName
+        - deviceType
+        - deviceOS
+        - userAgent
+        - userId
+
+    UserSessionDetailResponse:
+      allOf:
+        - $ref: '#/components/schemas/UserSessionResponse'
+        - type: object
+          properties:
+            isCurrent:
+              type: boolean
+            clientIdentifiers:
+              type: array
+              items:
+                type: string
+          required:
+            - isCurrent
+            - clientIdentifiers
+
+    GetUserSessionsResponse:
+      type: object
+      properties:
+        sessions:
+          type: array
+          items:
+            $ref: '#/components/schemas/UserSessionDetailResponse'
+      required:
+        - sessions
+
+    SessionOwnerResponse:
+      description: |
+        Who a listed session belongs to: the name parts and the email, which is what a
+        session page shows. Not a user profile, because the client sessions endpoint is
+        reached with the clients scopes alone.
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int64
+        email:
+          type: string
+        givenName:
+          type: string
+        middleName:
+          type: string
+        familyName:
+          type: string
+      required:
+        - id
+        - email
+        - givenName
+        - middleName
+        - familyName
+
+    GetClientSessionsResponse:
+      type: object
+      properties:
+        sessions:
+          type: array
+          items:
+            $ref: '#/components/schemas/UserSessionDetailResponse'
+        users:
+          description: |
+            The owners of the sessions listed, normalized: a user holding several
+            sessions appears once. Every session's userId is a key into this array.
+          type: array
+          items:
+            $ref: '#/components/schemas/SessionOwnerResponse'
+      required:
+        - sessions
+        - users
+
+    GetUserSessionResponse:
+      type: object
+      properties:
+        session:
+          $ref: '#/components/schemas/UserSessionResponse'
+      required:
+        - session
+
+    # =========================================================================
+    # Consent Schemas
+    # =========================================================================
+    UserConsentResponse:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int64
+        createdAt:
+          type: string
+          format: date-time
+          nullable: true
+        updatedAt:
+          type: string
+          format: date-time
+          nullable: true
+        clientId:
+          type: integer
+          format: int64
+        userId:
+          type: integer
+          format: int64
+        scope:
+          type: string
+        grantedAt:
+          type: string
+          format: date-time
+          nullable: true
+        clientIdentifier:
+          type: string
+        clientDescription:
+          type: string
+      required:
+        - id
+        - createdAt
+        - updatedAt
+        - clientId
+        - userId
+        - scope
+        - grantedAt
+        - clientIdentifier
+        - clientDescription
+
+    GetUserConsentsResponse:
+      type: object
+      properties:
+        consents:
+          type: array
+          items:
+            $ref: '#/components/schemas/UserConsentResponse'
+      required:
+        - consents
+
+    # =========================================================================
+    # Group Schemas
+    # =========================================================================
+    GroupResponse:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int64
+        createdAt:
+          type: string
+          format: date-time
+          nullable: true
+        updatedAt:
+          type: string
+          format: date-time
+          nullable: true
+        groupIdentifier:
+          type: string
+        description:
+          type: string
+        includeInIdToken:
+          type: boolean
+        includeInAccessToken:
+          type: boolean
+        memberCount:
+          type: integer
+      required:
+        - id
+        - createdAt
+        - updatedAt
+        - groupIdentifier
+        - description
+        - includeInIdToken
+        - includeInAccessToken
+        - memberCount
+
+    GetGroupsResponse:
+      type: object
+      properties:
+        groups:
+          type: array
+          items:
+            $ref: '#/components/schemas/GroupResponse'
+      required:
+        - groups
+
+    GetGroupResponse:
+      type: object
+      properties:
+        group:
+          $ref: '#/components/schemas/GroupResponse'
+      required:
+        - group
+
+    CreateGroupRequest:
+      type: object
+      required:
+        - groupIdentifier
+      properties:
+        groupIdentifier:
+          type: string
+        description:
+          type: string
+          maxLength: 100
+        includeInIdToken:
+          type: boolean
+        includeInAccessToken:
+          type: boolean
+
+    CreateGroupResponse:
+      type: object
+      properties:
+        group:
+          $ref: '#/components/schemas/GroupResponse'
+      required:
+        - group
+
+    UpdateGroupRequest:
+      type: object
+      properties:
+        groupIdentifier:
+          type: string
+        description:
+          type: string
+          maxLength: 100
+        includeInIdToken:
+          type: boolean
+        includeInAccessToken:
+          type: boolean
+
+    UpdateGroupResponse:
+      type: object
+      properties:
+        group:
+          $ref: '#/components/schemas/GroupResponse'
+      required:
+        - group
+
+    GroupWithPermissionResponse:
+      allOf:
+        - $ref: '#/components/schemas/GroupResponse'
+        - type: object
+          properties:
+            hasPermission:
+              type: boolean
+              description: Whether this group has the annotated permission assigned
+          required:
+            - hasPermission
+
+    SearchGroupsWithPermissionAnnotationResponse:
+      type: object
+      properties:
+        groups:
+          type: array
+          items:
+            $ref: '#/components/schemas/GroupWithPermissionResponse'
+        total:
+          type: integer
+        page:
+          type: integer
+        size:
+          type: integer
+      required:
+        - groups
+        - total
+        - page
+        - size
+
+    GetGroupMembersResponse:
+      type: object
+      properties:
+        members:
+          type: array
+          items:
+            $ref: '#/components/schemas/UserResponse'
+        total:
+          type: integer
+        page:
+          type: integer
+        size:
+          type: integer
+      required:
+        - members
+        - total
+        - page
+        - size
+
+    AddGroupMemberRequest:
+      type: object
+      required:
+        - userId
+      properties:
+        userId:
+          type: integer
+          format: int64
+
+    GetUserGroupsResponse:
+      type: object
+      properties:
+        user:
+          $ref: '#/components/schemas/UserResponse'
+        groups:
+          type: array
+          items:
+            $ref: '#/components/schemas/GroupResponse'
+      required:
+        - user
+        - groups
+
+    UpdateGroupPermissionsRequest:
+      type: object
+      properties:
+        permissionIds:
+          type: array
+          items:
+            type: integer
+            format: int64
+
+    # =========================================================================
+    # Group Attribute Schemas
+    # =========================================================================
+    GroupAttributeResponse:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int64
+        createdAt:
+          type: string
+          format: date-time
+          nullable: true
+        updatedAt:
+          type: string
+          format: date-time
+          nullable: true
+        key:
+          type: string
+        value:
+          type: string
+        includeInIdToken:
+          type: boolean
+        includeInAccessToken:
+          type: boolean
+        groupId:
+          type: integer
+          format: int64
+      required:
+        - id
+        - createdAt
+        - updatedAt
+        - key
+        - value
+        - includeInIdToken
+        - includeInAccessToken
+        - groupId
+
+    GetGroupAttributesResponse:
+      type: object
+      properties:
+        attributes:
+          type: array
+          items:
+            $ref: '#/components/schemas/GroupAttributeResponse'
+      required:
+        - attributes
+
+    GetGroupAttributeResponse:
+      type: object
+      properties:
+        attribute:
+          $ref: '#/components/schemas/GroupAttributeResponse'
+      required:
+        - attribute
+
+    CreateGroupAttributeRequest:
+      type: object
+      required:
+        - key
+        - value
+        - groupId
+      properties:
+        key:
+          type: string
+        value:
+          type: string
+        includeInIdToken:
+          type: boolean
+        includeInAccessToken:
+          type: boolean
+        groupId:
+          type: integer
+          format: int64
+
+    CreateGroupAttributeResponse:
+      type: object
+      properties:
+        attribute:
+          $ref: '#/components/schemas/GroupAttributeResponse'
+      required:
+        - attribute
+
+    UpdateGroupAttributeRequest:
+      type: object
+      properties:
+        key:
+          type: string
+        value:
+          type: string
+        includeInIdToken:
+          type: boolean
+        includeInAccessToken:
+          type: boolean
+
+    UpdateGroupAttributeResponse:
+      type: object
+      properties:
+        attribute:
+          $ref: '#/components/schemas/GroupAttributeResponse'
+      required:
+        - attribute
+
+    # =========================================================================
+    # Resource & Permission Schemas
+    # =========================================================================
+    ResourceResponse:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int64
+        resourceIdentifier:
+          type: string
+        description:
+          type: string
+        isSystemLevelResource:
+          type: boolean
+          description: |
+            True for a resource this server owns and enforces as system level: rename and
+            delete are refused on it with 403. A consumer should disable those controls
+            rather than recompute the rule.
+      required:
+        - id
+        - resourceIdentifier
+        - description
+        - isSystemLevelResource
+
+    PermissionResponse:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int64
+        permissionIdentifier:
+          type: string
+        description:
+          type: string
+        resourceId:
+          type: integer
+          format: int64
+        resource:
+          $ref: '#/components/schemas/ResourceResponse'
+      required:
+        - id
+        - permissionIdentifier
+        - description
+        - resourceId
+        - resource
+
+    GetResourcesResponse:
+      type: object
+      properties:
+        resources:
+          type: array
+          items:
+            $ref: '#/components/schemas/ResourceResponse'
+      required:
+        - resources
+
+    GetResourceResponse:
+      type: object
+      properties:
+        resource:
+          $ref: '#/components/schemas/ResourceResponse'
+      required:
+        - resource
+
+    CreateResourceRequest:
+      type: object
+      required:
+        - resourceIdentifier
+      properties:
+        resourceIdentifier:
+          type: string
+        description:
+          type: string
+          maxLength: 100
+
+    CreateResourceResponse:
+      type: object
+      properties:
+        resource:
+          $ref: '#/components/schemas/ResourceResponse'
+      required:
+        - resource
+
+    UpdateResourceRequest:
+      type: object
+      properties:
+        resourceIdentifier:
+          type: string
+        description:
+          type: string
+          maxLength: 100
+
+    UpdateResourceResponse:
+      type: object
+      properties:
+        resource:
+          $ref: '#/components/schemas/ResourceResponse'
+      required:
+        - resource
+
+    GetPermissionsByResourceResponse:
+      type: object
+      properties:
+        permissions:
+          type: array
+          items:
+            $ref: '#/components/schemas/PermissionResponse'
+      required:
+        - permissions
+
+    UpdateResourcePermissionsRequest:
+      type: object
+      properties:
+        permissions:
+          type: array
+          items:
+            $ref: '#/components/schemas/ResourcePermissionUpsert'
+
+    ResourcePermissionUpsert:
+      type: object
+      required:
+        - permissionIdentifier
+      properties:
+        id:
+          type: integer
+          format: int64
+          description: Include to update existing, omit to create new
+        permissionIdentifier:
+          type: string
+        description:
+          type: string
+
+    GetUserPermissionsResponse:
+      type: object
+      properties:
+        user:
+          $ref: '#/components/schemas/UserResponse'
+        permissions:
+          type: array
+          items:
+            $ref: '#/components/schemas/PermissionResponse'
+      required:
+        - user
+        - permissions
+
+    GetGroupPermissionsResponse:
+      type: object
+      properties:
+        group:
+          $ref: '#/components/schemas/GroupResponse'
+        permissions:
+          type: array
+          items:
+            $ref: '#/components/schemas/PermissionResponse'
+      required:
+        - group
+        - permissions
+
+    GetUsersByPermissionResponse:
+      type: object
+      properties:
+        users:
+          type: array
+          items:
+            $ref: '#/components/schemas/UserResponse'
+        total:
+          type: integer
+        page:
+          type: integer
+        size:
+          type: integer
+      required:
+        - users
+        - total
+        - page
+        - size
+
+    # =========================================================================
+    # Client Schemas
+    # =========================================================================
+    RedirectURI:
+      type: object
+      description: |
+        The `redirectURIs` entries of ClientResponse.
+
+        The schema name is unchanged, but the shape below is not what releases up to and
+        including v1.6.0 put on the wire: this position carried the persistence row directly,
+        so its keys arrived capitalised and its `createdAt` arrived as a two-field
+        `{"Time":...,"Valid":...}` object. The keys below are the ones every published
+        contract has always declared.
+      properties:
+        id:
+          type: integer
+          format: int64
+        createdAt:
+          type: string
+          format: date-time
+          nullable: true
+        uri:
+          type: string
+        clientId:
+          type: integer
+          format: int64
+      required:
+        - id
+        - createdAt
+        - uri
+        - clientId
+
+    WebOrigin:
+      type: object
+      description: |
+        The `webOrigins` entries of ClientResponse. Its keys moved in the same release and for
+        the same reason as RedirectURI above.
+      properties:
+        id:
+          type: integer
+          format: int64
+        createdAt:
+          type: string
+          format: date-time
+          nullable: true
+        origin:
+          type: string
+        clientId:
+          type: integer
+          format: int64
+      required:
+        - id
+        - createdAt
+        - origin
+        - clientId
+
+    ClientResponse:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int64
+        createdAt:
+          type: string
+          format: date-time
+          nullable: true
+        updatedAt:
+          type: string
+          format: date-time
+          nullable: true
+        clientIdentifier:
+          type: string
+        clientSecret:
+          type: string
+          description: Only included in detail responses
+        description:
+          type: string
+        websiteUrl:
+          type: string
+          description: The client's website URL
+        displayName:
+          type: string
+          description: A user-friendly name for the client
+        enabled:
+          type: boolean
+        consentRequired:
+          type: boolean
+        createdViaDcr:
+          type: boolean
+          description: Read-only. True when the client registered itself through /connect/register
+        showLogo:
+          type: boolean
+          description: When true, the client logo is displayed on login and consent screens
+        showDisplayName:
+          type: boolean
+          description: When true, the display name is shown instead of the client identifier
+        showDescription:
+          type: boolean
+          description: When true, the client description is displayed on login and consent screens
+        showWebsiteUrl:
+          type: boolean
+          description: When true, the client website URL is displayed on login and consent screens
+        isPublic:
+          type: boolean
+        isSystemLevelClient:
+          type: boolean
+        authorizationCodeEnabled:
+          type: boolean
+        clientCredentialsEnabled:
+          type: boolean
+        pkceRequired:
+          type: boolean
+          nullable: true
+          description: Null inherits the global setting, true requires PKCE, false makes it optional. Ignored for public clients, which always require PKCE
+        implicitGrantEnabled:
+          type: boolean
+          nullable: true
+          description: Null inherits the global setting, true enables the implicit flow, false disables it. Deprecated in OAuth 2.1
+        resourceOwnerPasswordCredentialsEnabled:
+          type: boolean
+          nullable: true
+          description: Null inherits the global setting, true enables grant_type=password (RFC 6749 section 4.3), false disables it. Deprecated in OAuth 2.1
+        tokenExpirationInSeconds:
+          type: integer
+        refreshTokenOfflineIdleTimeoutInSeconds:
+          type: integer
+        refreshTokenOfflineMaxLifetimeInSeconds:
+          type: integer
+        includeOpenIDConnectClaimsInAccessToken:
+          type: string
+        includeOpenIDConnectClaimsInIdToken:
+          type: string
+        defaultAcrLevel:
+          type: string
+        redirectURIs:
+          type: array
+          items:
+            $ref: '#/components/schemas/RedirectURI'
+        webOrigins:
+          type: array
+          items:
+            $ref: '#/components/schemas/WebOrigin'
+      required:
+        - id
+        - createdAt
+        - updatedAt
+        - clientIdentifier
+        - description
+        - websiteUrl
+        - displayName
+        - enabled
+        - consentRequired
+        - createdViaDcr
+        - showLogo
+        - showDisplayName
+        - showDescription
+        - showWebsiteUrl
+        - isPublic
+        - isSystemLevelClient
+        - authorizationCodeEnabled
+        - clientCredentialsEnabled
+        - pkceRequired
+        - implicitGrantEnabled
+        - resourceOwnerPasswordCredentialsEnabled
+        - tokenExpirationInSeconds
+        - refreshTokenOfflineIdleTimeoutInSeconds
+        - refreshTokenOfflineMaxLifetimeInSeconds
+        - includeOpenIDConnectClaimsInAccessToken
+        - includeOpenIDConnectClaimsInIdToken
+        - defaultAcrLevel
+        - redirectURIs
+        - webOrigins
+
+    GetClientsResponse:
+      type: object
+      properties:
+        clients:
+          type: array
+          items:
+            $ref: '#/components/schemas/ClientResponse'
+      required:
+        - clients
+
+    GetClientResponse:
+      type: object
+      properties:
+        client:
+          $ref: '#/components/schemas/ClientResponse'
+      required:
+        - client
+
+    CreateClientRequest:
+      type: object
+      required:
+        - clientIdentifier
+      properties:
+        clientIdentifier:
+          type: string
+        description:
+          type: string
+        displayName:
+          type: string
+          description: A user-friendly name for the client (max 100 chars after trimming). When the trimmed value is non-empty, showDisplayName is automatically set to true; otherwise false.
+        authorizationCodeEnabled:
+          type: boolean
+        clientCredentialsEnabled:
+          type: boolean
+
+    CreateClientResponse:
+      type: object
+      properties:
+        client:
+          $ref: '#/components/schemas/ClientResponse'
+      required:
+        - client
+
+    UpdateClientResponse:
+      type: object
+      properties:
+        client:
+          $ref: '#/components/schemas/ClientResponse'
+      required:
+        - client
+
+    UpdateClientSettingsRequest:
+      type: object
+      required:
+        - clientIdentifier
+      properties:
+        clientIdentifier:
+          type: string
+        description:
+          type: string
+        websiteUrl:
+          type: string
+          description: The client's website URL (http or https, max 256 chars)
+        displayName:
+          type: string
+          description: A user-friendly name for the client (max 100 chars)
+        enabled:
+          type: boolean
+        consentRequired:
+          type: boolean
+        showLogo:
+          type: boolean
+          description: When true, the client logo is displayed on login and consent screens
+        showDisplayName:
+          type: boolean
+          description: When true, the display name is shown instead of the client identifier
+        showDescription:
+          type: boolean
+          description: When true, the client description is displayed on login and consent screens
+        showWebsiteUrl:
+          type: boolean
+          description: When true, the client website URL is displayed on login and consent screens
+        defaultAcrLevel:
+          type: string
+
+    UpdateClientAuthenticationRequest:
+      type: object
+      properties:
+        isPublic:
+          type: boolean
+        clientSecret:
+          type: string
+          description: Required for confidential clients
+
+    UpdateClientOAuth2FlowsRequest:
+      type: object
+      properties:
+        authorizationCodeEnabled:
+          type: boolean
+        clientCredentialsEnabled:
+          type: boolean
+        pkceRequired:
+          type: boolean
+          nullable: true
+          description: Null inherits the global setting, true requires PKCE, false makes it optional. Ignored for public clients, which always require PKCE
+        implicitGrantEnabled:
+          type: boolean
+          nullable: true
+          description: Null inherits the global setting, true enables the implicit flow, false disables it. Deprecated in OAuth 2.1
+        resourceOwnerPasswordCredentialsEnabled:
+          type: boolean
+          nullable: true
+          description: Null inherits the global setting, true enables grant_type=password (RFC 6749 section 4.3), false disables it. Deprecated in OAuth 2.1
+
+    UpdateClientRedirectURIsRequest:
+      type: object
+      properties:
+        redirectURIs:
+          type: array
+          items:
+            type: string
+
+    UpdateClientWebOriginsRequest:
+      type: object
+      properties:
+        webOrigins:
+          type: array
+          items:
+            type: string
+
+    UpdateClientTokensRequest:
+      type: object
+      properties:
+        tokenExpirationInSeconds:
+          type: integer
+        refreshTokenOfflineIdleTimeoutInSeconds:
+          type: integer
+        refreshTokenOfflineMaxLifetimeInSeconds:
+          type: integer
+        includeOpenIDConnectClaimsInAccessToken:
+          type: string
+        includeOpenIDConnectClaimsInIdToken:
+          type: string
+
+    UpdateClientPermissionsRequest:
+      type: object
+      properties:
+        permissionIds:
+          type: array
+          items:
+            type: integer
+            format: int64
+
+    GetClientPermissionsResponse:
+      type: object
+      properties:
+        client:
+          $ref: '#/components/schemas/ClientResponse'
+        permissions:
+          type: array
+          items:
+            $ref: '#/components/schemas/PermissionResponse'
+      required:
+        - client
+        - permissions
+
+    ClientLogoInfoResponse:
+      type: object
+      properties:
+        hasLogo:
+          type: boolean
+        logoUrl:
+          type: string
+          description: Public URL to serve the logo image (only present when hasLogo is true)
+      required:
+        # logoUrl is deliberately absent: the handler adds that key only when hasLogo is true.
+        - hasLogo
+
+    ClientLogoUploadResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        pictureUrl:
+          type: string
+          description: Public URL to the uploaded logo
+      required:
+        - success
+        - pictureUrl
+
+    ProfilePictureInfoResponse:
+      type: object
+      properties:
+        hasPicture:
+          type: boolean
+        pictureUrl:
+          type: string
+          description: Public URL to serve the picture (only present when hasPicture is true)
+      required:
+        # pictureUrl is deliberately absent: the handler adds that key only when hasPicture is
+        # true.
+        - hasPicture
+
+    ProfilePictureUploadResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        pictureUrl:
+          type: string
+          description: Public URL to the uploaded picture
+      required:
+        - success
+        - pictureUrl
+
+    # =========================================================================
+    # Settings Schemas
+    # =========================================================================
+    SettingsGeneralResponse:
+      type: object
+      properties:
+        appName:
+          type: string
+        issuer:
+          type: string
+        selfRegistrationEnabled:
+          type: boolean
+        selfRegistrationRequiresEmailVerification:
+          type: boolean
+        dynamicClientRegistrationEnabled:
+          type: boolean
+        passwordPolicy:
+          type: string
+        pkceRequired:
+          type: boolean
+          description: When true, confidential clients must use PKCE. Public clients always require PKCE regardless of this setting
+        implicitFlowEnabled:
+          type: boolean
+          description: When true, the implicit flow is enabled server-wide. Deprecated in OAuth 2.1
+        resourceOwnerPasswordCredentialsEnabled:
+          type: boolean
+          description: When true, grant_type=password is enabled server-wide (RFC 6749 section 4.3). Deprecated in OAuth 2.1
+      required:
+        - appName
+        - issuer
+        - selfRegistrationEnabled
+        - selfRegistrationRequiresEmailVerification
+        - dynamicClientRegistrationEnabled
+        - passwordPolicy
+        - pkceRequired
+        - implicitFlowEnabled
+        - resourceOwnerPasswordCredentialsEnabled
+
+    UpdateSettingsGeneralRequest:
+      type: object
+      properties:
+        appName:
+          type: string
+        issuer:
+          type: string
+        selfRegistrationEnabled:
+          type: boolean
+        selfRegistrationRequiresEmailVerification:
+          type: boolean
+        dynamicClientRegistrationEnabled:
+          type: boolean
+        passwordPolicy:
+          type: string
+        pkceRequired:
+          type: boolean
+          description: When true, confidential clients must use PKCE. Public clients always require PKCE regardless of this setting
+        implicitFlowEnabled:
+          type: boolean
+          description: When true, allows the implicit flow (response_type=token, id_token, id_token token). Deprecated in OAuth 2.1
+        resourceOwnerPasswordCredentialsEnabled:
+          type: boolean
+          description: When true, allows grant_type=password at the token endpoint (RFC 6749 section 4.3). Deprecated in OAuth 2.1
+
+    SettingsEmailResponse:
+      type: object
+      properties:
+        smtpEnabled:
+          type: boolean
+        smtpHost:
+          type: string
+        smtpPort:
+          type: integer
+        smtpUsername:
+          type: string
+        smtpEncryption:
+          type: string
+        smtpFromName:
+          type: string
+        smtpFromEmail:
+          type: string
+        hasSmtpPassword:
+          type: boolean
+      required:
+        - smtpEnabled
+        - smtpHost
+        - smtpPort
+        - smtpUsername
+        - smtpEncryption
+        - smtpFromName
+        - smtpFromEmail
+        - hasSmtpPassword
+
+    UpdateSettingsEmailRequest:
+      type: object
+      properties:
+        smtpEnabled:
+          type: boolean
+        smtpHost:
+          type: string
+        smtpPort:
+          type: integer
+        smtpUsername:
+          type: string
+        smtpPassword:
+          type: string
+        smtpEncryption:
+          type: string
+        smtpFromName:
+          type: string
+        smtpFromEmail:
+          type: string
+
+    SendTestEmailRequest:
+      type: object
+      required:
+        - to
+      properties:
+        to:
+          type: string
+          format: email
+
+    SettingsSessionsResponse:
+      type: object
+      properties:
+        userSessionIdleTimeoutInSeconds:
+          type: integer
+        userSessionMaxLifetimeInSeconds:
+          type: integer
+      required:
+        - userSessionIdleTimeoutInSeconds
+        - userSessionMaxLifetimeInSeconds
+
+    UpdateSettingsSessionsRequest:
+      type: object
+      properties:
+        userSessionIdleTimeoutInSeconds:
+          type: integer
+        userSessionMaxLifetimeInSeconds:
+          type: integer
+
+    SettingsUIThemeResponse:
+      type: object
+      properties:
+        uiTheme:
+          type: string
+        availableThemes:
+          type: array
+          items:
+            type: string
+      required:
+        - uiTheme
+        - availableThemes
+
+    UpdateSettingsUIThemeRequest:
+      type: object
+      properties:
+        uiTheme:
+          type: string
+
+    SettingsTokensResponse:
+      type: object
+      properties:
+        tokenExpirationInSeconds:
+          type: integer
+        refreshTokenOfflineIdleTimeoutInSeconds:
+          type: integer
+        refreshTokenOfflineMaxLifetimeInSeconds:
+          type: integer
+        includeOpenIDConnectClaimsInAccessToken:
+          type: boolean
+        includeOpenIDConnectClaimsInIdToken:
+          type: boolean
+      required:
+        - tokenExpirationInSeconds
+        - refreshTokenOfflineIdleTimeoutInSeconds
+        - refreshTokenOfflineMaxLifetimeInSeconds
+        - includeOpenIDConnectClaimsInAccessToken
+        - includeOpenIDConnectClaimsInIdToken
+
+    UpdateSettingsTokensRequest:
+      type: object
+      properties:
+        tokenExpirationInSeconds:
+          type: integer
+        refreshTokenOfflineIdleTimeoutInSeconds:
+          type: integer
+        refreshTokenOfflineMaxLifetimeInSeconds:
+          type: integer
+        includeOpenIDConnectClaimsInAccessToken:
+          type: boolean
+        includeOpenIDConnectClaimsInIdToken:
+          type: boolean
+
+    SettingsSigningKeyResponse:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int64
+        createdAt:
+          type: string
+          format: date-time
+          nullable: true
+        state:
+          type: string
+        keyIdentifier:
+          type: string
+        type:
+          type: string
+        algorithm:
+          type: string
+        publicKeyASN1DER:
+          type: string
+        publicKeyPEM:
+          type: string
+        publicKeyJWK:
+          type: string
+      required:
+        - id
+        - createdAt
+        - state
+        - keyIdentifier
+        - type
+        - algorithm
+        - publicKeyASN1DER
+        - publicKeyPEM
+        - publicKeyJWK
+
+    GetSettingsKeysResponse:
+      type: object
+      properties:
+        keys:
+          type: array
+          items:
+            $ref: '#/components/schemas/SettingsSigningKeyResponse'
+      required:
+        - keys
+
+    SettingsAuditLogsResponse:
+      type: object
+      properties:
+        auditLogsInConsoleEnabled:
+          type: boolean
+        auditLogsInDatabaseEnabled:
+          type: boolean
+        auditLogRetentionDays:
+          type: integer
+          description: Days to keep entries for. 0 means keep them forever.
+      required:
+        - auditLogsInConsoleEnabled
+        - auditLogsInDatabaseEnabled
+        - auditLogRetentionDays
+
+    UpdateSettingsAuditLogsRequest:
+      type: object
+      properties:
+        auditLogsInConsoleEnabled:
+          type: boolean
+        auditLogsInDatabaseEnabled:
+          type: boolean
+        auditLogRetentionDays:
+          type: integer
+          description: Days to keep entries for. 0 means keep them forever, and the maximum is 3650.
+
+    AuditLogResponse:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int64
+        createdAt:
+          type: string
+          format: date-time
+        auditEvent:
+          type: string
+        details:
+          type: string
+          description: The event payload, as a JSON string
+        requestId:
+          type: string
+          description: |
+            The request's id as the application log carries it, so the same value
+            appears in the log's request_id attribute. Empty when the entry was not
+            written on a request.
+      required:
+        - id
+        - createdAt
+        - auditEvent
+        - details
+        - requestId
+
+    GetAuditEventTypesResponse:
+      type: object
+      properties:
+        auditEventTypes:
+          type: array
+          items:
+            type: string
+      required:
+        - auditEventTypes
+
+    GetAuditLogsResponse:
+      type: object
+      properties:
+        auditLogs:
+          type: array
+          items:
+            $ref: '#/components/schemas/AuditLogResponse'
+        total:
+          type: integer
+        page:
+          type: integer
+        size:
+          type: integer
+      required:
+        - auditLogs
+        - total
+        - page
+        - size
+
+    PhoneCountryResponse:
+      type: object
+      properties:
+        uniqueId:
+          type: string
+        alpha2:
+          type: string
+        emoji:
+          type: string
+        callingCode:
+          type: string
+        name:
+          type: string
+      required:
+        - uniqueId
+        - alpha2
+        - emoji
+        - callingCode
+        - name
+
+    GetPhoneCountriesResponse:
+      type: object
+      properties:
+        phoneCountries:
+          type: array
+          items:
+            $ref: '#/components/schemas/PhoneCountryResponse'
+      required:
+        - phoneCountries
+
+    # =========================================================================
+    # Account API Schemas
+    # =========================================================================
+    UpdateAccountEmailRequest:
+      type: object
+      required:
+        - email
+      properties:
+        email:
+          type: string
+          format: email
+
+    VerifyAccountEmailRequest:
+      type: object
+      required:
+        - verificationCode
+      properties:
+        verificationCode:
+          type: string
+          description: 8-character code (4 letters + 4 numbers), case-insensitive
+
+    AccountEmailVerificationSendResponse:
+      type: object
+      properties:
+        emailVerificationSent:
+          type: boolean
+        emailDestination:
+          type: string
+        tooManyRequests:
+          type: boolean
+        waitInSeconds:
+          type: integer
+        emailVerified:
+          type: boolean
+      required:
+        - emailVerificationSent
+        - emailDestination
+        - tooManyRequests
+        - waitInSeconds
+        - emailVerified
+
+    UpdateAccountPhoneRequest:
+      type: object
+      properties:
+        phoneCountryUniqueId:
+          type: string
+        phoneNumber:
+          type: string
+          description: Empty string to clear
+
+    UpdateAccountPasswordRequest:
+      type: object
+      required:
+        - currentPassword
+        - newPassword
+      properties:
+        currentPassword:
+          type: string
+        newPassword:
+          type: string
+
+    AccountOTPEnrollmentResponse:
+      type: object
+      properties:
+        base64Image:
+          type: string
+          description: QR code as base64-encoded PNG
+        secretKey:
+          type: string
+          description: >-
+            TOTP secret key (base32), for a user who cannot scan the QR code. The server has
+            recorded this value; do not substitute another when enabling.
+      required:
+        - base64Image
+        - secretKey
+
+    UpdateAccountOTPRequest:
+      type: object
+      required:
+        - enabled
+        - password
+      properties:
+        enabled:
+          type: boolean
+        password:
+          type: string
+          description: Current password for verification
+        otpCode:
+          type: string
+          description: >-
+            6-digit TOTP code (required when enabling), generated from the secret returned by
+            GET /api/v1/account/otp/enrollment
+
+    AccountLogoutRequest:
+      type: object
+      required:
+        - postLogoutRedirectUri
+      properties:
+        postLogoutRedirectUri:
+          type: string
+          format: uri
+        state:
+          type: string
+        clientIdentifier:
+          type: string
+          description: Auto-resolved if omitted
+        responseMode:
+          type: string
+          description: >-
+            Which response shape to prepare. "form_post" answers the parameters of a
+            self-submitting POST form, which keeps the id_token_hint out of a top-level
+            navigation's URL, its history and its referrers. Any other value, absent included,
+            answers a redirect URL. The type is deliberately open rather than a closed set: the
+            endpoint refuses nothing here, so an enum would tell a validating client to withhold
+            a request this server answers.
+
+    AccountLogoutRedirectResponse:
+      type: object
+      properties:
+        logoutUrl:
+          type: string
+          format: uri
+          description: >-
+            The end-session URL to follow. It carries the id_token_hint in its query string,
+            so it reaches the address bar, the browser history and any intermediary access log;
+            request form_post instead where that matters.
+      required:
+        - logoutUrl
+
+    AccountLogoutFormPostResponse:
+      type: object
+      description: >-
+        The parameters of a POST to the end-session endpoint. Render them as hidden inputs of a
+        form the page submits itself, so the id_token_hint travels in the request body.
+      properties:
+        method:
+          type: string
+          enum: [POST]
+          description: Always POST.
+        endpoint:
+          type: string
+          format: uri
+          description: The end-session endpoint to submit to, with no query string of its own.
+        params:
+          type: object
+          additionalProperties:
+            type: string
+          description: >-
+            The form fields, as name to value: id_token_hint, post_logout_redirect_uri, and
+            state when the request sent one.
+      required:
+        - method
+        - endpoint
+        - params

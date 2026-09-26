@@ -1,0 +1,47 @@
+# This config covers the interfaces the admin console owns and mocks. Since #385 that
+# is the JWT session middleware's two ports, AuthHelper and tokenParser, which moved
+# here out of core/middleware along with the middleware that holds them, and this
+# module's own HttpHelper port.
+#
+# Every dir below is inside adminconsole, and since #385 the same is true of every
+# other config: no module writes a mock outside its own tree any more. This one's
+# HttpHelper mock is what ended that. The auth server used to generate it into
+# core/handlerhelpers/mocks and both modules imported it from there, which worked only
+# because the auth server's port is the wider of the two -- it declares
+# LookupFromUrlQueryOrFormPost and this module's does not -- so the console was
+# asserting against a mock of an interface it does not have (#338, #385).
+filename: "{{.InterfaceName | snakecase}}_mock.go"
+structname: "{{.InterfaceName}}"
+template: testify
+# Emits "//go:build !production" in every generated mock, keeping testify out of
+# production builds (see build/Dockerfile-*, which build with -tags=production).
+#
+# boilerplate-file names the same file authserver/.mockery.yaml does, spelled
+# relative to this module because the path resolves against mockery's working
+# directory. See that file for what it is for (#338).
+template-data:
+  mock-build-tags: "!production"
+  boilerplate-file: "../mockery-header.txt"
+packages:
+  # JWT session middleware
+  github.com/leodip/goiabada/adminconsole/internal/middleware:
+    interfaces:
+      AuthHelper:
+        config:
+          dir: "./internal/middleware/mocks"
+          pkgname: "mocks_middleware"
+      # Unexported, so the global structname template would emit an unusable
+      # lowercase type name outside the generated package. Name it explicitly (#338).
+      tokenParser:
+        config:
+          dir: "./internal/middleware/mocks"
+          pkgname: "mocks_middleware"
+          structname: "TokenParser"
+  # This module's renderer port. Its implementation is internal/handlerhelpers, which
+  # #385 split out of core so each application owns the renderer it actually uses.
+  github.com/leodip/goiabada/adminconsole/internal/handlers:
+    interfaces:
+      HttpHelper:
+        config:
+          dir: "./internal/handlerhelpers/mocks"
+          pkgname: "mocks_handlerhelpers"

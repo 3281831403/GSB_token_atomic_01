@@ -1,0 +1,253 @@
+package apihandlers
+
+import (
+	"context"
+	"database/sql"
+	"io"
+	"net/http"
+	"strconv"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/leodip/goiabada/authserver/internal/audit"
+	"github.com/leodip/goiabada/authserver/internal/config"
+	"github.com/leodip/goiabada/authserver/internal/imaging"
+	"github.com/leodip/goiabada/authserver/internal/middleware"
+	"github.com/leodip/goiabada/authserver/internal/models"
+)
+
+// clientLogoDatabase is what the client logo endpoints need: the client and the logo row they
+// read, write and delete.
+type clientLogoDatabase interface {
+	ClientHasLogo(ctx context.Context, tx *sql.Tx, clientId int64) (bool, error)
+	CreateClientLogo(ctx context.Context, tx *sql.Tx, clientLogo *models.ClientLogo) error
+	DeleteClientLogo(ctx context.Context, tx *sql.Tx, clientId int64) error
+	GetClientById(ctx context.Context, tx *sql.Tx, clientId int64) (*models.Client, error)
+	GetClientLogoByClientId(ctx context.Context, tx *sql.Tx, clientId int64) (*models.ClientLogo, error)
+	UpdateClientLogo(ctx context.Context, tx *sql.Tx, clientLogo *models.ClientLogo) error
+}
+
+// HandleAPIClientLogoPost - POST /api/v1/admin/clients/{id}/logo
+func HandleAPIClientLogoPost(
+	database clientLogoDatabase,
+	auditLogger AuditLogger,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Parse client ID from URL
+		idStr := chi.URLParam(r, "id")
+		if len(idStr) == 0 {
+			writeJSONError(w, "Client ID is required", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		clientId, err := strconv.ParseInt(idStr, 10, 64)
+		if err != nil {
+			writeJSONError(w, "Invalid client ID", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		// Get client from database
+		client, err := database.GetClientById(r.Context(), nil, clientId)
+		if err != nil {
+			writeInternalServerError(w, r, err)
+			return
+		}
+
+		if client == nil {
+			writeJSONError(w, "Client not found", "NOT_FOUND", http.StatusNotFound)
+			return
+		}
+
+		// Get max file size from config
+		maxFileSize := imaging.MaxFileSize(config.GetAuthServer().ProfilePictureMaxSizeBytes)
+
+		// Limit request body size
+		r.Body = http.MaxBytesReader(w, r.Body, maxFileSize+1024) // extra for multipart overhead
+
+		// Parse multipart form
+		//nolint:gosec // G120: bounded by the MaxBytesReader above and the server's request-body table; G120 flags every multipart parse
+		err = r.ParseMultipartForm(maxFileSize)
+		if err != nil {
+			writeJSONError(w, "File too large or invalid form data", "FILE_TOO_LARGE", http.StatusBadRequest)
+			return
+		}
+
+		// Get the file from the form
+		file, _, err := r.FormFile("picture")
+		if err != nil {
+			writeJSONError(w, "No picture file provided", "NO_FILE", http.StatusBadRequest)
+			return
+		}
+		defer func() { _ = file.Close() }()
+
+		// Read file data
+		fileData, err := io.ReadAll(file)
+		if err != nil {
+			writeInternalServerError(w, r, err)
+			return
+		}
+
+		// Validate the image
+		result := imaging.ValidateProfilePicture(fileData, maxFileSize)
+		if !result.Valid {
+			writeJSONError(w, result.Error, "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		// Check if client already has a logo
+		existingLogo, err := database.GetClientLogoByClientId(r.Context(), nil, clientId)
+		if err != nil {
+			writeInternalServerError(w, r, err)
+			return
+		}
+
+		if existingLogo != nil {
+			// Update existing logo
+			existingLogo.Logo = fileData
+			existingLogo.ContentType = result.ContentType
+			err = database.UpdateClientLogo(r.Context(), nil, existingLogo)
+		} else {
+			// Create new logo
+			clientLogo := &models.ClientLogo{
+				ClientId:    clientId,
+				Logo:        fileData,
+				ContentType: result.ContentType,
+			}
+			err = database.CreateClientLogo(r.Context(), nil, clientLogo)
+		}
+
+		if err != nil {
+			writeInternalServerError(w, r, err)
+			return
+		}
+
+		// Get logged in user from access token
+		jwtToken, ok := middleware.GetValidatedToken(r)
+		var loggedInUser string
+		if ok {
+			loggedInUser = jwtToken.GetStringClaim("sub")
+		}
+
+		// Log audit event
+		auditLogger.Log(r.Context(), audit.AuditUpdatedClientLogo, map[string]interface{}{
+			"clientId":     client.Id,
+			"loggedInUser": loggedInUser,
+		})
+
+		// Return success response
+		response := map[string]interface{}{
+			"success":    true,
+			"pictureUrl": config.GetAuthServer().BaseURL + "/client/logo/" + client.ClientIdentifier,
+		}
+
+		writeJSON(w, r, http.StatusOK, response)
+	}
+}
+
+// HandleAPIClientLogoDelete - DELETE /api/v1/admin/clients/{id}/logo
+func HandleAPIClientLogoDelete(
+	database clientLogoDatabase,
+	auditLogger AuditLogger,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Parse client ID from URL
+		idStr := chi.URLParam(r, "id")
+		if len(idStr) == 0 {
+			writeJSONError(w, "Client ID is required", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		clientId, err := strconv.ParseInt(idStr, 10, 64)
+		if err != nil {
+			writeJSONError(w, "Invalid client ID", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		// Get client from database
+		client, err := database.GetClientById(r.Context(), nil, clientId)
+		if err != nil {
+			writeInternalServerError(w, r, err)
+			return
+		}
+
+		if client == nil {
+			writeJSONError(w, "Client not found", "NOT_FOUND", http.StatusNotFound)
+			return
+		}
+
+		// Delete the logo
+		err = database.DeleteClientLogo(r.Context(), nil, clientId)
+		if err != nil {
+			writeInternalServerError(w, r, err)
+			return
+		}
+
+		// Get logged in user from access token
+		jwtToken, ok := middleware.GetValidatedToken(r)
+		var loggedInUser string
+		if ok {
+			loggedInUser = jwtToken.GetStringClaim("sub")
+		}
+
+		// Log audit event
+		auditLogger.Log(r.Context(), audit.AuditDeletedClientLogo, map[string]interface{}{
+			"clientId":     client.Id,
+			"loggedInUser": loggedInUser,
+		})
+
+		// Return success response
+		response := map[string]interface{}{
+			"success": true,
+		}
+
+		writeJSON(w, r, http.StatusOK, response)
+	}
+}
+
+// HandleAPIClientLogoGet - GET /api/v1/admin/clients/{id}/logo
+func HandleAPIClientLogoGet(
+	database clientLogoDatabase,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Parse client ID from URL
+		idStr := chi.URLParam(r, "id")
+		if len(idStr) == 0 {
+			writeJSONError(w, "Client ID is required", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		clientId, err := strconv.ParseInt(idStr, 10, 64)
+		if err != nil {
+			writeJSONError(w, "Invalid client ID", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		// Get client from database
+		client, err := database.GetClientById(r.Context(), nil, clientId)
+		if err != nil {
+			writeInternalServerError(w, r, err)
+			return
+		}
+
+		if client == nil {
+			writeJSONError(w, "Client not found", "NOT_FOUND", http.StatusNotFound)
+			return
+		}
+
+		// Check if client has a logo
+		hasLogo, err := database.ClientHasLogo(r.Context(), nil, clientId)
+		if err != nil {
+			writeInternalServerError(w, r, err)
+			return
+		}
+
+		response := map[string]interface{}{
+			"hasLogo": hasLogo,
+		}
+
+		if hasLogo {
+			response["logoUrl"] = config.GetAuthServer().BaseURL + "/client/logo/" + client.ClientIdentifier
+		}
+
+		writeJSON(w, r, http.StatusOK, response)
+	}
+}

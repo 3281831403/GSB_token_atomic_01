@@ -1,0 +1,198 @@
+package adminuserhandlers
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"strconv"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/leodip/goiabada/adminconsole/internal/constants"
+	"github.com/leodip/goiabada/adminconsole/internal/handlers"
+	"github.com/leodip/goiabada/adminconsole/internal/oauthclient"
+	"github.com/leodip/goiabada/core/api"
+	"github.com/leodip/goiabada/core/errs"
+)
+
+// userAttributesEditAPI is what the edit user attribute page needs: the user, the attribute, and
+// the write.
+type userAttributesEditAPI interface {
+	GetUserAttributeById(ctx context.Context, accessToken string, attributeId int64) (*api.UserAttributeResponse, error)
+	GetUserById(ctx context.Context, accessToken string, userId int64) (*api.UserResponse, error)
+	UpdateUserAttribute(ctx context.Context, accessToken string, attributeId int64, request *api.UpdateUserAttributeRequest) (*api.UserAttributeResponse, error)
+}
+
+func HandleAdminUserAttributesEditGet(
+	httpHelper handlers.HttpHelper,
+	apiClient userAttributesEditAPI,
+) http.HandlerFunc {
+
+	return func(w http.ResponseWriter, r *http.Request) {
+
+		idStr := chi.URLParam(r, "userId")
+		if len(idStr) == 0 {
+			httpHelper.NotFound(w, r)
+			return
+		}
+
+		id, err := strconv.ParseInt(idStr, 10, 64)
+		if err != nil {
+			httpHelper.NotFound(w, r)
+			return
+		}
+
+		// Get JWT info from context to extract access token
+		jwtInfo, ok := r.Context().Value(constants.ContextKeyJwtInfo).(oauthclient.JwtInfo)
+		if !ok {
+			httpHelper.InternalServerError(w, r, errs.New("no JWT info found in context"))
+			return
+		}
+
+		user, err := apiClient.GetUserById(r.Context(), jwtInfo.TokenResponse.AccessToken, id)
+		if err != nil {
+			handlers.HandleAPIError(httpHelper, w, r, err)
+			return
+		}
+		if user == nil {
+			httpHelper.NotFound(w, r)
+			return
+		}
+
+		idStr = chi.URLParam(r, "attributeId")
+		if len(idStr) == 0 {
+			httpHelper.NotFound(w, r)
+			return
+		}
+
+		id, err = strconv.ParseInt(idStr, 10, 64)
+		if err != nil {
+			httpHelper.NotFound(w, r)
+			return
+		}
+
+		attribute, err := apiClient.GetUserAttributeById(r.Context(), jwtInfo.TokenResponse.AccessToken, id)
+		if err != nil {
+			handlers.HandleAPIError(httpHelper, w, r, err)
+			return
+		}
+		if attribute == nil || attribute.UserId != user.Id {
+			httpHelper.NotFound(w, r)
+			return
+		}
+
+		bind := map[string]interface{}{
+			"user":      user,
+			"attribute": attribute,
+			"page":      r.URL.Query().Get("page"),
+			"query":     r.URL.Query().Get("query"),
+		}
+
+		err = httpHelper.RenderTemplate(w, r, "/layouts/menu_layout.html", "/admin_users_attributes_edit.html", bind)
+		if err != nil {
+			httpHelper.InternalServerError(w, r, err)
+			return
+		}
+	}
+}
+
+func HandleAdminUserAttributesEditPost(
+	httpHelper handlers.HttpHelper,
+	apiClient userAttributesEditAPI,
+) http.HandlerFunc {
+
+	return func(w http.ResponseWriter, r *http.Request) {
+
+		idStr := chi.URLParam(r, "userId")
+		if len(idStr) == 0 {
+			httpHelper.NotFound(w, r)
+			return
+		}
+
+		id, err := strconv.ParseInt(idStr, 10, 64)
+		if err != nil {
+			httpHelper.NotFound(w, r)
+			return
+		}
+
+		// Get JWT info from context to extract access token
+		jwtInfo, ok := r.Context().Value(constants.ContextKeyJwtInfo).(oauthclient.JwtInfo)
+		if !ok {
+			httpHelper.InternalServerError(w, r, errs.New("no JWT info found in context"))
+			return
+		}
+
+		user, err := apiClient.GetUserById(r.Context(), jwtInfo.TokenResponse.AccessToken, id)
+		if err != nil {
+			handlers.HandleAPIError(httpHelper, w, r, err)
+			return
+		}
+		if user == nil {
+			httpHelper.NotFound(w, r)
+			return
+		}
+
+		idStr = chi.URLParam(r, "attributeId")
+		if len(idStr) == 0 {
+			httpHelper.NotFound(w, r)
+			return
+		}
+
+		attributeId, err := strconv.ParseInt(idStr, 10, 64)
+		if err != nil {
+			httpHelper.NotFound(w, r)
+			return
+		}
+
+		attribute, err := apiClient.GetUserAttributeById(r.Context(), jwtInfo.TokenResponse.AccessToken, attributeId)
+		if err != nil {
+			handlers.HandleAPIError(httpHelper, w, r, err)
+			return
+		}
+		if attribute == nil || attribute.UserId != user.Id {
+			httpHelper.NotFound(w, r)
+			return
+		}
+
+		// Update attribute fields with form values for potential error display
+		attribute.Key = r.FormValue("attributeKey")
+		attribute.Value = r.FormValue("attributeValue")
+		attribute.IncludeInAccessToken = r.FormValue("includeInAccessToken") == "on"
+		attribute.IncludeInIdToken = r.FormValue("includeInIdToken") == "on"
+
+		renderError := func(message string) {
+			bind := map[string]interface{}{
+				"user":      user,
+				"attribute": attribute,
+				"error":     message,
+				"page":      r.URL.Query().Get("page"),
+				"query":     r.URL.Query().Get("query"),
+			}
+
+			renderErr := httpHelper.RenderTemplate(w, r, "/layouts/menu_layout.html", "/admin_users_attributes_edit.html", bind)
+			if renderErr != nil {
+				httpHelper.InternalServerError(w, r, renderErr)
+			}
+		}
+
+		if len(attribute.Key) == 0 {
+			renderError("Attribute key is required")
+			return
+		}
+
+		// Create update request for API
+		request := &api.UpdateUserAttributeRequest{
+			Key:                  attribute.Key,
+			Value:                attribute.Value,
+			IncludeInAccessToken: attribute.IncludeInAccessToken,
+			IncludeInIdToken:     attribute.IncludeInIdToken,
+		}
+
+		_, err = apiClient.UpdateUserAttribute(r.Context(), jwtInfo.TokenResponse.AccessToken, attributeId, request)
+		if err != nil {
+			handlers.HandleAPIErrorWithCallback(httpHelper, w, r, err, renderError)
+			return
+		}
+
+		http.Redirect(w, r, withListPosition(fmt.Sprintf("/admin/users/%v/attributes", user.Id), r), http.StatusFound)
+	}
+}

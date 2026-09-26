@@ -1,0 +1,177 @@
+package admingrouphandlers
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"strconv"
+	"strings"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/leodip/goiabada/adminconsole/internal/apiclient"
+	"github.com/leodip/goiabada/adminconsole/internal/config"
+	"github.com/leodip/goiabada/adminconsole/internal/constants"
+	"github.com/leodip/goiabada/adminconsole/internal/handlers"
+	"github.com/leodip/goiabada/adminconsole/internal/oauthclient"
+	"github.com/leodip/goiabada/core/api"
+	coreconstants "github.com/leodip/goiabada/core/constants"
+	"github.com/leodip/goiabada/core/errs"
+	"github.com/leodip/goiabada/core/sessionstore"
+)
+
+// groupSettingsAPI is what the group settings page needs: the group, and the write.
+type groupSettingsAPI interface {
+	GetGroupById(ctx context.Context, accessToken string, groupId int64) (*api.GroupResponse, error)
+	UpdateGroup(ctx context.Context, accessToken string, groupId int64, request *api.UpdateGroupRequest) (*api.GroupResponse, error)
+}
+
+func HandleAdminGroupSettingsGet(
+	httpHelper handlers.HttpHelper,
+	httpSession sessionstore.Store,
+	apiClient groupSettingsAPI,
+) http.HandlerFunc {
+
+	return func(w http.ResponseWriter, r *http.Request) {
+
+		idStr := chi.URLParam(r, "groupId")
+		if len(idStr) == 0 {
+			httpHelper.NotFound(w, r)
+			return
+		}
+
+		id, err := strconv.ParseInt(idStr, 10, 64)
+		if err != nil {
+			httpHelper.NotFound(w, r)
+			return
+		}
+
+		// Get JWT info from context to extract access token
+		jwtInfo, ok := r.Context().Value(constants.ContextKeyJwtInfo).(oauthclient.JwtInfo)
+		if !ok {
+			httpHelper.InternalServerError(w, r, errs.New("no JWT info found in context"))
+			return
+		}
+
+		group, err := apiClient.GetGroupById(r.Context(), jwtInfo.TokenResponse.AccessToken, id)
+		if err != nil {
+			var apiErr *apiclient.APIError
+			if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound {
+				httpHelper.NotFound(w, r)
+				return
+			}
+			handlers.HandleAPIError(httpHelper, w, r, err)
+			return
+		}
+
+		sess, err := httpSession.Get(r, coreconstants.AdminConsoleSessionName)
+		if err != nil {
+			httpHelper.InternalServerError(w, r, err)
+			return
+		}
+
+		_, savedSuccessfully := sess.TakeFlash("savedSuccessfully")
+		if savedSuccessfully {
+			err = httpSession.Save(r, w, sess)
+			if err != nil {
+				httpHelper.InternalServerError(w, r, err)
+				return
+			}
+		}
+
+		bind := map[string]interface{}{
+			"groupId":              group.Id,
+			"groupIdentifier":      group.GroupIdentifier,
+			"description":          group.Description,
+			"includeInIdToken":     group.IncludeInIdToken,
+			"includeInAccessToken": group.IncludeInAccessToken,
+			"savedSuccessfully":    savedSuccessfully,
+		}
+
+		err = httpHelper.RenderTemplate(w, r, "/layouts/menu_layout.html", "/admin_groups_settings.html", bind)
+		if err != nil {
+			httpHelper.InternalServerError(w, r, err)
+			return
+		}
+	}
+}
+
+func HandleAdminGroupSettingsPost(
+	httpHelper handlers.HttpHelper,
+	httpSession sessionstore.Store,
+	apiClient groupSettingsAPI,
+) http.HandlerFunc {
+
+	return func(w http.ResponseWriter, r *http.Request) {
+
+		idStr := chi.URLParam(r, "groupId")
+		if len(idStr) == 0 {
+			httpHelper.NotFound(w, r)
+			return
+		}
+
+		id, err := strconv.ParseInt(idStr, 10, 64)
+		if err != nil {
+			httpHelper.NotFound(w, r)
+			return
+		}
+
+		// Get JWT info from context to extract access token
+		jwtInfo, ok := r.Context().Value(constants.ContextKeyJwtInfo).(oauthclient.JwtInfo)
+		if !ok {
+			httpHelper.InternalServerError(w, r, errs.New("no JWT info found in context"))
+			return
+		}
+
+		// Parse form data
+		groupIdentifier := strings.TrimSpace(r.FormValue("groupIdentifier"))
+		description := strings.TrimSpace(r.FormValue("description"))
+		includeInIdToken := r.FormValue("includeInIdToken") == "on"
+		includeInAccessToken := r.FormValue("includeInAccessToken") == "on"
+
+		renderError := func(message string) {
+			bind := map[string]interface{}{
+				"groupId":              id,
+				"groupIdentifier":      groupIdentifier,
+				"description":          description,
+				"includeInIdToken":     includeInIdToken,
+				"includeInAccessToken": includeInAccessToken,
+				"error":                message,
+			}
+
+			renderErr := httpHelper.RenderTemplate(w, r, "/layouts/menu_layout.html", "/admin_groups_settings.html", bind)
+			if renderErr != nil {
+				httpHelper.InternalServerError(w, r, renderErr)
+			}
+		}
+
+		// Create API request
+		updateReq := &api.UpdateGroupRequest{
+			GroupIdentifier:      groupIdentifier,
+			Description:          description,
+			IncludeInIdToken:     includeInIdToken,
+			IncludeInAccessToken: includeInAccessToken,
+		}
+
+		// Call API to update group
+		_, err = apiClient.UpdateGroup(r.Context(), jwtInfo.TokenResponse.AccessToken, id, updateReq)
+		if err != nil {
+			handlers.HandleAPIErrorWithCallback(httpHelper, w, r, err, renderError)
+			return
+		}
+
+		sess, err := httpSession.Get(r, coreconstants.AdminConsoleSessionName)
+		if err != nil {
+			httpHelper.InternalServerError(w, r, err)
+			return
+		}
+
+		sess.SetFlash("savedSuccessfully", "true")
+		err = httpSession.Save(r, w, sess)
+		if err != nil {
+			httpHelper.InternalServerError(w, r, err)
+			return
+		}
+		http.Redirect(w, r, fmt.Sprintf("%v/admin/groups/%v/settings", config.GetAdminConsole().BaseURL, id), http.StatusFound)
+	}
+}

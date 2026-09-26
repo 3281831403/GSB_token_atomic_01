@@ -1,0 +1,124 @@
+package apihandlers
+
+import (
+	"errors"
+	"fmt"
+	"net/http"
+
+	"github.com/leodip/goiabada/authserver/internal/apiresponse"
+	"github.com/leodip/goiabada/authserver/internal/data"
+	"github.com/leodip/goiabada/authserver/internal/middleware"
+	"github.com/leodip/goiabada/core/customerrors"
+	"github.com/leodip/goiabada/core/i18n"
+)
+
+// writeJSONError emits the admin/account API error envelope with the
+// caller-supplied UPPER_SNAKE code and English message. Consumers route
+// on the HTTP status code, not on the body, so this helper is the only
+// thing every callsite needs.
+//
+// i18n surface: C — admin/account API. Callers pass already-localized
+// text (when relevant) or a stable English message for non-localized
+// codes. writeValidationError is the localizing wrapper.
+func writeJSONError(w http.ResponseWriter, message, code string, statusCode int) {
+	apiresponse.WriteError(w, message, code, statusCode)
+}
+
+// writeJSON is the one JSON writer on this surface: it buffers the encode before the header, so a
+// failure answers a real 500 instead of a superfluous WriteHeader on a body already half on the
+// wire (#279 decision 8).
+func writeJSON(w http.ResponseWriter, r *http.Request, status int, v any) {
+	apiresponse.WriteJSON(w, r, status, v)
+}
+
+// writeInternalServerError is the one 500 on this surface: one structured log record with the
+// stack, the request id and the caller's own attributes, and one envelope naming
+// INTERNAL_SERVER_ERROR and that request id. It replaced seven per-site codes, of which 194 sites
+// logged nothing at all (#279 decision 7).
+func writeInternalServerError(w http.ResponseWriter, r *http.Request, err error, attrs ...any) {
+	apiresponse.WriteInternalServerError(w, r, err, attrs...)
+}
+
+// writeInternalServerErrorWithCode is writeInternalServerError for a 500 whose error_code a caller
+// acts on and which therefore cannot flatten to INTERNAL_SERVER_ERROR. It keeps that code and the
+// sentence the OpenAPI document promises, and takes the half of decision 7 that has nothing to do
+// with the code: one structured record with the stack, and the same request id in the body, so an
+// operator can join a caller's report to a log line.
+//
+// Key rotation's KEY_SET_INCOMPLETE is the only such 500 on this surface. It answered with neither
+// half, which made it the one 500 here that was invisible in the log and uncorrelated on the wire
+// (#279 decision 7).
+func writeInternalServerErrorWithCode(w http.ResponseWriter, r *http.Request, err error, message, code string) {
+	requestId := apiresponse.LogInternalServerError(r, err)
+	writeJSONError(w, fmt.Sprintf("%s. Request Id: %v", message, requestId), code,
+		http.StatusInternalServerError)
+}
+
+// writeEmailTakenOrInternalServerError answers a failed user write: 409 EMAIL_ALREADY_EXISTS when
+// the engine refused it on a unique key, which on the users table means the email, and the one 500
+// otherwise. RFC 9110 section 15.5.10: a conflict "with the current state of the target
+// resource" the user "might be able to resolve" and resubmit.
+//
+// Each caller checks the address before it writes, and that check answers the ordinary duplicate.
+// This is the race the check cannot close, where a concurrent request takes the address between
+// the read and the write; the data layer tags the refusal on every engine, so matching the
+// sentinel is enough. Subject is the table's only other unique key, and no caller here writes one
+// another row could hold: a create mints a fresh UUID and an email change keeps the row's own.
+// Serves user creation and both email PUTs, the last two of which answered this race 500 until
+// #425 (#414 item 1).
+func writeEmailTakenOrInternalServerError(w http.ResponseWriter, r *http.Request, err error) {
+	if errors.Is(err, data.ErrUniqueViolation) {
+		writeJSONError(w, "This email address is already registered", "EMAIL_ALREADY_EXISTS", http.StatusConflict)
+		return
+	}
+	writeInternalServerError(w, r, err)
+}
+
+// writeValidationError emits a 400 Bad Request envelope from a validation
+// error. For *i18n.LocalizedError (the canonical UI/API path), error_code
+// is the catalog key and error_description is the message localized to
+// the request's locale. For legacy *customerrors.ErrorDetail, the code is
+// the constant "VALIDATION_ERROR" and the description is the English text
+// already on the error. Consumers route on the HTTP status code.
+//
+// i18n surface: C — admin/account API.
+//
+// Two errors.As tests rather than a type switch, in the switch's own order, so a validator's error
+// keeps its code and its localized text after anything on the way up has wrapped it. A type switch
+// reads only the outermost value, so a single wrap sent the whole thing to the default arm, where
+// the code flattens to VALIDATION_ERROR and the description becomes the wrapped Error() string
+// with the wrapper's prefix on it (#279 decision 6).
+func writeValidationError(w http.ResponseWriter, r *http.Request, err error) {
+	var localizedErr *i18n.LocalizedError
+	if errors.As(err, &localizedErr) {
+		writeJSONError(w, localizedErr.Localize(r.Context()), localizedErr.Code, http.StatusBadRequest)
+		return
+	}
+	var errorDetail *customerrors.ErrorDetail
+	if errors.As(err, &errorDetail) {
+		writeJSONError(w, errorDetail.GetDescription(), "VALIDATION_ERROR", http.StatusBadRequest)
+		return
+	}
+	writeJSONError(w, err.Error(), "VALIDATION_ERROR", http.StatusBadRequest)
+}
+
+// callerSubject is the `sub` of the access token this request authenticated with, and it is
+// what an audit row's "loggedInUser" names: the administrator who performed the action.
+//
+// Every handler in this package sits behind JwtAuthorizationHeaderToContext and a scope
+// middleware, so the token is on the context whenever the request got this far; the empty
+// string is what a caller with no validated token would have recorded anyway, which is the
+// same fallback the thirty-eight sites that already read the token inline carry.
+//
+// This replaced AuthHelper.GetLoggedInSubject, which read the admin console's session key
+// ContextKeyJwtInfo. Nothing in this process writes that key -- the auth server installs the
+// bearer middleware, not the JWT session middleware -- so every row audited through it named
+// nobody. Do not reintroduce a session read here: this surface is authenticated by bearer
+// token and has no browser session to read (#385).
+func callerSubject(r *http.Request) string {
+	jwtToken, ok := middleware.GetValidatedToken(r)
+	if !ok {
+		return ""
+	}
+	return jwtToken.GetStringClaim("sub")
+}

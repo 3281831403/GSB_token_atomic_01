@@ -1,0 +1,307 @@
+package accounthandlers
+
+import (
+	"context"
+	"database/sql"
+	"log/slog"
+	"net/http"
+	"time"
+
+	"github.com/leodip/goiabada/core/errs"
+	"github.com/leodip/goiabada/core/sessionstore"
+
+	"github.com/leodip/goiabada/authserver/internal/audit"
+	"github.com/leodip/goiabada/authserver/internal/config"
+	"github.com/leodip/goiabada/authserver/internal/constants"
+	"github.com/leodip/goiabada/authserver/internal/emaillinks"
+	"github.com/leodip/goiabada/authserver/internal/encryption"
+	"github.com/leodip/goiabada/authserver/internal/models"
+	"github.com/leodip/goiabada/authserver/internal/usercreation"
+	"github.com/leodip/goiabada/core/hashutil"
+)
+
+// verificationCodeLifetime bounds how long an activation code stays usable after
+// HandleAccountRegisterPost issues it.
+//
+// Consulted on the FIRST hop only, where the emailed code arrives. The clean hop after the
+// redirect is bounded by the marker's own window instead, which starts when the code was
+// validated, so someone clicking at 4:59 is not dropped between the two requests. That is the
+// same rule the reset flow states in isForgotPasswordCodeExpired (#112 decision 7).
+const verificationCodeLifetime = 5 * time.Minute
+
+// The reasons an activation link is refused, as recorded on the Warn record. They are the reset
+// flow's names for the same states, so one log query reads both emailed-link flows. The marker's
+// own rejections (marker_missing, marker_wrong_flow, marker_expired, continuation_in_flight) pass
+// through as emaillinks decided them, as they do on the reset side (#425).
+const (
+	// activationReasonUnknownCode is a code that resolves to no pre-registration, or to one whose
+	// stored code it does not reproduce. The first hop only, where the credential arrives.
+	activationReasonUnknownCode = "unknown_code"
+	// activationReasonCodeExpired is the code's own lifetime having passed.
+	activationReasonCodeExpired = "code_expired"
+	// activationReasonCodeNoLongerOutstanding is a marker whose code hash no longer resolves: the
+	// activation completed, the code expired and was deleted, or the row is otherwise gone.
+	activationReasonCodeNoLongerOutstanding = "code_no_longer_outstanding"
+)
+
+// refuseActivationLink is every activation refusal: one Warn record naming the reason, then the
+// one rendering, at 200.
+//
+// 200 and not a 4xx, for the reason renderResetPasswordCodeInvalid gives on the reset side:
+// activation links are fetched by mail scanners and link previewers that treat a 4xx as a broken
+// link, and the page itself was served. The response is the same for every reason, so the record
+// is the only place the cause is visible. An unknown code used to answer the 500 page with an
+// error-level stack, which paged an operator for a user clicking an old link (#425 decision 5).
+//
+// Genuine server faults must NOT come here: a stored code that will not decrypt, a database
+// failure and a session store that cannot be read stay InternalServerError.
+func refuseActivationLink(httpHelper HttpHelper, w http.ResponseWriter, r *http.Request, reason string) {
+	slog.WarnContext(r.Context(), "account activation link refused", "reason", reason)
+	renderActivationLinkExpired(httpHelper, w, r)
+}
+
+// renderActivationLinkExpired renders the "this link is no longer usable, register again"
+// state of the activation result page. Reached only through refuseActivationLink.
+//
+// Every refusal attributable to the link comes here. On the clean hop: no marker, a marker left
+// by the reset flow, an expired marker, and a marker whose code hash no longer resolves to a
+// pre-registration. That last one is what refuses a marker whose code has since been consumed,
+// which clearing the session does not answer even now that clearing it reaches every copy
+// (#266). On the first hop: an unknown code, a code its row's stored code does not match, an
+// expired code, and a link followed while another continuation is still live.
+//
+// It is an existing rendering rather than a new state on purpose: the page already tells the
+// reader to register again, which is the right instruction for every one of them (#112).
+func renderActivationLinkExpired(httpHelper HttpHelper, w http.ResponseWriter, r *http.Request) {
+	bind := map[string]interface{}{
+		"linkHasExpired": true,
+	}
+
+	if err := httpHelper.RenderTemplate(w, r, "/layouts/auth_layout.html", "/account_register_activation_result.html", bind); err != nil {
+		httpHelper.InternalServerError(w, r, err)
+	}
+}
+
+// accountActivateDatabase is what the self-registration activation page needs: the pre-
+// registration it consumes.
+type accountActivateDatabase interface {
+	DeletePreRegistration(ctx context.Context, tx *sql.Tx, preRegistrationId int64) error
+	GetPreRegistrationByVerificationCodeHash(ctx context.Context, tx *sql.Tx, codeHash string) (*models.PreRegistration, error)
+}
+
+// HandleAccountActivateGet serves both halves of the activation link's journey.
+//
+// A request carrying ?code= is the emailed link being followed: it validates the code, marks
+// the session and answers 303 to the same path with no query, so the credential does not
+// remain in the address bar, in browser history, or in the Referer of anything the page then
+// loads (#201, absorbed by #112 decision 1). A request with no query is that redirect landing,
+// and completes the activation from the marker alone.
+//
+// The link deliberately does NOT carry the address any more, which is what removes #112's
+// defect class: a '+' or a '%xx' in an address was mangled by form-urlencoded query parsing,
+// so the pre-registration was never found and those users could not register at all. The
+// code's alphabet is entirely RFC 3986 unreserved, so there is no encoding step left to get
+// wrong.
+//
+// The account is still created during a GET, which decision 3 considered and kept: a link
+// previewer that fetches the URL therefore completes the registration. After this change it
+// consumes the redirect and the account is created on the clean GET instead, which is the same
+// outcome by one more hop.
+//
+// Both hops refuse while self-registration is off, the way the register pages do: a link mailed
+// while registration was on must not create an account after an administrator has turned it off
+// (#425 decision 6).
+func HandleAccountActivateGet(
+	httpHelper HttpHelper,
+	httpSession sessionstore.Store,
+	database accountActivateDatabase,
+	userCreator UserCreator,
+	auditLogger AuditLogger,
+) http.HandlerFunc {
+
+	return func(w http.ResponseWriter, r *http.Request) {
+
+		settings := r.Context().Value(constants.ContextKeySettings).(*models.Settings)
+		if !settings.SelfRegistrationEnabled {
+			refuseSelfRegistrationDisabled(httpHelper, w, r)
+			return
+		}
+
+		if code := r.URL.Query().Get("code"); len(code) > 0 {
+			handleActivationLinkFollowed(httpHelper, httpSession, database, w, r, code)
+			return
+		}
+
+		handleActivationCleanHop(httpHelper, httpSession, database, userCreator, auditLogger, w, r)
+	}
+}
+
+// handleActivationLinkFollowed is the first hop: the emailed link, carrying the code.
+//
+// It validates but does not consume the code (#112 decision 7). A mail scanner that prefetches
+// the URL writes a marker into its own throwaway cookie jar and leaves the code usable for the
+// real user.
+func handleActivationLinkFollowed(httpHelper HttpHelper, httpSession sessionstore.Store,
+	database accountActivateDatabase, w http.ResponseWriter, r *http.Request, code string) {
+
+	codeHash, err := hashutil.HashString(code)
+	if err != nil {
+		httpHelper.InternalServerError(w, r, err)
+		return
+	}
+
+	preRegistration, err := database.GetPreRegistrationByVerificationCodeHash(r.Context(), nil, codeHash)
+	if err != nil {
+		httpHelper.InternalServerError(w, r, err)
+		return
+	}
+
+	// An unknown code is also a consumed one: the activation deletes the row, so a link clicked
+	// twice lands here.
+	if preRegistration == nil {
+		refuseActivationLink(httpHelper, w, r, activationReasonUnknownCode)
+		return
+	}
+
+	verificationCode, err := encryption.DecryptData(preRegistration.VerificationCodeEncrypted)
+	if err != nil {
+		httpHelper.InternalServerError(w, r, errs.Wrap(err, "unable to decrypt verification code"))
+		return
+	}
+
+	// The index found a candidate; this decides. Reachable only through a SHA-256 collision now
+	// that the row is located by hash, and kept so the comparison stays load-bearing rather than
+	// decorative. Answered as an unknown code, as the reset twin answers its own mismatch.
+	if verificationCode != code {
+		refuseActivationLink(httpHelper, w, r, activationReasonUnknownCode)
+		return
+	}
+
+	if isVerificationCodeExpired(preRegistration) {
+		// The code has expired: delete the pre-registration and ask the user to register again.
+		if deletePreRegistrationErr := database.DeletePreRegistration(r.Context(), nil, preRegistration.Id); deletePreRegistrationErr != nil {
+			httpHelper.InternalServerError(w, r, deletePreRegistrationErr)
+			return
+		}
+
+		refuseActivationLink(httpHelper, w, r, activationReasonCodeExpired)
+		return
+	}
+
+	// The marker names the code hash, not only the pre-registration id: a marker naming a
+	// durable id alone would still resolve after the row was deleted, where the hash stops
+	// resolving the moment the activation completes. See handleActivationCleanHop.
+	rejection, err := emaillinks.SaveLinkMarker(httpSession, w, r, emaillinks.LinkMarkerFlowAccountActivate,
+		preRegistration.Id, codeHash)
+	if err != nil {
+		httpHelper.InternalServerError(w, r, err)
+		return
+	}
+
+	// A second, different link followed while one is still live, of either flow. The first
+	// continuation keeps the session and this one is refused: the clean hop reads the
+	// marker alone, so replacing here would make the redirect already in flight activate
+	// this registration instead of the one that authorized it. Logged rather than audited,
+	// because this handler has no failed-activation event to record it under; the reset side,
+	// which has one, audits the same refusal as continuation_in_flight.
+	//
+	// Activation carries no continuation id, unlike the reset form: its continuation is the
+	// browser following a 303 with no page in between, so there is nothing on screen to be
+	// retargeted later and nowhere to put an id that would not go back into the URL.
+	if rejection != "" {
+		refuseActivationLink(httpHelper, w, r, string(rejection))
+		return
+	}
+
+	// 303 rather than 302, so the browser is required to follow with a GET regardless of what
+	// this request was, and the code is gone from the request target from here on.
+	http.Redirect(w, r, emaillinks.AccountActivatePath, http.StatusSeeOther)
+}
+
+// isVerificationCodeExpired reports whether the activation code issued for this
+// pre-registration is past its lifetime. A row with no issued-at is treated as expired, which
+// fails closed.
+func isVerificationCodeExpired(preRegistration *models.PreRegistration) bool {
+	return preRegistration.VerificationCodeIssuedAt.Time.Add(verificationCodeLifetime).Before(time.Now().UTC())
+}
+
+// handleActivationCleanHop is the redirect landing: no query at all, the marker alone.
+//
+// Re-resolving the marker's code hash is what refuses a replayed marker, for the reason
+// resolveResetPasswordMarker gives on the reset side: DeletePreRegistration removes the row
+// the hash names in the same request that creates the account, so a second attempt resolves
+// to nothing. Clearing the session now reaches every copy of the marker, since the session
+// is a database row rather than a browser cookie, so this is defence in depth rather than
+// the whole boundary it was written as (#112, #266).
+func handleActivationCleanHop(httpHelper HttpHelper, httpSession sessionstore.Store,
+	database accountActivateDatabase, userCreator UserCreator, auditLogger AuditLogger,
+	w http.ResponseWriter, r *http.Request) {
+
+	marker, rejection, err := emaillinks.GetLinkMarker(httpSession, r, emaillinks.LinkMarkerFlowAccountActivate)
+	if err != nil {
+		httpHelper.InternalServerError(w, r, err)
+		return
+	}
+	if rejection != "" {
+		refuseActivationLink(httpHelper, w, r, string(rejection))
+		return
+	}
+
+	// The resolved row is the authority for which registration this is, not marker.Id: the
+	// marker travels in a cookie, so the id it carries is a label rather than something this
+	// request established.
+	preRegistration, err := database.GetPreRegistrationByVerificationCodeHash(r.Context(), nil, marker.CodeHash)
+	if err != nil {
+		httpHelper.InternalServerError(w, r, err)
+		return
+	}
+	if preRegistration == nil {
+		refuseActivationLink(httpHelper, w, r, activationReasonCodeNoLongerOutstanding)
+		return
+	}
+
+	createdUser, err := userCreator.CreateUser(r.Context(), &usercreation.CreateUserInput{
+		Email:         preRegistration.Email,
+		EmailVerified: true,
+		PasswordHash:  preRegistration.PasswordHash,
+	})
+	if err != nil {
+		httpHelper.InternalServerError(w, r, err)
+		return
+	}
+
+	auditLogger.Log(r.Context(), audit.AuditCreatedUser, map[string]interface{}{
+		"email": createdUser.Email,
+	})
+
+	// What makes the marker one-shot: after this the hash it names resolves to nothing, so a
+	// replayed copy of the cookie lands on the expired rendering. Two copies racing before
+	// either gets here are bounded instead by the UNIQUE index on users.email, which refuses
+	// the second insert, so exactly one account exists either way.
+	err = database.DeletePreRegistration(r.Context(), nil, preRegistration.Id)
+	if err != nil {
+		httpHelper.InternalServerError(w, r, err)
+		return
+	}
+
+	auditLogger.Log(r.Context(), audit.AuditActivatedAccount, map[string]interface{}{
+		"email": createdUser.Email,
+	})
+
+	// Hygiene, and not the thing that makes the marker single-use: the deletion above is. A
+	// failure here is logged rather than answered with a 500, because the account has already
+	// been created and telling the caller the activation failed would be false.
+	if clearLinkMarkerErr := emaillinks.ClearLinkMarker(httpSession, w, r); clearLinkMarkerErr != nil {
+		slog.ErrorContext(r.Context(), "unable to clear the account activation link marker after a completed activation",
+			"email", createdUser.Email, "error", clearLinkMarkerErr)
+	}
+
+	bind := map[string]interface{}{
+		"adminConsoleBaseUrl": config.GetAdminConsole().BaseURL,
+	}
+
+	err = httpHelper.RenderTemplate(w, r, "/layouts/auth_layout.html", "/account_register_activation_result.html", bind)
+	if err != nil {
+		httpHelper.InternalServerError(w, r, err)
+	}
+}

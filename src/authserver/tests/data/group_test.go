@@ -1,0 +1,414 @@
+package datatests
+
+import (
+	"context"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/leodip/goiabada/authserver/internal/models"
+	"github.com/leodip/goiabada/authserver/internal/testutil/fake"
+)
+
+func TestCreateGroup(t *testing.T) {
+	group := &models.Group{
+		GroupIdentifier:      "test_group_" + fake.LetterN(6),
+		Description:          "Test Group",
+		IncludeInIdToken:     true,
+		IncludeInAccessToken: false,
+	}
+
+	err := database.CreateGroup(context.Background(), nil, group)
+	if err != nil {
+		t.Fatalf("Failed to create group: %v", err)
+	}
+
+	if group.Id == 0 {
+		t.Error("Expected non-zero ID after creation")
+	}
+	if !group.CreatedAt.Valid || group.CreatedAt.Time.IsZero() {
+		t.Error("Expected CreatedAt to be set")
+	}
+	if !group.UpdatedAt.Valid || group.UpdatedAt.Time.IsZero() {
+		t.Error("Expected UpdatedAt to be set")
+	}
+
+	retrievedGroup, err := database.GetGroupById(context.Background(), nil, group.Id)
+	if err != nil {
+		t.Fatalf("Failed to retrieve created group: %v", err)
+	}
+
+	if retrievedGroup.GroupIdentifier != group.GroupIdentifier {
+		t.Errorf("Expected GroupIdentifier %s, got %s", group.GroupIdentifier, retrievedGroup.GroupIdentifier)
+	}
+	if retrievedGroup.Description != group.Description {
+		t.Errorf("Expected Description %s, got %s", group.Description, retrievedGroup.Description)
+	}
+	if retrievedGroup.IncludeInIdToken != group.IncludeInIdToken {
+		t.Errorf("Expected IncludeInIdToken %v, got %v", group.IncludeInIdToken, retrievedGroup.IncludeInIdToken)
+	}
+	if retrievedGroup.IncludeInAccessToken != group.IncludeInAccessToken {
+		t.Errorf("Expected IncludeInAccessToken %v, got %v", group.IncludeInAccessToken, retrievedGroup.IncludeInAccessToken)
+	}
+}
+
+func TestUpdateGroup(t *testing.T) {
+	group := createTestGroup(t)
+
+	group.Description = "Updated Description"
+	group.IncludeInIdToken = false
+	group.IncludeInAccessToken = true
+
+	// Wait a moment to ensure UpdatedAt will be different
+	time.Sleep(timestampTick)
+
+	err := database.UpdateGroup(context.Background(), nil, group)
+	if err != nil {
+		t.Fatalf("Failed to update group: %v", err)
+	}
+
+	updatedGroup, err := database.GetGroupById(context.Background(), nil, group.Id)
+	if err != nil {
+		t.Fatalf("Failed to retrieve updated group: %v", err)
+	}
+
+	if updatedGroup.Description != group.Description {
+		t.Errorf("Expected Description %s, got %s", group.Description, updatedGroup.Description)
+	}
+	if updatedGroup.IncludeInIdToken != group.IncludeInIdToken {
+		t.Errorf("Expected IncludeInIdToken %v, got %v", group.IncludeInIdToken, updatedGroup.IncludeInIdToken)
+	}
+	if updatedGroup.IncludeInAccessToken != group.IncludeInAccessToken {
+		t.Errorf("Expected IncludeInAccessToken %v, got %v", group.IncludeInAccessToken, updatedGroup.IncludeInAccessToken)
+	}
+	if !updatedGroup.UpdatedAt.Time.After(updatedGroup.CreatedAt.Time) {
+		t.Error("Expected UpdatedAt to be after CreatedAt")
+	}
+}
+
+func TestGetGroupById(t *testing.T) {
+	group := createTestGroup(t)
+
+	retrievedGroup, err := database.GetGroupById(context.Background(), nil, group.Id)
+	if err != nil {
+		t.Fatalf("Failed to get group by ID: %v", err)
+	}
+
+	if retrievedGroup.Id != group.Id {
+		t.Errorf("Expected ID %d, got %d", group.Id, retrievedGroup.Id)
+	}
+	if retrievedGroup.GroupIdentifier != group.GroupIdentifier {
+		t.Errorf("Expected GroupIdentifier %s, got %s", group.GroupIdentifier, retrievedGroup.GroupIdentifier)
+	}
+
+	nonExistentGroup, err := database.GetGroupById(context.Background(), nil, 99999)
+	if err != nil {
+		t.Errorf("Expected no error for non-existent group, got: %v", err)
+	}
+	if nonExistentGroup != nil {
+		t.Errorf("Expected nil for non-existent group, got a group with ID: %d", nonExistentGroup.Id)
+	}
+}
+
+func TestGetGroupByGroupIdentifier(t *testing.T) {
+	group := createTestGroup(t)
+
+	retrievedGroup, err := database.GetGroupByGroupIdentifier(context.Background(), nil, group.GroupIdentifier)
+	if err != nil {
+		t.Fatalf("Failed to get group by identifier: %v", err)
+	}
+
+	if retrievedGroup.Id != group.Id {
+		t.Errorf("Expected ID %d, got %d", group.Id, retrievedGroup.Id)
+	}
+	if retrievedGroup.GroupIdentifier != group.GroupIdentifier {
+		t.Errorf("Expected GroupIdentifier %s, got %s", group.GroupIdentifier, retrievedGroup.GroupIdentifier)
+	}
+
+	nonExistentGroup, err := database.GetGroupByGroupIdentifier(context.Background(), nil, "non_existent_identifier")
+	if err != nil {
+		t.Errorf("Expected no error for non-existent group, got: %v", err)
+	}
+	if nonExistentGroup != nil {
+		t.Errorf("Expected nil for non-existent group, got a group with ID: %d", nonExistentGroup.Id)
+	}
+}
+
+func TestGetAllGroups(t *testing.T) {
+	group1 := createTestGroup(t)
+	group2 := createTestGroup(t)
+
+	groups, err := database.GetAllGroups(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("Failed to get all groups: %v", err)
+	}
+
+	if len(groups) < 2 {
+		t.Errorf("Expected at least 2 groups, got %d", len(groups))
+	}
+
+	foundGroup1 := false
+	foundGroup2 := false
+	for _, group := range groups {
+		if group.Id == group1.Id {
+			foundGroup1 = true
+		}
+		if group.Id == group2.Id {
+			foundGroup2 = true
+		}
+	}
+
+	if !foundGroup1 || !foundGroup2 {
+		t.Error("Not all created groups were found in GetAllGroups result")
+	}
+}
+
+// TestGetAllGroupsPaginated asserts the properties of pagination rather than the
+// contents of fixed pages, because this reader spans the whole table and every
+// other test in the package adds to it.
+//
+// It used to delete every group in the database first, to make the counts
+// predictable. That worked only because nothing runs in parallel and no later test
+// depended on a group created earlier, and it cascaded into users_groups,
+// groups_permissions and group_attributes on the way. Asserting relative to a
+// baseline needs no such wipe, and pins more than the old version did: that the
+// pages tile the table with no gap or repeat, and that the ordering the reader
+// promises actually holds.
+func TestGetAllGroupsPaginated(t *testing.T) {
+	const pageSize = 10
+	const numGroups = 25
+
+	// Page size 1 is the cheapest way to read the current total.
+	_, baseline, err := database.GetAllGroupsPaginated(context.Background(), nil, 1, 1)
+	if err != nil {
+		t.Fatalf("Failed to read the baseline group count: %v", err)
+	}
+
+	created := make(map[string]bool, numGroups)
+	for i := 0; i < numGroups; i++ {
+		group := createTestGroup(t)
+		created[group.GroupIdentifier] = true
+		// Remove only what this test made. Unlike the old table-wide wipe this
+		// touches nothing another test owns, and it keeps the table from growing by
+		// 25 rows on every run of the three server databases, which are never reset.
+		t.Cleanup(func() { _ = database.DeleteGroup(context.Background(), nil, group.Id) })
+	}
+
+	expectedTotal := baseline + numGroups
+
+	// A full page, a partial last page, and the page past the end.
+	lastPage := (expectedTotal + pageSize - 1) / pageSize
+	expectedOnLastPage := expectedTotal - (lastPage-1)*pageSize
+
+	for _, tc := range []struct {
+		name     string
+		page     int
+		expected int
+	}{
+		{"first page is full", 1, pageSize},
+		{"last page holds the remainder", lastPage, expectedOnLastPage},
+		{"page past the end is empty", lastPage + 1, 0},
+	} {
+		groups, total, getGroupsErr := database.GetAllGroupsPaginated(context.Background(), nil, tc.page, pageSize)
+		if getGroupsErr != nil {
+			t.Fatalf("%s: failed to get page %d: %v", tc.name, tc.page, getGroupsErr)
+		}
+		if len(groups) != tc.expected {
+			t.Errorf("%s: expected %d groups on page %d, got %d", tc.name, tc.expected, tc.page, len(groups))
+		}
+		// The total is a property of the query, not of the page, so it must not
+		// change as the caller walks off the end.
+		if total != expectedTotal {
+			t.Errorf("%s: expected total %d on page %d, got %d", tc.name, expectedTotal, tc.page, total)
+		}
+	}
+
+	// Read everything in one page, as the reference for what the pages should tile.
+	all, total, err := database.GetAllGroupsPaginated(context.Background(), nil, 1, expectedTotal)
+	if err != nil {
+		t.Fatalf("Failed to read all groups in one page: %v", err)
+	}
+	if total != expectedTotal || len(all) != expectedTotal {
+		t.Fatalf("Expected %d groups in one page, got %d (total reported %d)", expectedTotal, len(all), total)
+	}
+
+	// Every group created here comes back exactly once.
+	seen := 0
+	for _, group := range all {
+		if created[group.GroupIdentifier] {
+			seen++
+			delete(created, group.GroupIdentifier) // so a repeat is not counted twice
+		}
+	}
+	if seen != numGroups {
+		t.Errorf("Expected all %d created groups to appear exactly once, found %d", numGroups, seen)
+	}
+
+	// The pages must tile that reference: page N holds exactly the slice the single
+	// read put at that offset, with nothing skipped or repeated at the seam.
+	//
+	// Deliberately not asserted: what the order itself should be. The reader sorts
+	// by group_identifier in the database, and the collation is not ours to assume.
+	// MySQL's default (utf8mb4_0900_ai_ci) and SQL Server's are case-insensitive
+	// while sqlite compares bytes, so a fixed expected order would be wrong on some
+	// engine no matter which one we picked. Comparing the pages against the full
+	// read tests the offset arithmetic without needing to know the collation.
+	for _, page := range []int{1, 2} {
+		groups, _, err := database.GetAllGroupsPaginated(context.Background(), nil, page, pageSize)
+		if err != nil {
+			t.Fatalf("Failed to get page %d: %v", page, err)
+		}
+		offset := (page - 1) * pageSize
+		for i, group := range groups {
+			if group.GroupIdentifier != all[offset+i].GroupIdentifier {
+				t.Errorf("Page %d position %d: expected %q, got %q",
+					page, i, all[offset+i].GroupIdentifier, group.GroupIdentifier)
+			}
+		}
+	}
+}
+
+func TestDeleteGroup(t *testing.T) {
+	group := createTestGroup(t)
+
+	err := database.DeleteGroup(context.Background(), nil, group.Id)
+	if err != nil {
+		t.Fatalf("Failed to delete group: %v", err)
+	}
+
+	deletedGroup, err := database.GetGroupById(context.Background(), nil, group.Id)
+	if err != nil {
+		t.Fatalf("Error while checking for deleted group: %v", err)
+	}
+	if deletedGroup != nil {
+		t.Errorf("Group still exists after deletion")
+	}
+
+	err = database.DeleteGroup(context.Background(), nil, 99999)
+	if err != nil {
+		t.Errorf("Expected no error when deleting non-existent group, got: %v", err)
+	}
+}
+
+func createTestGroup(t *testing.T) *models.Group {
+	random := fake.LetterN(6)
+	group := &models.Group{
+		GroupIdentifier: "TestGroup_" + random,
+		Description:     "Test Group Description",
+	}
+	err := database.CreateGroup(context.Background(), nil, group)
+	if err != nil {
+		t.Fatalf("Failed to create test group: %v", err)
+	}
+	return group
+}
+
+// TestGetGroupByGroupIdentifierIsCaseSensitive is the client test's property for groups,
+// and it is here rather than only there because the collation is a property of the column
+// and not of the table: idx_group_identifier folded case on MySQL and SQL Server exactly as
+// idx_client_identifier did, so "developers" and "Developers" were one group on two engines
+// and two on the other two.
+//
+// The padded lookup covers the fold no collation reaches: SQL Server pads for `=`, so the
+// row comes back and the data layer discards it (commondb.engineFoldedTheMatch). See
+// TestGetClientByClientIdentifierIsCaseSensitive for the whole of the reasoning.
+func TestGetGroupByGroupIdentifierIsCaseSensitive(t *testing.T) {
+	lower := "case_group_" + strings.ToLower(fake.LetterN(6))
+	upper := strings.ToUpper(lower)
+
+	lowerGroup := &models.Group{GroupIdentifier: lower, Description: "lowercase"}
+	if err := database.CreateGroup(context.Background(), nil, lowerGroup); err != nil {
+		t.Fatalf("Failed to create the lowercase group: %v", err)
+	}
+
+	// A second group differing from the first only by case, which MySQL and SQL Server
+	// refused before 000040.
+	upperGroup := &models.Group{GroupIdentifier: upper, Description: "uppercase"}
+	if err := database.CreateGroup(context.Background(), nil, upperGroup); err != nil {
+		t.Fatalf("Failed to create a group differing only by case, which every engine must now accept: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name   string
+		lookup string
+		wantId int64
+	}{
+		{"the lowercase name resolves the lowercase group", lower, lowerGroup.Id},
+		{"the uppercase name resolves the uppercase group", upper, upperGroup.Id},
+		{"a mis-cased name resolves nothing", "Case_Group_" + strings.ToUpper(lower[11:]), 0},
+		{"a trailing space resolves nothing, which SQL Server's padding would otherwise defeat", lower + " ", 0},
+	} {
+		got, err := database.GetGroupByGroupIdentifier(context.Background(), nil, tc.lookup)
+		if err != nil {
+			t.Fatalf("%s: unexpected error: %v", tc.name, err)
+		}
+		if tc.wantId == 0 {
+			if got != nil {
+				t.Errorf("%s: expected nil, got the group with id %d and identifier %q",
+					tc.name, got.Id, got.GroupIdentifier)
+			}
+			continue
+		}
+		if got == nil {
+			t.Fatalf("%s: expected the group with id %d, got nil", tc.name, tc.wantId)
+		}
+		if got.Id != tc.wantId {
+			t.Errorf("%s: expected the group with id %d, got id %d (identifier %q)",
+				tc.name, tc.wantId, got.Id, got.GroupIdentifier)
+		}
+	}
+}
+
+// TestGetGroupMembersPaginated_EnlistsInTheCallersTransaction pins #413's second site. The page
+// query already took the caller's transaction; the count query beside it passed nil, so the two
+// halves of one answer were read on two connections. That is the defect's exact shape: a total
+// that disagrees with the page it accompanies.
+//
+// The rows are created inside the transaction for the reason ClientLoadPermissions' case gives.
+func TestGetGroupMembersPaginated_EnlistsInTheCallersTransaction(t *testing.T) {
+	tx := beginTx(t)
+
+	group := &models.Group{
+		GroupIdentifier: "TxGroup_" + fake.LetterN(8),
+		Description:     "Transaction pass-through group",
+	}
+	if err := database.CreateGroup(context.Background(), tx, group); err != nil {
+		t.Fatalf("Failed to create group inside the transaction: %v", err)
+	}
+
+	user := &models.User{
+		Enabled:   true,
+		Subject:   fake.UUID(),
+		Username:  "u" + fake.LetterN(12),
+		GivenName: "TxMember" + fake.LetterN(6),
+		Email:     fake.LetterN(12) + "@example.com",
+	}
+	if err := database.CreateUser(context.Background(), tx, user); err != nil {
+		t.Fatalf("Failed to create user inside the transaction: %v", err)
+	}
+
+	userGroup := &models.UserGroup{UserId: user.Id, GroupId: group.Id}
+	if err := database.CreateUserGroup(context.Background(), tx, userGroup); err != nil {
+		t.Fatalf("Failed to create users_groups row inside the transaction: %v", err)
+	}
+
+	members, total, err := database.GetGroupMembersPaginated(context.Background(), tx, group.Id, 1, 10)
+	if err != nil {
+		t.Fatalf("GetGroupMembersPaginated through the transaction: %v", err)
+	}
+
+	if len(members) != 1 {
+		t.Fatalf("Expected the transaction's own member, got %d", len(members))
+	}
+	if members[0].Id != user.Id {
+		t.Errorf("Expected user %d, got %d", user.Id, members[0].Id)
+	}
+	if total != 1 {
+		t.Errorf("Expected a total of 1 to agree with the one member on the page, got %d: "+
+			"the count query ran outside the caller's transaction (#413)", total)
+	}
+
+	if err := database.RollbackTransaction(context.Background(), tx); err != nil {
+		t.Fatalf("RollbackTransaction: %v", err)
+	}
+}

@@ -1,0 +1,152 @@
+---
+title: Tokens
+description: Access tokens, ID tokens, and refresh token management.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+## Token expiration
+
+You can customize the expiration (in seconds) for access tokens and ID tokens on the **Settings → Tokens** page. These configurations apply globally to all clients. However, individual clients can override the global settings in their specific client configurations.
+
+The default token expiration is set to 5 minutes. Access tokens are intentionally kept short-lived for security reasons.
+
+## OIDC claims in ID tokens
+
+By default, Goiabada includes OpenID Connect scope claims (from `profile`, `email`, `phone`, `address` scopes) in ID tokens. This behavior matches industry standards (Auth0, Microsoft, Keycloak) and provides immediate access to user information without an additional API call.
+
+However, you can configure this behavior globally or per-client to support different use cases:
+
+### Global configuration
+
+Navigate to **Settings → Tokens** in the admin console:
+
+- **Include OpenID Connect claims in ID tokens**: Controls whether OIDC scope claims are included in ID tokens by default
+- Default: **Enabled** (claims included)
+- When disabled: Applications must use the `/userinfo` endpoint to retrieve user claims
+
+### Per-client configuration
+
+In each client's **Tokens** settings, you can override the global behavior:
+
+- **Include OIDC claims in ID tokens**: Three options
+  - `Default` - Use the global setting
+  - `On` - Always include claims in ID tokens for this client
+  - `Off` - Never include claims in ID tokens for this client
+
+This per-client control allows you to:
+- Enable strict OIDC conformance for specific applications
+- Optimize token size for performance-critical applications
+- Meet different security requirements across your application portfolio
+
+### What's always included
+
+Regardless of this setting, ID tokens always contain:
+- Core OpenID claims: `sub`, `iss`, `aud`, `exp`, `iat`, `auth_time`, `nonce`, `acr`, `amr`
+- Goiabada-specific scopes (`groups`, `attributes`) follow their own inclusion rules
+
+All claims are **always** available via the `/userinfo` endpoint, regardless of whether they're included in the ID token.
+
+### OIDC specification compliance
+
+According to [OIDC Core 5.4](https://openid.net/specs/openid-connect-core-1_0.html#ScopeClaims), scope-related claims **MAY** be included in ID tokens but **SHOULD** be retrieved from the `/userinfo` endpoint for strict conformance.
+
+For more details on this feature and when to use it, see [OIDC claims in tokens](/concepts/openid-connect/#oidc-claims-in-tokens).
+
+## Claims in access tokens
+
+Two claims in access tokens are worth knowing about when you validate tokens yourself.
+
+### The `sid` claim is conditional
+
+An access token carries a `sid` (session identifier) claim only when the grant it came from is tied to a user session. Access tokens issued for an `offline_access` grant, or through the resource owner password credentials flow, carry **no** `sid`, because those grants deliberately outlive the browser session that started them.
+
+Do not treat a missing `sid` as an invalid token, and do not require it when validating. ID tokens on authorization code grants still carry `sid`, which is what [RP-initiated logout](/integration/endpoints/#authlogout-get-or-post) matches on.
+
+### The `auth_state_generation` claim is reserved
+
+Access tokens carry an `auth_state_generation` claim, an integer that Goiabada uses internally to tell whether a token was issued before the user's credentials last changed. See [credential changes and live sessions](/concepts/user-sessions/#credential-changes-and-live-sessions).
+
+Treat it as **opaque and reserved**. Do not parse it, compare it between tokens, or build logic on its value: it is an implementation detail whose meaning may change, and it is not a version number you can reason about.
+
+## Refresh tokens
+
+Refresh tokens are used in the authorization code flow with PKCE and in the resource owner password credentials flow (the client credentials flow doesn't use refresh tokens).
+
+Goiabada supports two types of refresh tokens: **normal** and **offline**.
+
+### Normal refresh tokens
+
+Normal tokens are linked to the user session. They can be used to get a new access token as long as there's an active user session.
+
+- When a normal refresh token is used, the user session `last_accessed` timestamp is bumped
+- The expiration time of a normal refresh token is the same as the user session idle timeout (default is 2 hours)
+- If the user session is terminated, it automatically invalidates the refresh tokens linked to that session
+
+### Offline refresh tokens
+
+Offline refresh tokens don't depend on an active user session. They can be used to obtain a new access token even when the user is not actively using the application, and they keep working after the browser session that created them has expired.
+
+- They are governed by two limits, both configurable on **Settings → Tokens**: an idle timeout (defaults to 30 days) and a maximum lifetime (defaults to 1 year)
+- Useful for background tasks or applications that need to access resources on behalf of users without their immediate interaction
+
+A session expiring and a session being ended are not the same thing, and only the first leaves an offline token working. When somebody explicitly ends the session an offline token was authorized through, that token is revoked. See [ending a session](/concepts/user-sessions/#ending-a-session).
+
+Because an offline refresh token can remain usable for a long time, it is also the grant most worth thinking about when a user's credentials change. See [credential changes and live sessions](/concepts/user-sessions/#credential-changes-and-live-sessions).
+
+### Requesting offline tokens
+
+In your authorization request, when you ask for the `offline_access` scope, your refresh token will be classified as **offline**. Otherwise, if you don't include the `offline_access` scope, your refresh token will be considered **normal**.
+
+```
+scope=openid offline_access
+```
+
+## Refresh token rotation
+
+Upon each usage of a refresh token, the refresh token passed to the `/auth/token` endpoint becomes inactive, and a new refresh token is provided in the token response.
+
+In other words, a refresh token is a one-time-use token; once used, it must be substituted with the new refresh token obtained from the response.
+
+Single use is enforced atomically. Across concurrent requests presenting the same refresh token, **at most one** can receive a token set; two can never succeed. If the token is live and issuance succeeds, one wins and the rest are refused with `invalid_grant`. If it was already retired, or issuance fails, none succeeds.
+
+### What your client must do
+
+<Aside type="caution">
+Serialize your refresh requests, and **atomically** persist the refresh token from each successful response in place of the old one before using the rest of that response.
+
+Presenting a refresh token that rotation has already retired revokes **the family's live tokens**, including the one your application is currently using, and the user has to authorize again. That happens whether the retired token was replayed by an attacker or by your own client.
+</Aside>
+
+Two shapes cause this by accident:
+
+- **Parallel refreshes.** Two threads, tabs or instances notice the access token has expired and each presents the same refresh token. One wins. Whether the other is quietly refused or treated as a replay depends on whether its database lookup saw the token as still live, which is not something either side can control. Refresh through a single shared path instead.
+- **Retrying after a lost response.** The server rotated the token and the response never arrived. Retrying with the old token presents a retired one. Persist the new token before acting on the response, and treat a lost response as "reauthorize", not "retry".
+
+## Refresh token replay
+
+When a refresh token that rotation has already retired is presented again, Goiabada revokes every member of that token's **rotation family** that is still live and committed at the moment containment runs. In practice that is the successor issued when the presented token was rotated, plus any further descendants of the same original grant. The presented token itself is already retired, which is what identified it as a replay.
+
+One case is not covered: a token minted by a rotation that commits immediately after containment has run is not reached by it. That token still works, and using it rotates it in the ordinary way, so the family can keep rotating until a retired member of it is presented again or the surviving chain expires.
+
+This follows the strict rotation model in [RFC 9700 section 4.14.2](https://www.rfc-editor.org/rfc/rfc9700.html#section-4.14.2), which is explicit that the server cannot identify which presenter is legitimate. Goiabada therefore treats a retired token coming back as reason to invalidate the chain, without claiming to know that the token was copied: a delayed request from your own client produces exactly the same signal. Leaving the chain alive instead would mean that someone who did steal a refresh token and lost the race to use it could simply wait and keep rotating, while the legitimate user is the one locked out.
+
+**What containment does not touch.** Only the rotation family is revoked. The browser session survives, other clients the user is signed in to are unaffected, and other grants belonging to the same user keep working, including a separate grant created from the same browser session. A refresh token replay implicates one grant's client-side storage, not the sign-in itself.
+
+Access tokens already issued are **not** revoked. They are short-lived signed JWTs with no revocation list, so containment stops the next rotation rather than cutting short an access token already handed out. This is the main reason to keep access token lifetimes short.
+
+The incident is recorded as a `refresh_token_replay_detected` [audit event](/concepts/audit-log/) **when containment actually revokes at least one live member**. A repeated presentation that finds no live committed family member changes nothing and emits no event, so one incident does not produce a row per attempt. A repeat that does find one, such as a child committed after the earlier containment, revokes it and is recorded. The payload carries the presented token's `jti`, the family identifier, how many tokens were revoked, the client and user involved, and which flow created the grant. It never contains the refresh token itself.
+
+The event does not by itself prove an attack: a client that refreshes in parallel can trigger it, which is one more reason to serialize.
+
+### Storage
+
+Revoked refresh token rows are retained until the token itself expires, rather than being deleted as soon as they are revoked. The stored row is what lets the server recognise a replayed token at all; deleting it early means a replay is refused but the live family is never contained.
+
+This makes the `refresh_tokens` table grow with refresh frequency and your configured lifetimes. With the default 30-day offline idle timeout, a grant refreshed every five minutes accumulates roughly 8,600 rows before the oldest start ageing out. Background cleanup runs every 12 hours and deletes a row only once its expiration or maximum lifetime has passed.
+
+Worth monitoring if you issue many long-lived offline grants that refresh frequently. Both the offline idle timeout and the maximum lifetime are configurable on **Settings → Tokens**, but only whichever of the two actually bounds your grants affects the count: lowering a maximum lifetime that never binds changes nothing. Reduce the effective retention lifetime and the retained rows fall with it.
+
+<Aside type="caution">
+If you import refresh tokens from another system, populate `expires_at`. A row with both `expires_at` and `max_lifetime` empty is never reaped by the background cleanup, because neither comparison can decide it has expired, and removing such rows needs an explicit operator action.
+</Aside>

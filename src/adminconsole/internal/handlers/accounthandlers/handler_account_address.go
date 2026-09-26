@@ -1,0 +1,180 @@
+package accounthandlers
+
+import (
+	"context"
+	"net/http"
+	"sort"
+	"strings"
+
+	"github.com/leodip/goiabada/adminconsole/internal/config"
+	"github.com/leodip/goiabada/adminconsole/internal/constants"
+	"github.com/leodip/goiabada/adminconsole/internal/handlers"
+	"github.com/leodip/goiabada/adminconsole/internal/oauthclient"
+	"github.com/leodip/goiabada/core/api"
+	coreconstants "github.com/leodip/goiabada/core/constants"
+	"github.com/leodip/goiabada/core/countries"
+	"github.com/leodip/goiabada/core/errs"
+	"github.com/leodip/goiabada/core/sessionstore"
+)
+
+// accountAddressAPI is what the account address page needs: the profile it renders from, and the
+// address write.
+type accountAddressAPI interface {
+	GetAccountProfile(ctx context.Context, accessToken string) (*api.UserResponse, error)
+	UpdateAccountAddress(ctx context.Context, accessToken string, request *api.UpdateUserAddressRequest) (*api.UserResponse, error)
+}
+
+func HandleAccountAddressGet(
+	httpHelper handlers.HttpHelper,
+	httpSession sessionstore.Store,
+	apiClient accountAddressAPI,
+) http.HandlerFunc {
+
+	countries := countries.AllInfo()
+	sort.Slice(countries, func(i, j int) bool {
+		return countries[i].Name < countries[j].Name
+	})
+
+	return func(w http.ResponseWriter, r *http.Request) {
+
+		// Get JWT info to extract access token
+		jwtInfo, ok := r.Context().Value(constants.ContextKeyJwtInfo).(oauthclient.JwtInfo)
+		if !ok {
+			httpHelper.InternalServerError(w, r, errs.New("no JWT info found in context"))
+			return
+		}
+
+		user, err := apiClient.GetAccountProfile(r.Context(), jwtInfo.TokenResponse.AccessToken)
+		if err != nil {
+			handlers.HandleAPIError(httpHelper, w, r, err)
+			return
+		}
+
+		sess, err := httpSession.Get(r, coreconstants.AdminConsoleSessionName)
+		if err != nil {
+			httpHelper.InternalServerError(w, r, err)
+			return
+		}
+
+		_, savedSuccessfully := sess.TakeFlash("savedSuccessfully")
+		if savedSuccessfully {
+			err = httpSession.Save(r, w, sess)
+			if err != nil {
+				httpHelper.InternalServerError(w, r, err)
+				return
+			}
+		}
+
+		address := struct {
+			AddressLine1      string
+			AddressLine2      string
+			AddressLocality   string
+			AddressRegion     string
+			AddressPostalCode string
+			AddressCountry    string
+		}{
+			AddressLine1:      user.AddressLine1,
+			AddressLine2:      user.AddressLine2,
+			AddressLocality:   user.AddressLocality,
+			AddressRegion:     user.AddressRegion,
+			AddressPostalCode: user.AddressPostalCode,
+			AddressCountry:    user.AddressCountry,
+		}
+
+		bind := map[string]interface{}{
+			"user":              user,
+			"address":           address,
+			"countries":         countries,
+			"savedSuccessfully": savedSuccessfully,
+		}
+
+		err = httpHelper.RenderTemplate(w, r, "/layouts/menu_layout.html", "/account_address.html", bind)
+		if err != nil {
+			httpHelper.InternalServerError(w, r, err)
+			return
+		}
+	}
+}
+
+func HandleAccountAddressPost(
+	httpHelper handlers.HttpHelper,
+	httpSession sessionstore.Store,
+	apiClient accountAddressAPI,
+) http.HandlerFunc {
+
+	countries := countries.AllInfo()
+	sort.Slice(countries, func(i, j int) bool {
+		return countries[i].Name < countries[j].Name
+	})
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Get access token and current profile for potential error render
+		jwtInfo, ok := r.Context().Value(constants.ContextKeyJwtInfo).(oauthclient.JwtInfo)
+		if !ok {
+			httpHelper.InternalServerError(w, r, errs.New("no JWT info found in context"))
+			return
+		}
+
+		user, err := apiClient.GetAccountProfile(r.Context(), jwtInfo.TokenResponse.AccessToken)
+		if err != nil {
+			handlers.HandleAPIError(httpHelper, w, r, err)
+			return
+		}
+
+		req := &api.UpdateUserAddressRequest{
+			AddressLine1:      strings.TrimSpace(r.FormValue("addressLine1")),
+			AddressLine2:      strings.TrimSpace(r.FormValue("addressLine2")),
+			AddressLocality:   strings.TrimSpace(r.FormValue("addressLocality")),
+			AddressRegion:     strings.TrimSpace(r.FormValue("addressRegion")),
+			AddressPostalCode: strings.TrimSpace(r.FormValue("addressPostalCode")),
+			AddressCountry:    strings.TrimSpace(r.FormValue("addressCountry")),
+		}
+
+		_, err = apiClient.UpdateAccountAddress(r.Context(), jwtInfo.TokenResponse.AccessToken, req)
+		if err != nil {
+			handlers.HandleAPIErrorWithCallback(httpHelper, w, r, err, func(errorMessage string) {
+				// Re-render with submitted values
+				address := struct {
+					AddressLine1      string
+					AddressLine2      string
+					AddressLocality   string
+					AddressRegion     string
+					AddressPostalCode string
+					AddressCountry    string
+				}{
+					AddressLine1:      req.AddressLine1,
+					AddressLine2:      req.AddressLine2,
+					AddressLocality:   req.AddressLocality,
+					AddressRegion:     req.AddressRegion,
+					AddressPostalCode: req.AddressPostalCode,
+					AddressCountry:    req.AddressCountry,
+				}
+
+				bind := map[string]interface{}{
+					"user":      user,
+					"address":   address,
+					"countries": countries,
+					"error":     errorMessage,
+				}
+				if renderErr := httpHelper.RenderTemplate(w, r, "/layouts/menu_layout.html", "/account_address.html", bind); renderErr != nil {
+					httpHelper.InternalServerError(w, r, renderErr)
+				}
+			})
+			return
+		}
+
+		sess, err := httpSession.Get(r, coreconstants.AdminConsoleSessionName)
+		if err != nil {
+			httpHelper.InternalServerError(w, r, err)
+			return
+		}
+		sess.SetFlash("savedSuccessfully", "true")
+		err = httpSession.Save(r, w, sess)
+		if err != nil {
+			httpHelper.InternalServerError(w, r, err)
+			return
+		}
+
+		http.Redirect(w, r, config.GetAdminConsole().BaseURL+"/account/address", http.StatusFound)
+	}
+}

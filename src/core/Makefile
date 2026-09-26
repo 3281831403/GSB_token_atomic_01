@@ -1,0 +1,6 @@
+check:	
+	unparam -exported ./...	
+	golangci-lint run ./...
+
+format:
+	gofmt -w -s .

@@ -1,0 +1,653 @@
+---
+title: Environment variables
+description: Complete reference for all Goiabada configuration options.
+---
+
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+Goiabada consists of two applications, each with its own configuration:
+
+- **Auth server** (`goiabada-authserver`) - Handles authentication, OAuth2/OIDC endpoints, and database access
+- **Admin console** (`goiabada-adminconsole`) - Provides the administrative interface
+
+Configuration can be set via **environment variables** or **command-line flags**. When both are set, flags take precedence. Each binary accepts only the flags it acts on; a flag belonging to the other application is rejected.
+
+## Auth server variables
+
+### Initial setup
+
+Used only on first startup:
+
+<table>
+  <thead>
+    <tr>
+      <th style="white-space: nowrap;">Variable / Flag</th>
+      <th>Default</th>
+      <th>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style="white-space: nowrap;"><code>GOIABADA_ADMIN_EMAIL</code><br/><code>--admin-email</code></td>
+      <td><code>admin@example.com</code></td>
+      <td>Email for initial admin user</td>
+    </tr>
+    <tr>
+      <td style="white-space: nowrap;"><code>GOIABADA_ADMIN_PASSWORD</code><br/><code>--admin-password</code></td>
+      <td><code>changeme</code></td>
+      <td>Password for initial admin user. At most 72 bytes, bcrypt's limit: a non-ASCII character counts as two to four, and startup refuses a longer password</td>
+    </tr>
+    <tr>
+      <td style="white-space: nowrap;"><code>GOIABADA_APPNAME</code><br/><code>--appname</code></td>
+      <td><code>Goiabada</code></td>
+      <td>Application name in UI</td>
+    </tr>
+  </tbody>
+</table>
+
+### Database configuration
+
+<table>
+  <thead>
+    <tr>
+      <th style="white-space: nowrap;">Variable / Flag</th>
+      <th>Default</th>
+      <th>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style="white-space: nowrap;"><code>GOIABADA_DB_TYPE</code><br/><code>--db-type</code></td>
+      <td><code>sqlite</code></td>
+      <td><code>mysql</code>, <code>postgres</code>, <code>mssql</code>, or <code>sqlite</code></td>
+    </tr>
+    <tr>
+      <td style="white-space: nowrap;"><code>GOIABADA_DB_USERNAME</code><br/><code>--db-username</code></td>
+      <td><code>root</code></td>
+      <td>Database username</td>
+    </tr>
+    <tr>
+      <td style="white-space: nowrap;"><code>GOIABADA_DB_PASSWORD</code><br/><code>--db-password</code></td>
+      <td><em>(empty)</em></td>
+      <td>Database password</td>
+    </tr>
+    <tr>
+      <td style="white-space: nowrap;"><code>GOIABADA_DB_HOST</code><br/><code>--db-host</code></td>
+      <td><code>localhost</code></td>
+      <td>Database hostname or address. An IPv6 address may be written with or without brackets (<code>::1</code> or <code>[::1]</code>)</td>
+    </tr>
+    <tr>
+      <td style="white-space: nowrap;"><code>GOIABADA_DB_PORT</code><br/><code>--db-port</code></td>
+      <td><code>3306</code></td>
+      <td>Database port</td>
+    </tr>
+    <tr>
+      <td style="white-space: nowrap;"><code>GOIABADA_DB_NAME</code><br/><code>--db-name</code></td>
+      <td><code>goiabada</code></td>
+      <td>Database name</td>
+    </tr>
+    <tr>
+      <td style="white-space: nowrap;"><code>GOIABADA_DB_CREATE</code><br/><code>--db-create</code></td>
+      <td><code>true</code></td>
+      <td>Create the database if it does not exist (server engines only). Set to <code>false</code> for a <a href="/production-deployment/database/">pre-created database</a></td>
+    </tr>
+    <tr>
+      <td style="white-space: nowrap;"><code>GOIABADA_DB_DSN</code><br/><code>--db-dsn</code></td>
+      <td><code>file::memory:</code></td>
+      <td>SQLite DSN (only for sqlite)</td>
+    </tr>
+  </tbody>
+</table>
+
+<Aside type="tip">
+For SQLite with a file, use: `file:/path/to/goiabada.db?_pragma=busy_timeout=5000&_pragma=journal_mode=WAL`
+
+- **busy_timeout=5000**: Waits up to 5 seconds when the database is locked by another connection, instead of failing immediately. Essential for handling concurrent requests.
+- **journal_mode=WAL**: Enables Write-Ahead Logging, which allows concurrent reads while writing and improves performance. Without WAL, readers block writers and vice versa.
+</Aside>
+
+### Network configuration
+
+The **base URL** is the public URL users see in their browser. The **internal base URL** is used by the admin console for server-to-server API calls. In containerized environments, internal URLs bypass external DNS/proxies for faster, more reliable communication (e.g., `http://goiabada-authserver:9090` instead of `https://auth.example.com`).
+
+These variables are read by **both applications**: the auth server uses them for JWT issuer and seeding, while the admin console uses them to connect to the auth server.
+
+<table>
+  <thead>
+    <tr>
+      <th style="white-space: nowrap;">Variable / Flag</th>
+      <th>Default</th>
+      <th>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style="white-space: nowrap;"><code>GOIABADA_AUTHSERVER_BASEURL</code><br/><code>--authserver-baseurl</code></td>
+      <td><code>http://localhost:9090</code></td>
+      <td>Public URL (used for JWT issuer, browser redirects). An <code>https://</code> value also enables the <code>Secure</code> flag on cookies automatically (there is no separate cookie-secure setting).</td>
+    </tr>
+    <tr>
+      <td style="white-space: nowrap;"><code>GOIABADA_AUTHSERVER_INTERNALBASEURL</code><br/><code>--authserver-internalbaseurl</code></td>
+      <td><em>(empty)</em></td>
+      <td>Internal URL used by admin console for API calls (if empty, uses base URL)</td>
+    </tr>
+    <tr>
+      <td style="white-space: nowrap;"><code>GOIABADA_AUTHSERVER_LISTEN_HOST_HTTP</code><br/><code>--authserver-listen-host-http</code></td>
+      <td><code>0.0.0.0</code></td>
+      <td>HTTP bind address. <code>0.0.0.0</code> = all interfaces, IPv4 and IPv6 alike; <code>127.0.0.1</code> or <code>::1</code> = loopback only, for that one address family. An IPv6 address may be written with or without brackets (<code>::1</code> or <code>[::1]</code>). See <a href="#listen-addresses-and-ipv6">Listen addresses and IPv6</a></td>
+    </tr>
+    <tr>
+      <td style="white-space: nowrap;"><code>GOIABADA_AUTHSERVER_LISTEN_PORT_HTTP</code><br/><code>--authserver-listen-port-http</code></td>
+      <td><code>9090</code></td>
+      <td>HTTP port</td>
+    </tr>
+    <tr>
+      <td style="white-space: nowrap;"><code>GOIABADA_AUTHSERVER_LISTEN_HOST_HTTPS</code><br/><code>--authserver-listen-host-https</code></td>
+      <td><code>0.0.0.0</code></td>
+      <td>HTTPS bind address. <code>0.0.0.0</code> = all interfaces, IPv4 and IPv6 alike; <code>127.0.0.1</code> or <code>::1</code> = loopback only, for that one address family. An IPv6 address may be written with or without brackets (<code>::1</code> or <code>[::1]</code>). See <a href="#listen-addresses-and-ipv6">Listen addresses and IPv6</a></td>
+    </tr>
+    <tr>
+      <td style="white-space: nowrap;"><code>GOIABADA_AUTHSERVER_LISTEN_PORT_HTTPS</code><br/><code>--authserver-listen-port-https</code></td>
+      <td><code>9443</code></td>
+      <td>HTTPS port</td>
+    </tr>
+  </tbody>
+</table>
+
+### Listen addresses and IPv6
+
+A listen host is an address on this machine, not the public URL: browsers and clients reach the server through `GOIABADA_AUTHSERVER_BASEURL` and `GOIABADA_ADMINCONSOLE_BASEURL`, and the listen hosts only decide which of this machine's addresses accept connections.
+
+- **`0.0.0.0`, the default, already serves IPv6.** Goiabada opens one socket from it that accepts both IPv4 and IPv6 connections, and `::` means the same thing. On a host with IPv6 switched off it quietly serves IPv4 alone.
+- **A specific address serves only its own family.** `127.0.0.1` accepts no IPv6 connection and `::1` no IPv4 one. A hostname such as `localhost` binds only the first address it resolves to, so prefer a literal address.
+- **Write an IPv6 address bare, as `::1` or `2001:db8::10`.** Brackets are accepted too (`[::1]`) and mean the same address. A link-local address takes its zone: `fe80::1%eth0`.
+
+### Security settings
+
+<table>
+  <thead>
+    <tr>
+      <th style="white-space: nowrap;">Variable / Flag</th>
+      <th>Default</th>
+      <th>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style="white-space: nowrap;"><code>GOIABADA_AUTHSERVER_CERTFILE</code><br/><code>--authserver-certfile</code></td>
+      <td><em>(empty)</em></td>
+      <td>TLS certificate path (only needed for direct HTTPS without a reverse proxy)</td>
+    </tr>
+    <tr>
+      <td style="white-space: nowrap;"><code>GOIABADA_AUTHSERVER_KEYFILE</code><br/><code>--authserver-keyfile</code></td>
+      <td><em>(empty)</em></td>
+      <td>TLS private key path (only needed for direct HTTPS without a reverse proxy)</td>
+    </tr>
+    <tr>
+      <td style="white-space: nowrap;"><code>GOIABADA_AUTHSERVER_TRUST_PROXY_HEADERS</code><br/><code>--authserver-trust-proxy-headers</code></td>
+      <td><code>false</code></td>
+      <td>Trust <code>X-Forwarded-For</code> / <code>X-Real-IP</code> from a reverse proxy when resolving the client IP (used for rate limiting and audit logging). Leave <code>false</code> when there is no proxy. See also <code>TRUSTED_PROXIES</code>.</td>
+    </tr>
+    <tr>
+      <td style="white-space: nowrap;"><code>GOIABADA_AUTHSERVER_TRUSTED_PROXIES</code><br/><code>--authserver-trusted-proxies</code></td>
+      <td><em>(empty)</em></td>
+      <td>Comma-separated reverse-proxy IPs/CIDRs, e.g. <code>10.0.0.0/8,192.168.1.5</code>. When set (with <code>TRUST_PROXY_HEADERS=true</code>), the real client IP is resolved by walking <code>X-Forwarded-For</code> from the right across these trusted hops, which prevents IP spoofing behind multiple proxies or a CDN. When empty, a single proxy hop is trusted. An entry that is neither an IP address nor a CIDR range stops the server at startup, whatever <code>TRUST_PROXY_HEADERS</code> says.</td>
+    </tr>
+    <tr>
+      <td style="white-space: nowrap;"><code>GOIABADA_AUTHSERVER_SESSION_AUTHENTICATION_KEY</code></td>
+      <td><em>(empty)</em></td>
+      <td>64-byte hex key (see <a href="#session-keys">Session keys</a>)</td>
+    </tr>
+    <tr>
+      <td style="white-space: nowrap;"><code>GOIABADA_AUTHSERVER_SESSION_ENCRYPTION_KEY</code></td>
+      <td><em>(empty)</em></td>
+      <td>32-byte hex key (see <a href="#session-keys">Session keys</a>)</td>
+    </tr>
+    <tr>
+      <td style="white-space: nowrap;"><code>GOIABADA_AUTHSERVER_SESSION_AUTHENTICATION_KEY_PREVIOUS</code></td>
+      <td><em>(empty)</em></td>
+      <td>Optional. Set to the old 64-byte hex key, together with its encryption-key twin, only while <a href="#rotating-the-session-keys">rotating</a> the session keys. Remove once the maximum session lifetime has passed.</td>
+    </tr>
+    <tr>
+      <td style="white-space: nowrap;"><code>GOIABADA_AUTHSERVER_SESSION_ENCRYPTION_KEY_PREVIOUS</code></td>
+      <td><em>(empty)</em></td>
+      <td>Optional. Set to the old 32-byte hex key, together with its authentication-key twin, only while <a href="#rotating-the-session-keys">rotating</a> the session keys. Remove once the maximum session lifetime has passed.</td>
+    </tr>
+    <tr>
+      <td style="white-space: nowrap;"><code>GOIABADA_AES_ENCRYPTION_KEY</code></td>
+      <td><em>(empty)</em></td>
+      <td><strong>Required.</strong> 32-byte hex key that encrypts secrets at rest in the database (see <a href="#data-at-rest-encryption-key">Data-at-rest encryption key</a>). Auth server only; not needed by the admin console.</td>
+    </tr>
+    <tr>
+      <td style="white-space: nowrap;"><code>GOIABADA_AES_ENCRYPTION_KEY_PREVIOUS</code></td>
+      <td><em>(empty)</em></td>
+      <td>Optional. Set to the old 32-byte hex key only while <a href="#rotating-the-key">rotating</a> <code>GOIABADA_AES_ENCRYPTION_KEY</code>; the auth server re-encrypts data from it to the current key at startup. Remove after rotation. Auth server only.</td>
+    </tr>
+    <tr>
+      <td style="white-space: nowrap;"><code>GOIABADA_AUTHSERVER_RATELIMITER_ENABLED</code><br/><code>--authserver-ratelimiter-enabled</code></td>
+      <td><code>false</code></td>
+      <td>Enable built-in rate limiting (see details below)</td>
+    </tr>
+  </tbody>
+</table>
+
+<Aside type="tip" title="Rate limiting details">
+When enabled, Goiabada applies rate limits to security-sensitive endpoints:
+
+| Endpoint | Limit | Counts | Key |
+|----------|-------|--------|-----|
+| `POST /auth/pwd` (password login) | 10 / 15min | failed sign-ins | IP address (IPv6 grouped by /64) + email (lowercased) |
+| `POST /auth/pwd` (password login) | 100 / 60min | failed sign-ins | email (lowercased) |
+| `POST /auth/pwd` (password login) | 30 / min | every request | IP address (IPv6 grouped by /64) |
+| `POST /auth/otp` (OTP verification) | 5 / 15min | failed codes | user ID |
+| `POST /api/v1/account/email/verification` | 5 / 15min | failed codes | access token subject |
+| `PUT /api/v1/account/password` | 5 / 15min | failed passwords | access token subject, shared with `PUT /api/v1/account/otp` |
+| `PUT /api/v1/account/otp` | 5 / 15min | failed passwords | access token subject, shared with `PUT /api/v1/account/password` |
+| `POST /forgot-password` | 5 / 5min | every request | email (lowercased) |
+| `POST /forgot-password` | 20 / 5min | every request | IP address (IPv6 grouped by /64) |
+| `GET` and `POST /reset-password` | 30 / 5min | every request | IP address (IPv6 grouped by /64) |
+| `POST /account/register` (self-registration) | 20 / 5min | every request | IP address (IPv6 grouped by /64) |
+| `GET /account/activate` | 20 / 5min | every request | IP address (IPv6 grouped by /64) |
+| `POST /connect/register` (DCR) | 10 / min | every request | IP address (IPv6 grouped by /64) |
+| `POST /auth/token` (ROPC grant) | 10 / 15min | failed sign-ins | IP address (IPv6 grouped by /64) + username (lowercased), shared with `POST /auth/pwd` |
+| `POST /auth/token` (ROPC grant) | 100 / 60min | failed sign-ins | username (lowercased), shared with `POST /auth/pwd` |
+| `POST /auth/token` (ROPC grant) | 30 / min | every request | IP address (IPv6 grouped by /64) |
+
+A limit that counts failures is not spent by a successful sign-in, so signing in normally never uses it up.
+
+Shared means one budget, not two of the same size: a wrong password counts the same whether it arrives at the login form or at the password grant.
+
+Counters are held in the process, so a deployment running several replicas multiplies every budget by the replica count and resets them on deploy.
+
+You can also implement rate limiting at the infrastructure level (reverse proxy, CDN, cloud WAF) for more flexibility.
+</Aside>
+
+### Customization
+
+See [Customizations](/reference/customizations/) for details on how to customize templates and static files.
+
+<table>
+  <thead>
+    <tr>
+      <th style="white-space: nowrap;">Variable / Flag</th>
+      <th>Default</th>
+      <th>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style="white-space: nowrap;"><code>GOIABADA_AUTHSERVER_STATICDIR</code><br/><code>--authserver-staticdir</code></td>
+      <td><em>(empty)</em></td>
+      <td>Custom static files directory</td>
+    </tr>
+    <tr>
+      <td style="white-space: nowrap;"><code>GOIABADA_AUTHSERVER_TEMPLATEDIR</code><br/><code>--authserver-templatedir</code></td>
+      <td><em>(empty)</em></td>
+      <td>Custom templates directory</td>
+    </tr>
+    <tr>
+      <td style="white-space: nowrap;"><code>GOIABADA_PROFILE_PICTURE_MAX_SIZE_BYTES</code></td>
+      <td><code>3145728</code></td>
+      <td>Largest profile picture or client logo the API accepts, in bytes. The admin console's upload form stops at 3 MB whatever this is set to.</td>
+    </tr>
+    <tr>
+      <td style="white-space: nowrap;"><code>GOIABADA_I18N_OVERRIDES_DIR</code></td>
+      <td><em>(empty)</em></td>
+      <td>Directory of override message catalogs. Set on both servers. See <a href="/concepts/localization/">Localization</a>.</td>
+    </tr>
+  </tbody>
+</table>
+
+### Logging
+
+<table>
+  <thead>
+    <tr>
+      <th style="white-space: nowrap;">Variable / Flag</th>
+      <th>Default</th>
+      <th>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style="white-space: nowrap;"><code>GOIABADA_AUTHSERVER_LOG_HTTP_REQUESTS</code><br/><code>--authserver-log-http-requests</code></td>
+      <td><code>false</code></td>
+      <td>Log HTTP requests, one record per request on the application log (stderr), apart from health checks, static assets and the favicon. Query parameter values are redacted apart from a short assessed-safe list, and the query is re-encoded rather than copied. See <a href="/reference/security/">Security</a>.</td>
+    </tr>
+    <tr>
+      <td style="white-space: nowrap;"><code>GOIABADA_AUTHSERVER_LOG_LEVEL</code><br/><code>--authserver-log-level</code></td>
+      <td><code>info</code></td>
+      <td>Lowest level of log record written. One of <code>debug</code>, <code>info</code>, <code>warn</code> or <code>error</code>, spelled in lowercase; anything else refuses startup. <code>debug</code> adds per-request tracing.</td>
+    </tr>
+    <tr>
+      <td style="white-space: nowrap;"><code>GOIABADA_AUTHSERVER_LOG_FORMAT</code><br/><code>--authserver-log-format</code></td>
+      <td><code>text</code></td>
+      <td>Shape of each log record: <code>text</code> for one <code>key=value</code> line, or <code>json</code> for one JSON document. Anything else refuses startup.</td>
+    </tr>
+    <tr>
+      <td style="white-space: nowrap;"><code>GOIABADA_AUTHSERVER_LOG_SQL</code><br/><code>--authserver-log-sql</code></td>
+      <td><code>false</code></td>
+      <td>Log SQL statements, one record per statement carrying the statement text. The values bound to it are not written, so a query is identifiable but the data it ran with is not.</td>
+    </tr>
+    <tr>
+      <td style="white-space: nowrap;"><code>GOIABADA_AUTHSERVER_DEBUG_API_REQUESTS</code><br/><code>--authserver-debug-api-requests</code></td>
+      <td><code>false</code></td>
+      <td>Verbose API logging, one record per exchange carrying the method, target, status, duration and both bodies. Credential fields in the bodies and the <code>Authorization</code> header are redacted. See <a href="/reference/security/">Security</a>.</td>
+    </tr>
+  </tbody>
+</table>
+
+### Bootstrap
+
+There are two ways to bootstrap Goiabada:
+
+**Recommended: Single-step bootstrap** using `GOIABADA_ADMINCONSOLE_OAUTH_CLIENT_SECRET`. Pre-generate credentials (e.g., using `goiabada-setup`) and provide them to both services. The auth server seeds the database and continues running normally.
+
+**Legacy: Two-step bootstrap** using `GOIABADA_AUTHSERVER_BOOTSTRAP_ENV_OUTFILE`. The auth server generates credentials, writes them to a file, and exits. You then copy the credentials to your configuration and restart. This approach requires manual intervention between steps.
+
+<table>
+  <thead>
+    <tr>
+      <th style="white-space: nowrap;">Variable / Flag</th>
+      <th>Default</th>
+      <th>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style="white-space: nowrap;"><code>GOIABADA_ADMINCONSOLE_OAUTH_CLIENT_SECRET</code><br/><code>--adminconsole-oauth-client-secret</code></td>
+      <td><em>(empty)</em></td>
+      <td><strong>Recommended.</strong> Pre-generated OAuth secret for single-step bootstrap (see note below)</td>
+    </tr>
+    <tr>
+      <td style="white-space: nowrap;"><code>GOIABADA_AUTHSERVER_BOOTSTRAP_ENV_OUTFILE</code><br/><code>--authserver-bootstrap-env-outfile</code></td>
+      <td><em>(empty)</em></td>
+      <td>Legacy two-step bootstrap: path where auth server writes generated credentials before exiting</td>
+    </tr>
+  </tbody>
+</table>
+
+<Aside type="note" title="Understanding GOIABADA_ADMINCONSOLE_OAUTH_CLIENT_SECRET">
+This variable serves different purposes depending on which application reads it:
+
+**On auth server (seeding only):** When the auth server starts for the first time and seeds the database, it creates an OAuth client for the admin console. If this variable is set, the auth server uses its value as the client secret. After the initial database seed, this variable is no longer needed by the auth server and can be removed from its configuration.
+
+**On admin console (runtime):** The admin console uses this secret to authenticate with the auth server via OAuth2. It needs this credential to obtain access tokens and make API calls to manage users, clients, and other resources. This variable must remain configured for the admin console to function.
+
+**Both applications must have the same value** during initial setup. The setup wizard automatically generates a matching secret for both.
+</Aside>
+
+---
+
+## Admin console variables
+
+### Network configuration
+
+<table>
+  <thead>
+    <tr>
+      <th style="white-space: nowrap;">Variable / Flag</th>
+      <th>Default</th>
+      <th>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style="white-space: nowrap;"><code>GOIABADA_ADMINCONSOLE_BASEURL</code><br/><code>--adminconsole-baseurl</code></td>
+      <td><code>http://localhost:9091</code></td>
+      <td>Public URL. An <code>https://</code> value also enables the <code>Secure</code> flag on cookies automatically (there is no separate cookie-secure setting).</td>
+    </tr>
+    <tr>
+      <td style="white-space: nowrap;"><code>GOIABADA_ADMINCONSOLE_LISTEN_HOST_HTTP</code><br/><code>--adminconsole-listen-host-http</code></td>
+      <td><code>0.0.0.0</code></td>
+      <td>HTTP bind address. <code>0.0.0.0</code> = all interfaces, IPv4 and IPv6 alike; <code>127.0.0.1</code> or <code>::1</code> = loopback only, for that one address family. An IPv6 address may be written with or without brackets (<code>::1</code> or <code>[::1]</code>). See <a href="#listen-addresses-and-ipv6">Listen addresses and IPv6</a></td>
+    </tr>
+    <tr>
+      <td style="white-space: nowrap;"><code>GOIABADA_ADMINCONSOLE_LISTEN_PORT_HTTP</code><br/><code>--adminconsole-listen-port-http</code></td>
+      <td><code>9091</code></td>
+      <td>HTTP port</td>
+    </tr>
+    <tr>
+      <td style="white-space: nowrap;"><code>GOIABADA_ADMINCONSOLE_LISTEN_HOST_HTTPS</code><br/><code>--adminconsole-listen-host-https</code></td>
+      <td><code>0.0.0.0</code></td>
+      <td>HTTPS bind address. <code>0.0.0.0</code> = all interfaces, IPv4 and IPv6 alike; <code>127.0.0.1</code> or <code>::1</code> = loopback only, for that one address family. An IPv6 address may be written with or without brackets (<code>::1</code> or <code>[::1]</code>). See <a href="#listen-addresses-and-ipv6">Listen addresses and IPv6</a></td>
+    </tr>
+    <tr>
+      <td style="white-space: nowrap;"><code>GOIABADA_ADMINCONSOLE_LISTEN_PORT_HTTPS</code><br/><code>--adminconsole-listen-port-https</code></td>
+      <td><code>9444</code></td>
+      <td>HTTPS port</td>
+    </tr>
+  </tbody>
+</table>
+
+### OAuth settings
+
+The admin console authenticates with the auth server using OAuth2 to access its APIs.
+
+<table>
+  <thead>
+    <tr>
+      <th style="white-space: nowrap;">Variable / Flag</th>
+      <th>Default</th>
+      <th>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style="white-space: nowrap;"><code>GOIABADA_ADMINCONSOLE_OAUTH_CLIENT_SECRET</code><br/><code>--adminconsole-oauth-client-secret</code></td>
+      <td><em>(empty)</em></td>
+      <td><strong>Required.</strong> OAuth client secret (must match auth server config, see <a href="#bootstrap">Bootstrap</a>)</td>
+    </tr>
+  </tbody>
+</table>
+
+### Auth server connection
+
+The admin console needs to know where the auth server is located. See [Network configuration](#network-configuration) for details on these variables - they are shared between both applications.
+
+<table>
+  <thead>
+    <tr>
+      <th style="white-space: nowrap;">Variable / Flag</th>
+      <th>Default</th>
+      <th>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style="white-space: nowrap;"><code>GOIABADA_AUTHSERVER_BASEURL</code><br/><code>--authserver-baseurl</code></td>
+      <td><code>http://localhost:9090</code></td>
+      <td>Public URL (used for browser redirects, JWT issuer validation)</td>
+    </tr>
+    <tr>
+      <td style="white-space: nowrap;"><code>GOIABADA_AUTHSERVER_INTERNALBASEURL</code><br/><code>--authserver-internalbaseurl</code></td>
+      <td><em>(empty)</em></td>
+      <td>Internal URL for API calls (if empty, uses base URL)</td>
+    </tr>
+  </tbody>
+</table>
+
+### Security settings
+
+<table>
+  <thead>
+    <tr>
+      <th style="white-space: nowrap;">Variable / Flag</th>
+      <th>Default</th>
+      <th>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style="white-space: nowrap;"><code>GOIABADA_ADMINCONSOLE_CERTFILE</code><br/><code>--adminconsole-certfile</code></td>
+      <td><em>(empty)</em></td>
+      <td>TLS certificate path (only needed for direct HTTPS without a reverse proxy)</td>
+    </tr>
+    <tr>
+      <td style="white-space: nowrap;"><code>GOIABADA_ADMINCONSOLE_KEYFILE</code><br/><code>--adminconsole-keyfile</code></td>
+      <td><em>(empty)</em></td>
+      <td>TLS private key path (only needed for direct HTTPS without a reverse proxy)</td>
+    </tr>
+    <tr>
+      <td style="white-space: nowrap;"><code>GOIABADA_ADMINCONSOLE_TRUST_PROXY_HEADERS</code><br/><code>--adminconsole-trust-proxy-headers</code></td>
+      <td><code>false</code></td>
+      <td>Trust <code>X-Forwarded-For</code> / <code>X-Real-IP</code> from a reverse proxy when resolving the client IP (used for audit logging). Leave <code>false</code> when there is no proxy. See also <code>TRUSTED_PROXIES</code>.</td>
+    </tr>
+    <tr>
+      <td style="white-space: nowrap;"><code>GOIABADA_ADMINCONSOLE_TRUSTED_PROXIES</code><br/><code>--adminconsole-trusted-proxies</code></td>
+      <td><em>(empty)</em></td>
+      <td>Comma-separated reverse-proxy IPs/CIDRs, e.g. <code>10.0.0.0/8,192.168.1.5</code>. When set (with <code>TRUST_PROXY_HEADERS=true</code>), the real client IP is resolved by walking <code>X-Forwarded-For</code> from the right across these trusted hops, which prevents IP spoofing behind multiple proxies or a CDN. When empty, a single proxy hop is trusted. An entry that is neither an IP address nor a CIDR range stops the server at startup, whatever <code>TRUST_PROXY_HEADERS</code> says.</td>
+    </tr>
+    <tr>
+      <td style="white-space: nowrap;"><code>GOIABADA_ADMINCONSOLE_SESSION_AUTHENTICATION_KEY</code></td>
+      <td><em>(empty)</em></td>
+      <td>64-byte hex key (see <a href="#session-keys">Session keys</a>)</td>
+    </tr>
+    <tr>
+      <td style="white-space: nowrap;"><code>GOIABADA_ADMINCONSOLE_SESSION_ENCRYPTION_KEY</code></td>
+      <td><em>(empty)</em></td>
+      <td>32-byte hex key (see <a href="#session-keys">Session keys</a>)</td>
+    </tr>
+    <tr>
+      <td style="white-space: nowrap;"><code>GOIABADA_ADMINCONSOLE_SESSION_AUTHENTICATION_KEY_PREVIOUS</code></td>
+      <td><em>(empty)</em></td>
+      <td>Optional. Set to the old 64-byte hex key, together with its encryption-key twin, only while <a href="#rotating-the-session-keys">rotating</a> the session keys. Remove once the maximum session lifetime has passed.</td>
+    </tr>
+    <tr>
+      <td style="white-space: nowrap;"><code>GOIABADA_ADMINCONSOLE_SESSION_ENCRYPTION_KEY_PREVIOUS</code></td>
+      <td><em>(empty)</em></td>
+      <td>Optional. Set to the old 32-byte hex key, together with its authentication-key twin, only while <a href="#rotating-the-session-keys">rotating</a> the session keys. Remove once the maximum session lifetime has passed.</td>
+    </tr>
+  </tbody>
+</table>
+
+### Customization
+
+See [Customizations](/reference/customizations/) for details on how to customize templates and static files.
+
+<table>
+  <thead>
+    <tr>
+      <th style="white-space: nowrap;">Variable / Flag</th>
+      <th>Default</th>
+      <th>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style="white-space: nowrap;"><code>GOIABADA_ADMINCONSOLE_STATICDIR</code><br/><code>--adminconsole-staticdir</code></td>
+      <td><em>(empty)</em></td>
+      <td>Custom static files</td>
+    </tr>
+    <tr>
+      <td style="white-space: nowrap;"><code>GOIABADA_ADMINCONSOLE_TEMPLATEDIR</code><br/><code>--adminconsole-templatedir</code></td>
+      <td><em>(empty)</em></td>
+      <td>Custom templates</td>
+    </tr>
+    <tr>
+      <td style="white-space: nowrap;"><code>GOIABADA_I18N_OVERRIDES_DIR</code></td>
+      <td><em>(empty)</em></td>
+      <td>Directory of override message catalogs. Set on both servers. See <a href="/concepts/localization/">Localization</a>.</td>
+    </tr>
+  </tbody>
+</table>
+
+### Logging
+
+<table>
+  <thead>
+    <tr>
+      <th style="white-space: nowrap;">Variable / Flag</th>
+      <th>Default</th>
+      <th>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style="white-space: nowrap;"><code>GOIABADA_ADMINCONSOLE_LOG_HTTP_REQUESTS</code><br/><code>--adminconsole-log-http-requests</code></td>
+      <td><code>false</code></td>
+      <td>Log HTTP requests, one record per request on the application log (stderr), apart from health checks, static assets and the favicon. Query parameter values are redacted apart from a short assessed-safe list, and the query is re-encoded rather than copied. See <a href="/reference/security/">Security</a>.</td>
+    </tr>
+    <tr>
+      <td style="white-space: nowrap;"><code>GOIABADA_ADMINCONSOLE_LOG_LEVEL</code><br/><code>--adminconsole-log-level</code></td>
+      <td><code>info</code></td>
+      <td>Lowest level of log record written. One of <code>debug</code>, <code>info</code>, <code>warn</code> or <code>error</code>, spelled in lowercase; anything else refuses startup. <code>debug</code> adds per-request tracing.</td>
+    </tr>
+    <tr>
+      <td style="white-space: nowrap;"><code>GOIABADA_ADMINCONSOLE_LOG_FORMAT</code><br/><code>--adminconsole-log-format</code></td>
+      <td><code>text</code></td>
+      <td>Shape of each log record: <code>text</code> for one <code>key=value</code> line, or <code>json</code> for one JSON document. Anything else refuses startup.</td>
+    </tr>
+  </tbody>
+</table>
+
+---
+
+## Session keys
+
+Both applications require session keys for cookie security in production.
+
+### Generate keys
+
+```bash
+# Authentication key (64 bytes = 128 hex characters)
+openssl rand -hex 64
+
+# Encryption key (32 bytes = 64 hex characters)
+openssl rand -hex 32
+```
+
+### Key purposes
+
+- **Authentication key** (64 bytes): seals the cookie and stored session
+- **Encryption key** (32 bytes): the same; both are needed
+
+<Aside type="caution">
+Never use plain text passwords or example keys. Always generate fresh cryptographic keys for each deployment.
+</Aside>
+
+### Rotating the session keys
+
+To change the session keys, move each application's current pair into the four `_PREVIOUS` variables, set the four current variables to freshly generated keys, then restart both applications. Each seals new sessions with the new pair and still opens sessions sealed under the previous one, so nobody is signed out. Remove the `_PREVIOUS` variables once the maximum session lifetime has passed, after which every signed-in session is sealed under the new pair. A sign-in in progress is not, so removing them may restart one. Skip them entirely and everybody signs in again once.
+
+---
+
+## Data-at-rest encryption key
+
+The **auth server** requires `GOIABADA_AES_ENCRYPTION_KEY`. It is a hex-encoded 32-byte key used to encrypt sensitive values before they are written to the database. The **admin console does not use it** (it has no direct database access and delegates to the auth server API), so set it on the auth server only.
+
+### Generate the key
+
+```bash
+# 32 bytes = 64 hex characters
+openssl rand -hex 32
+```
+
+### What it protects
+
+The key encrypts secrets at rest, including:
+
+- Client secrets
+- SMTP and SMS provider credentials
+- Email and phone verification codes
+- OTP (2FA) seeds
+- RSA signing keys used to sign tokens
+
+<Aside type="danger" title="Back up this key separately from the database">
+Store `GOIABADA_AES_ENCRYPTION_KEY` in a secure location that is **separate from your database backups**. If this key is lost, every encrypted secret and signing key becomes permanently unrecoverable. There is no way to decrypt the data without it.
+</Aside>
+
+### Rotating the key
+
+**Rotating to a new key.** To change the key later, set `GOIABADA_AES_ENCRYPTION_KEY` to the new key and `GOIABADA_AES_ENCRYPTION_KEY_PREVIOUS` to the old key, then restart the auth server. At startup it detects that the data is still encrypted under the previous key and re-encrypts everything to the new key (a single transaction). The operation is idempotent, so it is safe to leave `GOIABADA_AES_ENCRYPTION_KEY_PREVIOUS` set across restarts, but you should remove it once the rotation is confirmed. If the data decrypts under neither key, the auth server refuses to start rather than risk corrupting it.
+
+---
+
+## Architecture note (v1.2+)
+
+Since version 1.2, only the **auth server accesses the database directly**. The admin console communicates with the auth server via HTTP APIs using OAuth2 authentication.
+
+This means:
+- Database variables (`GOIABADA_DB_*`) are only used by the auth server
+- The admin console requires OAuth credentials to authenticate with the auth server
+- The admin console does not need database configuration

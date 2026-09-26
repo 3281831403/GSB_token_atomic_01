@@ -1,0 +1,47 @@
+-- Self-registered clients require consent (#108).
+--
+-- created_via_dcr records that a client registered itself through /connect/register
+-- rather than being created by an administrator. It is the enforced form of what the
+-- dcr_ identifier prefix only suggests: an administrator can name a client
+-- "dcr_anything", so the prefix cannot be trusted as a provenance test. Everything
+-- that asks "did this client vouch for itself" reads this column instead.
+--
+-- The backfill sets consent_required as well as the marker, and that is deliberate.
+-- Every client that registered itself before this migration was stamped
+-- ConsentRequired: false at creation, so without the backfill those clients keep
+-- issuing codes with no consent screen forever, in exactly the deployments that
+-- enabled dynamic registration. A forward-looking-only fix would leave the defect
+-- standing where it has already been exploited.
+--
+-- The prefix can miss, in one supported way, and this is the known limit of the
+-- backfill rather than an oversight. Every client created through /connect/register
+-- is given the prefix, but until this release an administrator could rename any
+-- client through the admin console, and a self-registered client renamed before the
+-- upgrade no longer matches here. It keeps created_via_dcr = 0 and consent_required
+-- = 0, which is the defect this migration exists to remove, and an operator has to
+-- tick "Consent required" on it by hand. Reaching that state needs an authenticated
+-- administrator to have renamed it first, so nothing an outsider can steer, and the
+-- alternatives were worse: no other column distinguishes a self-registered client,
+-- so a broader rule turns consent on for administrator-created clients too, and an
+-- audit-assisted pass recovers only registrations inside the 180-day default
+-- retention, which starts after audit rows began being persisted in 2026-02-11 and
+-- so misses most of the affected window anyway. The client update API blocks the
+-- rename from this release on, so the gap cannot widen (#108, decision 16).
+--
+-- The other direction is a false positive, an administrator who named a client
+-- dcr_something by hand, and that costs one unnecessary consent screen which the
+-- per-client consent toggle in the admin console turns off.
+--
+-- ESCAPE '!' , never ESCAPE '\' : the backslash escapes the closing quote inside a
+-- MySQL string literal, so that spelling is a syntax error on MySQL and parses fine
+-- on the other three, which is how it would reach a release. Without any escape at
+-- all, `_` is a single-character wildcard and LIKE 'dcr_%' also matches "dcrX9999"
+-- on all four engines. Both confirmed by running them on all four.
+--
+-- The down migration drops the column and leaves consent_required as this backfill
+-- set it. The reverse direction is "make these clients silently grantable again",
+-- which is the defect, so the loss is accepted rather than worked around.
+ALTER TABLE clients ADD COLUMN created_via_dcr numeric NOT NULL DEFAULT 0;
+
+UPDATE clients SET created_via_dcr = 1, consent_required = 1
+ WHERE client_identifier LIKE 'dcr!_%' ESCAPE '!';

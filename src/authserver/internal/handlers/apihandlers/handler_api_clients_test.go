@@ -1,0 +1,593 @@
+package apihandlers
+
+import (
+	"bytes"
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/leodip/goiabada/authserver/internal/audit"
+	mocks_audit "github.com/leodip/goiabada/authserver/internal/audit/mocks"
+	mocks_data "github.com/leodip/goiabada/authserver/internal/data/mocks"
+	"github.com/leodip/goiabada/authserver/internal/models"
+	"github.com/leodip/goiabada/core/api"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
+)
+
+// This file did not exist before #245's final review. Its subject is one property that no other
+// tier can observe: which copy of the client row a write decides against.
+//
+// Every one of these endpoints loads the client at the top of the request and writes it back with
+// UpdateClient, which projects every mutable column. The copy it holds is therefore a snapshot,
+// and between the load and the write another request can change the row underneath it. Nothing
+// reachable over HTTP can produce that gap on its own, because each request reloads; the seam
+// where it is visible is the handler's own conversation with the database, which is exactly what
+// a strict mock reproduces. Final review finding 1.
+
+// clientUpdateTx is the transaction the mocked database hands back, matched by identity so a
+// write that reached a different one, or nil, fails.
+var clientUpdateTx = &sql.Tx{}
+
+// authenticationPutRequest builds the PUT with its chi URL parameter and body.
+func authenticationPutRequest(t *testing.T, id string, req api.UpdateClientAuthenticationRequest) *http.Request {
+	t.Helper()
+	body, err := json.Marshal(req)
+	require.NoError(t, err)
+	r := httptest.NewRequest(http.MethodPut, "/api/v1/admin/clients/"+id+"/authentication", bytes.NewReader(body))
+	return setChiURLParam(r, "id", id)
+}
+
+// stubClientResponseLoads registers the two related-field loads every client handler performs
+// before it encodes its response. They carry nothing this file asserts on.
+func stubClientResponseLoads(database *mocks_data.Database) {
+	database.On("ClientLoadRedirectURIs", mock.Anything, (*sql.Tx)(nil), mock.Anything).Return(nil).Once()
+	database.On("ClientLoadWebOrigins", mock.Anything, (*sql.Tx)(nil), mock.Anything).Return(nil).Once()
+}
+
+// =============================================================================
+// updateClientNotOwningAuthenticationMode
+// =============================================================================
+
+// TestUpdateClientNotOwningAuthenticationMode_TakesTheModeFromTheRowNotTheCaller is the whole
+// point of the helper. It is handed a client that says public with no secret, which is what a
+// stale snapshot looks like, and the row says confidential with a secret. What must reach
+// UpdateClient is the row's answer, because none of the three endpoints using this helper is
+// allowed to change how the client authenticates.
+//
+// Getting this wrong is not a tidy-up: the write would restore public mode and delete a secret an
+// administrator had just set, and no revocation runs on this path, so the client's outstanding
+// grants would stay redeemable with nothing presented.
+func TestUpdateClientNotOwningAuthenticationMode_TakesTheModeFromTheRowNotTheCaller(t *testing.T) {
+	database := mocks_data.NewDatabase(t)
+
+	secret := []byte("the-secret-another-request-just-set")
+	mocks_data.ExpectRunInTransaction(database, clientUpdateTx)
+	database.On("AcquireClientRow", mock.Anything, clientUpdateTx, int64(7)).Return(nil).Once()
+	database.On("GetClientById", mock.Anything, clientUpdateTx, int64(7)).
+		Return(&models.Client{Id: 7, IsPublic: false, ClientSecretEncrypted: secret}, nil).Once()
+	var written *models.Client
+	database.On("UpdateClient", mock.Anything, clientUpdateTx, mock.Anything).
+		Run(func(args mock.Arguments) { written = args.Get(2).(*models.Client) }).Return(nil).Once()
+
+	stale := &models.Client{Id: 7, IsPublic: true, ClientSecretEncrypted: nil, Description: "edited"}
+	require.NoError(t, updateClientNotOwningAuthenticationMode(context.Background(), database, stale))
+
+	require.NotNil(t, written)
+	assert.False(t, written.IsPublic, "the write must carry the row's authentication mode")
+	assert.Equal(t, secret, written.ClientSecretEncrypted, "the write must not delete a newer secret")
+	// The field this endpoint does own still lands, or the helper would be protecting the row by
+	// discarding the request.
+	assert.Equal(t, "edited", written.Description)
+
+	// The read is inside the transaction that writes. Reading it before RunInTransaction, which
+	// the mock records at entry before the body runs, would leave exactly the gap this helper
+	// exists to close.
+	assert.Less(t, callIndex(t, database, "RunInTransaction"), callIndex(t, database, "GetClientById"))
+	assert.Less(t, callIndex(t, database, "GetClientById"), callIndex(t, database, "UpdateClient"))
+
+	// And the row is taken BEFORE it is read, which is what makes the read atomic with the write
+	// that follows it. A read that runs first can be invalidated by a writer committing behind
+	// it, and on mysql and postgres it is not even made to wait for one, so the order of these
+	// two calls is the whole of the remedy rather than a detail of it (#245 decision 18).
+	assert.Less(t, callIndex(t, database, "AcquireClientRow"), callIndex(t, database, "GetClientById"))
+}
+
+// TestUpdateClientNotOwningAuthenticationMode_ReappliesThePublicInvariantsAgainstTheRefreshedMode
+// pins what every one of these endpoints depends on. The two public-client rules, client
+// credentials off and PKCE required, must be applied to the mode the ROW carries, not the mode
+// the caller loaded. This is the state #245 exists to make unreachable.
+//
+// It is the round 2 finding as well as the round 1 one. Only the OAuth2 flows endpoint used to
+// carry these rules, so a general-settings or token-settings save that loaded the client while it
+// was confidential preserved the refreshed public mode and restored client credentials on and
+// PKCE off underneath it. The caller below is exactly that stale snapshot, and it goes through
+// the same helper the other two use, with nothing endpoint-specific handed in.
+func TestUpdateClientNotOwningAuthenticationMode_ReappliesThePublicInvariantsAgainstTheRefreshedMode(t *testing.T) {
+	database := mocks_data.NewDatabase(t)
+
+	mocks_data.ExpectRunInTransaction(database, clientUpdateTx)
+	database.On("AcquireClientRow", mock.Anything, clientUpdateTx, int64(7)).Return(nil).Once()
+	// The row is public; the caller below thinks it is confidential.
+	database.On("GetClientById", mock.Anything, clientUpdateTx, int64(7)).
+		Return(&models.Client{Id: 7, IsPublic: true}, nil).Once()
+	var written *models.Client
+	database.On("UpdateClient", mock.Anything, clientUpdateTx, mock.Anything).
+		Run(func(args mock.Arguments) { written = args.Get(2).(*models.Client) }).Return(nil).Once()
+
+	// A confidential client's legitimate settings, carried by a request that loaded it before it
+	// became public.
+	pkceOff := false
+	stale := &models.Client{
+		Id:                       7,
+		IsPublic:                 false,
+		PKCERequired:             &pkceOff,
+		ClientCredentialsEnabled: true,
+	}
+	require.NoError(t, updateClientNotOwningAuthenticationMode(context.Background(), database, stale))
+
+	require.NotNil(t, written)
+	assert.True(t, written.IsPublic, "the write must carry the row's authentication mode")
+	assert.False(t, written.ClientCredentialsEnabled,
+		"a public client must not be stored with client credentials enabled")
+	require.NotNil(t, written.PKCERequired,
+		"a public client must not be stored with a nil pkce_required: it renders as inherit")
+	assert.True(t, *written.PKCERequired,
+		"a public client must not be stored with pkce_required false")
+}
+
+// TestUpdateClientNotOwningAuthenticationMode_LeavesAConfidentialClientsFlowsAlone is the boundary
+// on the test above, and it is the one that would catch the rules being applied unconditionally.
+// The two invariants belong to public clients only: a confidential client is entitled to client
+// credentials and to PKCE optional, and a helper that forced them on every write would silently
+// take a working configuration away from the larger population.
+func TestUpdateClientNotOwningAuthenticationMode_LeavesAConfidentialClientsFlowsAlone(t *testing.T) {
+	database := mocks_data.NewDatabase(t)
+
+	mocks_data.ExpectRunInTransaction(database, clientUpdateTx)
+	database.On("AcquireClientRow", mock.Anything, clientUpdateTx, int64(7)).Return(nil).Once()
+	database.On("GetClientById", mock.Anything, clientUpdateTx, int64(7)).
+		Return(&models.Client{Id: 7, IsPublic: false}, nil).Once()
+	var written *models.Client
+	database.On("UpdateClient", mock.Anything, clientUpdateTx, mock.Anything).
+		Run(func(args mock.Arguments) { written = args.Get(2).(*models.Client) }).Return(nil).Once()
+
+	pkceOff := false
+	client := &models.Client{
+		Id:                       7,
+		IsPublic:                 false,
+		PKCERequired:             &pkceOff,
+		ClientCredentialsEnabled: true,
+	}
+	require.NoError(t, updateClientNotOwningAuthenticationMode(context.Background(), database, client))
+
+	require.NotNil(t, written)
+	assert.True(t, written.ClientCredentialsEnabled,
+		"a confidential client keeps client credentials")
+	require.NotNil(t, written.PKCERequired)
+	assert.False(t, *written.PKCERequired, "a confidential client keeps PKCE optional")
+}
+
+// TestUpdateClientNotOwningAuthenticationMode_ADisappearedClientIsAnErrorNotAnInsert covers the
+// row being deleted between the handler's load and this write. UpdateClient keys on the id and
+// would quietly affect no rows, so the failure has to be raised here.
+func TestUpdateClientNotOwningAuthenticationMode_ADisappearedClientIsAnErrorNotAnInsert(t *testing.T) {
+	database := mocks_data.NewDatabase(t)
+
+	stub := mocks_data.ExpectRunInTransaction(database, clientUpdateTx)
+	database.On("AcquireClientRow", mock.Anything, clientUpdateTx, int64(7)).Return(nil).Once()
+	database.On("GetClientById", mock.Anything, clientUpdateTx, int64(7)).Return(nil, nil).Once()
+
+	err := updateClientNotOwningAuthenticationMode(context.Background(), database, &models.Client{Id: 7})
+	require.Error(t, err)
+	assert.Equal(t, err, stub.BodyErr, "the body hands its error to the helper, which rolls back")
+	assertNotAttemptedOnClientDatabase(t, database, "UpdateClient")
+}
+
+// TestUpdateClientNotOwningAuthenticationMode_AFailedAcquisitionDoesNotWrite covers the
+// acquisition erroring. It must abort the save rather than fall through to a read that nothing is
+// holding, because that unprotected read is exactly what this helper was changed to stop making.
+// Falling through would put the endpoint back where it was with every other test here still
+// green.
+func TestUpdateClientNotOwningAuthenticationMode_AFailedAcquisitionDoesNotWrite(t *testing.T) {
+	database := mocks_data.NewDatabase(t)
+
+	stub := mocks_data.ExpectRunInTransaction(database, clientUpdateTx)
+	database.On("AcquireClientRow", mock.Anything, clientUpdateTx, int64(7)).
+		Return(errors.New("deadlock found when trying to get lock")).Once()
+
+	err := updateClientNotOwningAuthenticationMode(context.Background(), database, &models.Client{Id: 7, IsPublic: true})
+	require.Error(t, err)
+	assert.Equal(t, err, stub.BodyErr, "the body hands its error to the helper unchanged, which is what lets a real deadlock be rerun")
+	assertNotAttemptedOnClientDatabase(t, database, "GetClientById", "UpdateClient")
+}
+
+// =============================================================================
+// HandleAPIClientAuthenticationPut
+// =============================================================================
+
+// TestHandleAPIClientAuthenticationPut_ClassifiesTheFlipAgainstTheRow is the finding itself.
+//
+// The handler loads the client, and by the time it writes, the row says something else: here the
+// snapshot says public while the write turns out to perform the transition, which is what a
+// concurrent save that made the client confidential and issued it a grant leaves behind.
+// Classifying from the snapshot reads "already public", skips the revocation, and commits a
+// public client still holding grants that were issued while a secret was required. So the answer
+// comes from SetClientPublic, the write itself, and this asserts that the handler acts on that
+// answer rather than on the copy in its hand.
+func TestHandleAPIClientAuthenticationPut_ClassifiesTheFlipAgainstTheRow(t *testing.T) {
+	database := mocks_data.NewDatabase(t)
+	auditLogger := mocks_audit.NewAuditLogger(t)
+
+	// The snapshot the handler works from: already public.
+	database.On("GetClientById", mock.Anything, (*sql.Tx)(nil), int64(7)).
+		Return(&models.Client{Id: 7, IsPublic: true}, nil).Once()
+	// What the write reports when it runs: it really did make the client public, because another
+	// request got there first with confidential mode and the grants it issued are the ones at
+	// stake. The handler must believe this over its own snapshot.
+	mocks_data.ExpectRunInTransaction(database, clientUpdateTx)
+	database.On("SetClientPublic", mock.Anything, clientUpdateTx, int64(7)).Return(true, nil).Once()
+	database.On("UpdateClient", mock.Anything, clientUpdateTx, mock.Anything).Return(nil).Once()
+	database.On("RevokeCodesByClientId", mock.Anything, clientUpdateTx, int64(7)).Return(int64(2), nil).Once()
+	database.On("GetRefreshTokensByClientId", mock.Anything, clientUpdateTx, int64(7)).
+		Return([]*models.RefreshToken{}, nil).Once()
+	stubClientResponseLoads(database)
+
+	var revokedPayload map[string]interface{}
+	auditLogger.On("Log", mock.Anything, audit.AuditRevokedClientGrants, mock.Anything).
+		Run(func(args mock.Arguments) {
+			revokedPayload = args.Get(2).(map[string]interface{})
+		}).Return().Once()
+	auditLogger.On("Log", mock.Anything, audit.AuditUpdatedClientAuthentication, mock.Anything).Return().Once()
+
+	rr := httptest.NewRecorder()
+	handler := HandleAPIClientAuthenticationPut(database, auditLogger)
+	handler.ServeHTTP(rr, authenticationPutRequest(t, "7", api.UpdateClientAuthenticationRequest{IsPublic: true}))
+
+	assert.Equal(t, http.StatusOK, rr.Code)
+	database.AssertExpectations(t)
+	auditLogger.AssertExpectations(t)
+	require.NotNil(t, revokedPayload)
+	assert.Equal(t, int64(2), revokedPayload["revokedCodeCount"])
+
+	// The classification has to run BEFORE the client write, and the order is asserted rather
+	// than left to reading. UpdateClient projects every mutable column from the caller's copy,
+	// which says public, so a SetClientPublic placed after it would find the row already public
+	// and report false on every flip there has ever been. The revocation would then never run
+	// and nothing else in this file would notice.
+	assert.Less(t, callIndex(t, database, "SetClientPublic"), callIndex(t, database, "UpdateClient"))
+}
+
+// TestHandleAPIClientAuthenticationPut_AFailedClassificationRevokesNothingAndSavesNothing covers
+// the direction the two tests above cannot: what happens when the write cannot establish which
+// transition this is. There is no safe guess. Revoking anyway would sign out the users of a
+// client nobody flipped, and saving anyway would produce the very state the classification
+// exists to catch, so the whole transaction is abandoned and the caller is told it failed.
+func TestHandleAPIClientAuthenticationPut_AFailedClassificationRevokesNothingAndSavesNothing(t *testing.T) {
+	database := mocks_data.NewDatabase(t)
+	auditLogger := mocks_audit.NewAuditLogger(t)
+
+	database.On("GetClientById", mock.Anything, (*sql.Tx)(nil), int64(7)).
+		Return(&models.Client{Id: 7, IsPublic: false, ClientSecretEncrypted: []byte("secret")}, nil).Once()
+	stub := mocks_data.ExpectRunInTransaction(database, clientUpdateTx)
+	database.On("SetClientPublic", mock.Anything, clientUpdateTx, int64(7)).
+		Return(false, errors.New("no client with that id")).Once()
+
+	rr := httptest.NewRecorder()
+	handler := HandleAPIClientAuthenticationPut(database, auditLogger)
+	handler.ServeHTTP(rr, authenticationPutRequest(t, "7", api.UpdateClientAuthenticationRequest{IsPublic: true}))
+
+	assert.Equal(t, http.StatusInternalServerError, rr.Code)
+	// The client write is not registered on the strict mock, so reaching it fails on its own.
+	// Naming it says which property broke; BodyErr says the helper was asked to roll back.
+	assert.EqualError(t, stub.BodyErr, "no client with that id")
+	assertNotAttemptedOnClientDatabase(t, database, "UpdateClient",
+		"RevokeCodesByClientId", "GetRefreshTokensByClientId")
+	auditLogger.AssertNotCalled(t, "Log", mock.Anything, audit.AuditRevokedClientGrants, mock.Anything)
+	auditLogger.AssertNotCalled(t, "Log", mock.Anything, audit.AuditUpdatedClientAuthentication, mock.Anything)
+}
+
+// TestHandleAPIClientAuthenticationPut_ASaveOfAnAlreadyPublicClientRevokesNothing is the other
+// side of the same decision, and the one that stops the fix above becoming "revoke on every
+// save". Both the snapshot and the row say public, so this write removes no requirement and must
+// leave the client's grants alone: revoking here would sign every user of the application out
+// because an administrator re-saved a form.
+func TestHandleAPIClientAuthenticationPut_ASaveOfAnAlreadyPublicClientRevokesNothing(t *testing.T) {
+	database := mocks_data.NewDatabase(t)
+	auditLogger := mocks_audit.NewAuditLogger(t)
+
+	database.On("GetClientById", mock.Anything, (*sql.Tx)(nil), int64(7)).
+		Return(&models.Client{Id: 7, IsPublic: true}, nil).Once()
+	mocks_data.ExpectRunInTransaction(database, clientUpdateTx)
+	database.On("SetClientPublic", mock.Anything, clientUpdateTx, int64(7)).Return(false, nil).Once()
+	database.On("UpdateClient", mock.Anything, clientUpdateTx, mock.Anything).Return(nil).Once()
+	stubClientResponseLoads(database)
+
+	auditLogger.On("Log", mock.Anything, audit.AuditUpdatedClientAuthentication, mock.Anything).Return().Once()
+
+	rr := httptest.NewRecorder()
+	handler := HandleAPIClientAuthenticationPut(database, auditLogger)
+	handler.ServeHTTP(rr, authenticationPutRequest(t, "7", api.UpdateClientAuthenticationRequest{IsPublic: true}))
+
+	assert.Equal(t, http.StatusOK, rr.Code)
+	// The strict mock carries most of this: neither revocation call is registered, so reaching
+	// one fails. Naming them makes the failure say which property broke.
+	assertNotAttemptedOnClientDatabase(t, database, "RevokeCodesByClientId", "GetRefreshTokensByClientId")
+	auditLogger.AssertNotCalled(t, "Log", mock.Anything, audit.AuditRevokedClientGrants, mock.Anything)
+}
+
+// assertNotAttemptedOnClientDatabase fails naming the method, where the strict mock alone would
+// fail naming an unexpected call.
+//
+// It reads the recorded calls rather than calling AssertNotCalled, because the method is named
+// through a parameter here and AssertNotCalled matches on the name and the whole argument list at
+// once: it was passing two matchers to methods that all take three, so it compared lists that
+// could never be equal and passed at every call site whatever the handler did. Matching on the
+// name alone is what this helper meant in the first place, and it is the one thing an argument
+// list cannot express (#421).
+func assertNotAttemptedOnClientDatabase(t *testing.T, database *mocks_data.Database, methods ...string) {
+	t.Helper()
+	for _, method := range methods {
+		for _, call := range database.Calls {
+			if call.Method == method {
+				t.Errorf("%s was called, and this path must not reach it", method)
+			}
+		}
+	}
+}
+
+// callIndex reports the position of the first call to method in the mock's recorded order, so a
+// test can assert that one call happened before another.
+func callIndex(t *testing.T, database *mocks_data.Database, method string) int {
+	t.Helper()
+	for i, call := range database.Calls {
+		if call.Method == method {
+			return i
+		}
+	}
+	t.Fatalf("%s was never called", method)
+	return -1
+}
+
+// =============================================================================
+// HandleAPIClientWebOriginsPut
+// =============================================================================
+
+// webOriginsPutRequest builds the PUT with its chi URL parameter and body.
+func webOriginsPutRequest(t *testing.T, id string, origins []string) *http.Request {
+	t.Helper()
+	body, err := json.Marshal(api.UpdateClientWebOriginsRequest{WebOrigins: origins})
+	require.NoError(t, err)
+	r := httptest.NewRequest(http.MethodPut, "/api/v1/admin/clients/"+id+"/web-origins", bytes.NewReader(body))
+	return setChiURLParam(r, "id", id)
+}
+
+// The save is one transaction, and the current list is read inside it, under the row acquisition.
+//
+// Without that, two administrators saving different lists at once each read the same current list
+// and each write their own diff of it, so the row ends up holding the union of both rather than
+// either one. That is invisible to every other tier: nothing reachable over HTTP can produce the
+// gap on its own, because each request reloads. The seam where it is visible is the handler's own
+// conversation with the database, which is what a strict mock reproduces (#250 decision 15).
+//
+// The flow gate is gone as well, and this client says so: AuthorizationCodeEnabled is false, which
+// used to be refused with a 400 before the body was even read.
+func TestHandleAPIClientWebOriginsPut_SavesInOneTransactionUnderTheRowAcquisition(t *testing.T) {
+	database := mocks_data.NewDatabase(t)
+	auditLogger := mocks_audit.NewAuditLogger(t)
+
+	client := &models.Client{Id: 7, AuthorizationCodeEnabled: false}
+	database.On("GetClientById", mock.Anything, (*sql.Tx)(nil), int64(7)).Return(client, nil).Once()
+
+	mocks_data.ExpectRunInTransaction(database, clientUpdateTx)
+	database.On("AcquireClientRow", mock.Anything, clientUpdateTx, int64(7)).Return(nil).Once()
+	database.On("ClientLoadWebOrigins", mock.Anything, clientUpdateTx, mock.Anything).
+		Run(func(args mock.Arguments) {
+			args.Get(2).(*models.Client).WebOrigins = []models.WebOrigin{
+				{Id: 11, ClientId: 7, Origin: "https://old.example.com"},
+			}
+		}).Return(nil).Once()
+
+	var created string
+	database.On("CreateWebOrigin", mock.Anything, clientUpdateTx, mock.Anything).
+		Run(func(args mock.Arguments) { created = args.Get(2).(*models.WebOrigin).Origin }).Return(nil).Once()
+	database.On("DeleteWebOrigin", mock.Anything, clientUpdateTx, int64(11)).Return(nil).Once()
+	stubClientResponseLoads(database)
+
+	auditLogger.On("Log", mock.Anything, audit.AuditUpdatedWebOrigins, mock.Anything).Return().Once()
+
+	rr := httptest.NewRecorder()
+	handler := HandleAPIClientWebOriginsPut(database, auditLogger)
+	handler.ServeHTTP(rr, webOriginsPutRequest(t, "7", []string{"https://new.example.com"}))
+
+	assert.Equal(t, http.StatusOK, rr.Code)
+	assert.Equal(t, "https://new.example.com", created)
+	database.AssertExpectations(t)
+
+	// The read is inside the transaction that writes, and after the acquisition. Reading it on
+	// nil, or before AcquireClientRow, is what lets the concurrent save above interleave: the
+	// tx identity above already pins the first half, and the order pins the second.
+	assert.Less(t, callIndex(t, database, "AcquireClientRow"), callIndex(t, database, "ClientLoadWebOrigins"))
+	assert.Less(t, callIndex(t, database, "ClientLoadWebOrigins"), callIndex(t, database, "CreateWebOrigin"))
+}
+
+// A failure part way through commits nothing. The old code wrote each insert and delete on nil,
+// so a database error on the second of three writes left the first one committed, answered 500,
+// and the administrator's list was neither what they sent nor what it was before. Removing a
+// compromised origin and adding its replacement in one save is exactly when that matters.
+//
+// The body hands the failure to RunInTransaction, which is when the helper rolls back; the driver's
+// error stays in the chain it hands over, so a real deadlock would be recognised and rerun rather
+// than answered.
+func TestHandleAPIClientWebOriginsPut_AFailedWriteCommitsNothing(t *testing.T) {
+	database := mocks_data.NewDatabase(t)
+	auditLogger := mocks_audit.NewAuditLogger(t)
+
+	database.On("GetClientById", mock.Anything, (*sql.Tx)(nil), int64(7)).
+		Return(&models.Client{Id: 7, AuthorizationCodeEnabled: true}, nil).Once()
+	diskFull := errors.New("the disk is full")
+	stub := mocks_data.ExpectRunInTransaction(database, clientUpdateTx)
+	database.On("AcquireClientRow", mock.Anything, clientUpdateTx, int64(7)).Return(nil).Once()
+	database.On("ClientLoadWebOrigins", mock.Anything, clientUpdateTx, mock.Anything).Return(nil).Once()
+	database.On("CreateWebOrigin", mock.Anything, clientUpdateTx, mock.Anything).Return(diskFull).Once()
+
+	rr := httptest.NewRecorder()
+	handler := HandleAPIClientWebOriginsPut(database, auditLogger)
+	handler.ServeHTTP(rr, webOriginsPutRequest(t, "7", []string{"https://a.example.com"}))
+
+	assert.Equal(t, http.StatusInternalServerError, rr.Code)
+	assert.Contains(t, rr.Body.String(), "INTERNAL_SERVER_ERROR")
+	database.AssertExpectations(t)
+	// The driver's error is reachable through what the body returned, and the failure names the
+	// origin it was writing, which is what the handler's one log line carries. Which step failed
+	// stopped being a wire distinction when every 500 here moved onto one code and one sentence
+	// (#279 decision 7); it is still a distinction an operator can act on, so it is asserted
+	// where it now lives.
+	assert.ErrorIs(t, stub.BodyErr, diskFull)
+	var failure *webOriginsWriteFailure
+	require.ErrorAs(t, stub.BodyErr, &failure)
+	assert.Equal(t, "https://a.example.com", failure.origin)
+	// Nothing was audited either: an audit entry for a save that did not happen is a false
+	// record of an administrator's action.
+	auditLogger.AssertNotCalled(t, "Log", mock.Anything, audit.AuditUpdatedWebOrigins, mock.Anything)
+}
+
+// The load failing inside the transaction is answered under its own message, as it was before
+// the response moved out of the transaction body; the step is carried on the error rather than
+// written from inside an attempt that might be rerun.
+func TestHandleAPIClientWebOriginsPut_AFailedLoadIsAnsweredAsALoadFailure(t *testing.T) {
+	database := mocks_data.NewDatabase(t)
+	auditLogger := mocks_audit.NewAuditLogger(t)
+
+	database.On("GetClientById", mock.Anything, (*sql.Tx)(nil), int64(7)).
+		Return(&models.Client{Id: 7, AuthorizationCodeEnabled: true}, nil).Once()
+	loadErr := errors.New("the read failed")
+	stub := mocks_data.ExpectRunInTransaction(database, clientUpdateTx)
+	database.On("AcquireClientRow", mock.Anything, clientUpdateTx, int64(7)).Return(nil).Once()
+	database.On("ClientLoadWebOrigins", mock.Anything, clientUpdateTx, mock.Anything).Return(loadErr).Once()
+
+	rr := httptest.NewRecorder()
+	handler := HandleAPIClientWebOriginsPut(database, auditLogger)
+	handler.ServeHTTP(rr, webOriginsPutRequest(t, "7", []string{"https://a.example.com"}))
+
+	assert.Equal(t, http.StatusInternalServerError, rr.Code)
+	assert.Contains(t, rr.Body.String(), "INTERNAL_SERVER_ERROR")
+	// The step is still named, on the error rather than on the wire: it is carried out of the
+	// transaction body so nothing is written from an attempt that might be rerun.
+	assert.ErrorIs(t, stub.BodyErr, loadErr)
+	assert.Contains(t, stub.BodyErr.Error(), "database error loading client web origins before update")
+	database.AssertExpectations(t)
+	assertNotAttemptedOnClientDatabase(t, database, "CreateWebOrigin", "DeleteWebOrigin")
+	auditLogger.AssertNotCalled(t, "Log", mock.Anything, audit.AuditUpdatedWebOrigins, mock.Anything)
+}
+
+// A body aborted as a deadlock victim on its first attempt and rerun by the helper answers ONCE:
+// one 200, one audit event, and no error response for the attempt that was thrown away. This is
+// why every writeJSONError sits below RunInTransaction rather than inside the closure: an attempt
+// that has already written a 500 cannot be rerun into a 200 (#301).
+//
+// The helper's loop is scripted here: the stub runs the body, checks the driver's error is still
+// reachable through what the body returned, which is what the real classifier needs, and runs it
+// again. The real loop, with a real deadlock, is the data tier's.
+func TestHandleAPIClientWebOriginsPut_ARerunAttemptAnswersOnce(t *testing.T) {
+	database := mocks_data.NewDatabase(t)
+	auditLogger := mocks_audit.NewAuditLogger(t)
+
+	client := &models.Client{Id: 7, AuthorizationCodeEnabled: true}
+	database.On("GetClientById", mock.Anything, (*sql.Tx)(nil), int64(7)).Return(client, nil).Once()
+
+	deadlock := errors.New("Error 1213: Deadlock found when trying to get lock")
+	attempts := 0
+	database.EXPECT().RunInTransaction(mock.Anything, mock.Anything).RunAndReturn(func(_ context.Context, fn func(tx *sql.Tx) error) error {
+		for {
+			attempts++
+			err := fn(clientUpdateTx)
+			if err == nil {
+				return nil
+			}
+			require.ErrorIs(t, err, deadlock,
+				"the body must hand the driver's error back in the chain, or the helper cannot tell a deadlock from a fault")
+			require.Less(t, attempts, 3, "the second attempt was scripted to succeed")
+		}
+	}).Once()
+
+	// Both attempts take the row and read the list afresh.
+	database.On("AcquireClientRow", mock.Anything, clientUpdateTx, int64(7)).Return(nil).Twice()
+	database.On("ClientLoadWebOrigins", mock.Anything, clientUpdateTx, mock.Anything).Return(nil).Twice()
+	// The first insert is the deadlock victim; the second lands.
+	database.On("CreateWebOrigin", mock.Anything, clientUpdateTx, mock.Anything).Return(deadlock).Once()
+	database.On("CreateWebOrigin", mock.Anything, clientUpdateTx, mock.Anything).Return(nil).Once()
+	stubClientResponseLoads(database)
+
+	auditLogger.On("Log", mock.Anything, audit.AuditUpdatedWebOrigins, mock.Anything).Return().Once()
+
+	rr := httptest.NewRecorder()
+	handler := HandleAPIClientWebOriginsPut(database, auditLogger)
+	handler.ServeHTTP(rr, webOriginsPutRequest(t, "7", []string{"https://a.example.com"}))
+
+	assert.Equal(t, 2, attempts)
+	assert.Equal(t, http.StatusOK, rr.Code)
+	// One answer. A 500 written by the first attempt would sit in the body ahead of the 200's
+	// JSON, and the recorder would show it.
+	assert.NotContains(t, rr.Body.String(), "INTERNAL_SERVER_ERROR")
+	database.AssertExpectations(t)
+	auditLogger.AssertExpectations(t)
+}
+
+// The helper giving up, a deadlock on every attempt, is one 500 under the update message and no
+// audit event: the exhausted error carries no step of its own and is reported as the helper's.
+func TestHandleAPIClientWebOriginsPut_AnExhaustedRetryIsOneFiveHundred(t *testing.T) {
+	database := mocks_data.NewDatabase(t)
+	auditLogger := mocks_audit.NewAuditLogger(t)
+
+	database.On("GetClientById", mock.Anything, (*sql.Tx)(nil), int64(7)).
+		Return(&models.Client{Id: 7, AuthorizationCodeEnabled: true}, nil).Once()
+	exhausted := errors.New("transaction aborted as a deadlock victim on all 3 attempts")
+	mocks_data.ExpectRunInTransactionRefused(database, exhausted)
+
+	rr := httptest.NewRecorder()
+	handler := HandleAPIClientWebOriginsPut(database, auditLogger)
+	handler.ServeHTTP(rr, webOriginsPutRequest(t, "7", []string{"https://a.example.com"}))
+
+	assert.Equal(t, http.StatusInternalServerError, rr.Code)
+	assert.Equal(t, 1, strings.Count(rr.Body.String(), "INTERNAL_SERVER_ERROR"), "exactly one error response")
+	database.AssertExpectations(t)
+	auditLogger.AssertNotCalled(t, "Log", mock.Anything, mock.Anything, mock.Anything)
+}
+
+// A canonical origin longer than the column is refused rather than stored. web_origins.origin is
+// 256 characters on MySQL, PostgreSQL and SQL Server, so today this is a 500 on three engines out
+// of four and a silent success on sqlite, which is the only engine the local integration tier runs
+// (#250 decision 14b). The value here canonicalizes cleanly and is refused purely on length, which
+// is what separates this from the invalid-origin path.
+//
+// The strict mock carries GetClientById and nothing else: reaching RunInTransaction fails the test,
+// so the refusal is proved to happen before any write is attempted.
+func TestHandleAPIClientWebOriginsPut_AnOverlongOriginIsRefusedNotStored(t *testing.T) {
+	database := mocks_data.NewDatabase(t)
+	auditLogger := mocks_audit.NewAuditLogger(t)
+
+	database.On("GetClientById", mock.Anything, (*sql.Tx)(nil), int64(7)).
+		Return(&models.Client{Id: 7, AuthorizationCodeEnabled: true}, nil).Once()
+
+	// "https://" plus a host of repeated 63-character labels, canonical and over the cap.
+	label := strings.Repeat("a", 63)
+	host := label + "." + label + "." + label + "." + label
+	origin := "https://" + host
+	require.Greater(t, len(origin), maxWebOriginLength)
+
+	rr := httptest.NewRecorder()
+	handler := HandleAPIClientWebOriginsPut(database, auditLogger)
+	handler.ServeHTTP(rr, webOriginsPutRequest(t, "7", []string{origin}))
+
+	assert.Equal(t, http.StatusBadRequest, rr.Code)
+	assert.Contains(t, rr.Body.String(), "too long")
+	database.AssertExpectations(t)
+	database.AssertNotCalled(t, "RunInTransaction", mock.Anything, mock.Anything)
+}

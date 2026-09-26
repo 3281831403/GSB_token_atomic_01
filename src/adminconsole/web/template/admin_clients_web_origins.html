@@ -1,0 +1,280 @@
+{{define "title"}}{{ .appName }} - {{ T $.ctx "adminconsole.admin_clients.web_origins.page_title_prefix" }}{{.client.ClientIdentifier}}{{end}}
+{{define "pageTitle"}}{{ T $.ctx "adminconsole.admin_clients.web_origins.page_title_prefix" }}<span class="text-accent">{{.client.ClientIdentifier}}</span>{{end}}
+{{define "subTitle"}}{{end}}
+{{define "menu"}}
+    {{template "admin_menu" . }}
+{{end}}
+
+{{define "head"}}
+
+<script>
+
+    var webOrigins = [];
+    var ids = [];
+    {{ range $key, $value := .client.WebOrigins }}
+        webOrigins.push("{{ $value }}");
+        ids.push({{$key}});
+    {{end}}
+
+    document.addEventListener("DOMContentLoaded", function () {
+
+        var isSystemLevel = {{if .client.IsSystemLevelClient}}true{{else}}false{{end}};
+
+        const btnSave = document.getElementById("btnSave");
+        if (btnSave) {
+            btnSave.addEventListener("click", function (evt) {
+                evt.preventDefault();
+
+                function doSave() {
+                    const loadingIcon = document.getElementById("loadingIcon");
+
+                    sendAjaxRequest({
+                        "url": "/admin/clients/{{.client.ClientId}}/web-origins",
+                        "method": "POST",
+                        "bodyData": JSON.stringify({
+                            "clientId": {{.client.ClientId }},
+                            "webOrigins": webOrigins,
+                            "ids": ids,
+                        }),
+                        "loadingElement": loadingIcon,
+                        "loadingClasses": ["loading", "loading-xs"],
+                        "modalId": "modal0",
+                        "callback": function(result) {
+
+                            if (result.Success) {
+                                window.location.href = "/admin/clients/{{.client.ClientId}}/web-origins";
+                            } else {
+                                showModalDialog("modal0", "{{ T $.ctx "adminconsole.admin_clients.modal.error_title" }}", "{{ T $.ctx "adminconsole.admin_clients.modal.unexpected_error" }}");
+                            }
+                        }
+                    });
+                }
+
+                if (isSystemLevel) {
+                    showModalDialog("modal1", "{{ T $.ctx "adminconsole.admin_clients.modal.are_you_sure" }}",
+                        "{{ T $.ctx "adminconsole.admin_clients.modal.system_save_warning" }}",
+                        function() { /* cancel */ },
+                        function() { doSave(); }
+                    );
+                } else {
+                    doSave();
+                }
+            });
+        }
+
+        refreshWebOriginsTable();
+    });
+
+    function refreshWebOriginsTable() {
+
+        const webOriginsTable = document.getElementById("webOriginsTable");
+        const webOriginsTableBody = webOriginsTable.getElementsByTagName("tbody")[0];
+        webOriginsTableBody.innerHTML = "";
+
+        if(webOrigins.length == 0) {
+            const row = webOriginsTableBody.insertRow();
+            const cell1 = row.insertCell(0);
+            const cell2 = row.insertCell(1);
+            cell1.className = "p-2 font-mono text-sm align-middle";
+            cell1.innerHTML = "{{ T $.ctx "adminconsole.admin_clients.web_origins.none_yet" }}";
+
+            cell2.className = "p-2 text-right";
+            cell2.innerHTML = "&nbsp;";
+        } else {
+            webOrigins.forEach((uri, idx) => {
+                const row = webOriginsTableBody.insertRow();
+                const cell1 = row.insertCell(0);
+                const cell2 = row.insertCell(1);
+                cell1.className = "p-1 font-mono text-sm align-middle";
+                // textContent, not innerHTML: a web origin is data. Same change as the
+                // redirect URIs page, see issue #105. deleteWebOrigin must read it back
+                // with textContent for the same reason.
+                cell1.textContent = uri;
+
+                cell2.className = "p-1 text-right";
+                cell2.innerHTML = getTrashCanMarkup("", "deleteWebOrigin(event, this);", "");
+            });
+        }
+    }
+
+    function isUrlValid(string) {
+        let url;
+        try {
+            url = new URL(string);
+        } catch (_) {
+            return false;
+        }
+        return true;
+    }
+
+    function addWebOriginClick(evt) {
+        evt.preventDefault();
+
+        const webOrigin = document.getElementById("webOrigin");
+        if(isUrlValid(webOrigin.value)) {
+
+            let webor = new URL(webOrigin.value).origin;
+
+            if(webOrigins.includes(webor)) {
+                showModalDialog("modal0", "{{ T $.ctx "adminconsole.admin_clients.modal.error_title" }}", "{{ T $.ctx "adminconsole.admin_clients.web_origins.duplicate_error" }}");
+                return;
+            } else {
+                webOrigins.push(webor);
+                ids.push(0);
+                refreshWebOriginsTable();
+                webOrigin.value = "";
+                setTimeout(function() {
+                    webOrigin.focus();
+                }, 100);
+            }
+        } else {
+            showModalDialog("modal0", "{{ T $.ctx "adminconsole.admin_clients.modal.error_title" }}", "{{ T $.ctx "adminconsole.admin_clients.web_origins.invalid_url_prefix" }}<span class='text-accent'>{{ T $.ctx "adminconsole.admin_clients.web_origins.invalid_url_em" }}</span>{{ T $.ctx "adminconsole.admin_clients.web_origins.invalid_url_suffix" }}",
+                function() {
+                    setTimeout(function() {
+                        webOrigin.focus();
+                    }, 100);
+                });
+            return;
+        }
+    }
+
+    function deleteWebOrigin(evt, elem) {
+        evt.preventDefault();
+        const row = elem.parentNode.parentNode;
+        // Must match how the cell was written, above. See the note in
+        // admin_clients_redirect_uris.html: reading innerHTML re-serialises the value, so
+        // anything containing "&" or markup never matched and deletion did nothing.
+        const webOrigin = row.getElementsByTagName("td")[0].textContent;
+        const index = webOrigins.indexOf(webOrigin);
+        if (index > -1) {
+            webOrigins.splice(index, 1);
+            ids.splice(index, 1);
+        }
+        refreshWebOriginsTable();
+    }
+
+</script>
+
+{{end}}
+
+{{define "body"}}
+
+{{template "manage_clients_tabs" (args "web-origins" .client.ClientId $.ctx) }}
+
+<form method="post">
+
+    {{if .client.IsSystemLevelClient}}
+    <div class="grid grid-cols-1 gap-6 mt-6 lg:grid-cols-2">
+        <div role="alert" class="alert alert-warning">
+            <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 shrink-0 stroke-current" fill="none"
+                viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" /></svg>
+            <span>{{ T $.ctx "adminconsole.admin_clients.common.system_warning" }}</span>
+        </div>
+    </div>
+    {{end}}
+
+    <div class="grid grid-cols-1 gap-6 mt-6 lg:grid-cols-2">
+
+        <div class="w-full h-full pb-6 bg-base-100">
+
+                <div id="webOriginsEnabledPanel">
+                    <p>{{ T $.ctx "adminconsole.admin_clients.web_origins.intro_prefix" }}<span class="text-accent">{{ T $.ctx "adminconsole.admin_clients.web_origins.intro_em1" }}</span>{{ T $.ctx "adminconsole.admin_clients.web_origins.intro_middle" }}<span class="text-accent">{{ T $.ctx "adminconsole.admin_clients.web_origins.intro_em2" }}</span>{{ T $.ctx "adminconsole.admin_clients.web_origins.intro_suffix" }}</p>
+                    <p class="mt-1">{{ T $.ctx "adminconsole.admin_clients.web_origins.examples_prefix" }}<span class="text-accent">{{ T $.ctx "adminconsole.admin_clients.web_origins.examples_em1" }}</span>{{ T $.ctx "adminconsole.admin_clients.web_origins.examples_middle" }}<span class="text-accent">{{ T $.ctx "adminconsole.admin_clients.web_origins.examples_em2" }}</span>{{ T $.ctx "adminconsole.admin_clients.web_origins.examples_suffix" }}</p>
+
+                    <div class="w-full mt-6 form-control">
+                        <label class="label">
+                            <span class="label-text text-base-content">
+                                {{ T $.ctx "adminconsole.admin_clients.web_origins.field.origin" }}
+                            </span>
+                        </label>
+                        <div class="table">
+                            <div class="table-cell w-full">
+                                <input id="webOrigin" type="text" name="aa" value="" autofocus
+                                    class="w-full input input-bordered" autocomplete="off" />
+                            </div>
+                            <button onclick="addWebOriginClick(event);" class="ml-4 w-fit btn btn-secondary btn-sm">{{ T $.ctx "adminconsole.admin_clients.web_origins.add_button" }}</button>
+                        </div>
+                    </div>
+
+                    <div class="w-full mt-6">
+                        <table id="webOriginsTable" class="table">
+                            <thead>
+                                <tr>
+                                    <th class="p-1 text-lg">{{ T $.ctx "adminconsole.admin_clients.web_origins.col_authorized" }}</th>
+                                    <th></th>
+                                </tr>
+                             </thead>
+                            <tbody>
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <div class="w-full mt-8">
+                        <h2 class="text-lg">{{ T $.ctx "adminconsole.admin_clients.web_origins.effective_title" }}</h2>
+                        <p class="mt-1 text-sm">{{ T $.ctx "adminconsole.admin_clients.web_origins.effective_note" }}</p>
+                        <table id="effectiveWebOriginsTable" class="table mt-2">
+                            <thead>
+                                <tr>
+                                    <th class="p-1">{{ T $.ctx "adminconsole.admin_clients.web_origins.col_effective_origin" }}</th>
+                                    <th class="p-1">{{ T $.ctx "adminconsole.admin_clients.web_origins.col_effective_client" }}</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {{if .client.EffectiveWebOrigins}}
+                                    {{range .client.EffectiveWebOrigins}}
+                                    <tr>
+                                        <td class="p-1 font-mono text-sm align-middle">{{ .Origin }}</td>
+                                        <td class="p-1 font-mono text-sm align-middle">{{ .ClientIdentifier }}</td>
+                                    </tr>
+                                    {{end}}
+                                {{else}}
+                                    <tr>
+                                        <td class="p-1 font-mono text-sm align-middle">{{ T $.ctx "adminconsole.admin_clients.web_origins.none_yet" }}</td>
+                                        <td class="p-1">&nbsp;</td>
+                                    </tr>
+                                {{end}}
+                            </tbody>
+                        </table>
+                    </div>
+
+                </div>
+
+        </div>
+
+    </div>
+
+    <div class="grid grid-cols-1 gap-6 mt-8 lg:grid-cols-2">
+        <div>
+            {{if .error}}
+                <div class="mb-4 text-right text-error">
+                    <p>{{.error}}</p>
+                </div>
+            {{end}}
+
+            <div class="float-left p-3">
+                <a class="link-secondary" href="/admin/clients">
+                    <svg class="inline-block w-6 h-6 align-middle" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" d="M10.5 19.5L3 12m0 0l7.5-7.5M3 12h18" />
+                    </svg>
+                    <span class="ml-1 align-middle">{{ T $.ctx "adminconsole.admin_clients.common.back_to_list" }}</span>
+                </a>
+            </div>
+            {{if .savedSuccessfully}}
+                <div class="mb-4 text-right text-success">
+                    <p>&#10004; {{ T $.ctx "adminconsole.admin_clients.web_origins.saved_successfully" }}</p>
+                </div>
+            {{end}}
+            <span id="loadingIcon" class="hidden w-5 h-5 mr-2 align-middle text-primary float-right">&nbsp;</span>
+            <button id="btnSave" class="float-right btn btn-primary">{{ T $.ctx "adminconsole.admin_clients.save_button" }}</button>
+
+        </div>
+    </div>
+
+</form>
+
+{{template "modal_dialog" (args "modal0" "close" $.ctx ) }}
+
+{{template "modal_dialog" (args "modal1" "yes_no" $.ctx ) }}
+
+{{end}}

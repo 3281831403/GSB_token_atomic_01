@@ -1,0 +1,147 @@
+package accountvalidation
+
+import (
+	"context"
+	"database/sql"
+	"regexp"
+
+	"github.com/leodip/goiabada/authserver/internal/models"
+	"github.com/leodip/goiabada/core/errs"
+	"github.com/leodip/goiabada/core/i18n"
+)
+
+// emailValidatorDatabase is what the account email validator reads: the rows that decide whether
+// an address is already somebody else's.
+type emailValidatorDatabase interface {
+	GetUserByEmail(ctx context.Context, tx *sql.Tx, email string) (*models.User, error)
+	GetUserBySubject(ctx context.Context, tx *sql.Tx, subject string) (*models.User, error)
+}
+
+type EmailValidator struct {
+	database emailValidatorDatabase
+}
+
+func NewEmailValidator(database emailValidatorDatabase) *EmailValidator {
+	return &EmailValidator{
+		database: database,
+	}
+}
+
+type ValidateEmailInput struct {
+	Email             string
+	EmailConfirmation string
+	Subject           string
+}
+
+func (val *EmailValidator) ValidateEmailAddress(emailAddress string) error {
+	// Basic regex pattern for email validation.
+	pattern := `^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$`
+	regex, err := regexp.Compile(pattern)
+	if err != nil {
+		return err
+	}
+
+	// i18n surface: A | C — emitted to browser-flow handlers and admin/account API.
+	if !regex.MatchString(emailAddress) {
+		return i18n.NewLocalizedError(i18n.ErrCodeEmailInvalidFormat, nil)
+	}
+
+	// Split the email address into local and domain parts.
+	atIndex := regexp.MustCompile("@").FindStringIndex(emailAddress)
+	localPart := emailAddress[:atIndex[0]]
+
+	if regexp.MustCompile(`\.\.`).MatchString(emailAddress) {
+		return i18n.NewLocalizedError(i18n.ErrCodeEmailInvalidFormat, nil)
+	}
+
+	if localPart[0] == '.' || localPart[len(localPart)-1] == '.' {
+		return i18n.NewLocalizedError(i18n.ErrCodeEmailInvalidFormat, nil)
+	}
+
+	return nil
+}
+
+func (val *EmailValidator) ValidateEmailUpdate(ctx context.Context, input *ValidateEmailInput) error {
+
+	// i18n surface: C — admin/account API.
+	if len(input.Email) == 0 {
+		return i18n.NewLocalizedError(i18n.ErrCodeEmailRequired, nil)
+	}
+
+	if err := val.ValidateEmailAddress(input.Email); err != nil {
+		return err
+	}
+
+	if len(input.Email) > 60 {
+		return i18n.NewLocalizedError(i18n.ErrCodeEmailTooLong, map[string]any{"max": 60})
+	}
+
+	if input.Email != input.EmailConfirmation {
+		return i18n.NewLocalizedError(i18n.ErrCodeEmailConfirmationMismatch, nil)
+	}
+
+	user, err := val.database.GetUserBySubject(ctx, nil, input.Subject)
+	if err != nil {
+		return err
+	}
+	// An unresolvable subject is not a validation problem the caller can show to
+	// a user: it means the request carried a stale or forged subject. Surface it
+	// as an error rather than dereferencing nil below.
+	if user == nil {
+		return errs.New("subject not found: " + input.Subject)
+	}
+
+	userByEmail, err := val.database.GetUserByEmail(ctx, nil, input.Email)
+	if err != nil {
+		return err
+	}
+
+	if userByEmail != nil && userByEmail.Subject != user.Subject {
+		return i18n.NewLocalizedError(i18n.ErrCodeEmailAlreadyRegistered, nil)
+	}
+
+	return nil
+}
+
+// ValidateEmailChange validates an email change for a given subject without
+// relying on a confirmation field (confirmation is a UI concern).
+// It checks presence, format, max length and uniqueness across users.
+func (val *EmailValidator) ValidateEmailChange(ctx context.Context, email string, subject string) error {
+	// i18n surface: C — admin/account API.
+	if len(email) == 0 {
+		return i18n.NewLocalizedError(i18n.ErrCodeEmailRequired, nil)
+	}
+
+	if err := val.ValidateEmailAddress(email); err != nil {
+		return err
+	}
+
+	if len(email) > 60 {
+		return i18n.NewLocalizedError(i18n.ErrCodeEmailTooLong, map[string]any{"max": 60})
+	}
+
+	user, err := val.database.GetUserBySubject(ctx, nil, subject)
+	if err != nil {
+		return err
+	}
+	// An unresolvable subject is not a validation problem the caller can show to
+	// a user: it means the request carried a stale or forged subject. Surface it
+	// as an error. Guarding the comparison below with `user != nil` instead would
+	// make the whole condition false and so report the change as valid, silently
+	// skipping the uniqueness check and letting one account claim an address that
+	// belongs to another.
+	if user == nil {
+		return errs.New("subject not found: " + subject)
+	}
+
+	userByEmail, err := val.database.GetUserByEmail(ctx, nil, email)
+	if err != nil {
+		return err
+	}
+
+	if userByEmail != nil && userByEmail.Subject != user.Subject {
+		return i18n.NewLocalizedError(i18n.ErrCodeEmailAlreadyRegistered, nil)
+	}
+
+	return nil
+}

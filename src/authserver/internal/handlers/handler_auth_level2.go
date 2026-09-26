@@ -1,0 +1,131 @@
+package handlers
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"log/slog"
+	"net/http"
+
+	"github.com/leodip/goiabada/authserver/internal/ceremony"
+	"github.com/leodip/goiabada/authserver/internal/config"
+	"github.com/leodip/goiabada/authserver/internal/handlerhelpers"
+	"github.com/leodip/goiabada/authserver/internal/models"
+	"github.com/leodip/goiabada/core/errs"
+)
+
+// authLevel2Database is what the level 2 hop needs: the client and the user whose OTP enrolment
+// decides the path.
+type authLevel2Database interface {
+	GetClientByClientIdentifier(ctx context.Context, tx *sql.Tx, clientIdentifier string) (*models.Client, error)
+	GetUserById(ctx context.Context, tx *sql.Tx, userId int64) (*models.User, error)
+}
+
+func HandleAuthLevel2Get(
+	httpHelper HttpHelper,
+	authHelper AuthHelper,
+	database authLevel2Database,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+
+		authContext, err := authHelper.GetAuthContext(r)
+		if err != nil {
+			if errors.Is(err, handlerhelpers.ErrNoAuthContext) {
+				var profileUrl = GetProfileURL()
+				slog.WarnContext(r.Context(), "auth context is missing, redirecting", "redirect", profileUrl)
+				http.Redirect(w, r, profileUrl, http.StatusFound)
+			} else {
+				httpHelper.InternalServerError(w, r, err)
+			}
+			return
+		}
+
+		requiredState := ceremony.AuthStateRequiresLevel2
+		if authContext.AuthState != requiredState {
+			rejectAuthStateMismatch(httpHelper, w, r, requiredState, authContext.AuthState)
+			return
+		}
+
+		// here we'll select what type of level2 auth we'll use (otp, email_code, sms_code, magic_link)
+		// today we only support otp, other types will be added in the future
+
+		client, err := database.GetClientByClientIdentifier(r.Context(), nil, authContext.ClientId)
+		if err != nil {
+			httpHelper.InternalServerError(w, r, err)
+			return
+		}
+		if client == nil {
+			httpHelper.InternalServerError(w, r, errs.Errorf("client %v not found", authContext.ClientId))
+			return
+		}
+
+		user, err := database.GetUserById(r.Context(), nil, authContext.UserId)
+		if err != nil {
+			httpHelper.InternalServerError(w, r, err)
+			return
+		}
+		// GetUserById answers (nil, nil) for a row that is not there, so a user deleted
+		// mid-ceremony reaches the dereference below. Byte-identical to the six sibling
+		// ceremony handlers that already check this (HandleAuthOtpGet, HandleAuthOtpPost,
+		// HandleConsentGet, HandleConsentPost, HandleAuthCompletedGet and
+		// handleImplicitFlow): consistency is the point rather than a side benefit, because
+		// "every handler nil-checks except this one" is the kind of gap that regresses
+		// (#242 decision 5).
+		if user == nil {
+			httpHelper.InternalServerError(w, r, errs.New("user not found"))
+			return
+		}
+
+		// Capture the user's OTP configuration generation, before the switch so that every
+		// arm below carries it: the level2_optional OTP prompt, the level2_optional skip for
+		// a user with no authenticator, and level2_mandatory. **The skip has to count.** A
+		// level2_optional ceremony for a user who has removed their authenticator is
+		// legitimately answered by skipping OTP, and if that did not promote, every session
+		// of that user would stay permanently behind and handlePromptNone would answer
+		// interaction_required for the rest of each session's life.
+		//
+		// Nothing is written here. The value rides on the auth context and is promoted once,
+		// at /auth/completed, so a ceremony abandoned at the OTP form discharges nothing
+		// (#242 decision 3).
+		otpConfigGeneration := user.OtpConfigGeneration
+		authContext.OtpConfigGeneration = &otpConfigGeneration
+
+		// is OTP optional or mandatory?
+		targetAcrLevel := authContext.GetTargetAcrLevel(client.DefaultAcrLevel)
+		switch targetAcrLevel {
+		case models.AcrLevel2Optional:
+			// optional
+			// if user has OTP enabled, we'll ask for it
+			if user.OTPEnabled {
+				authContext.AuthState = ceremony.AuthStateLevel2OTP
+				err = authHelper.SaveAuthContext(w, r, authContext)
+				if err != nil {
+					httpHelper.InternalServerError(w, r, err)
+					return
+				}
+				http.Redirect(w, r, config.GetAuthServer().BaseURL+"/auth/otp", http.StatusFound)
+			} else {
+				// user without OTP, we'll skip it
+				authContext.AuthState = ceremony.AuthStateAuthenticationCompleted
+				err = authHelper.SaveAuthContext(w, r, authContext)
+				if err != nil {
+					httpHelper.InternalServerError(w, r, err)
+					return
+				}
+				http.Redirect(w, r, config.GetAuthServer().BaseURL+"/auth/completed", http.StatusFound)
+			}
+		case models.AcrLevel2Mandatory:
+			// OTP is mandatory
+			authContext.AuthState = ceremony.AuthStateLevel2OTP
+			err = authHelper.SaveAuthContext(w, r, authContext)
+			if err != nil {
+				httpHelper.InternalServerError(w, r, err)
+				return
+			}
+			http.Redirect(w, r, config.GetAuthServer().BaseURL+"/auth/otp", http.StatusFound)
+		default:
+			// we should never reach this point
+			httpHelper.InternalServerError(w, r, errs.New("invalid targetAcrLevel: "+targetAcrLevel.String()))
+		}
+	}
+}

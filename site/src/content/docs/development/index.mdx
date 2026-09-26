@@ -1,0 +1,78 @@
+---
+title: Development
+description: Set up a development environment for contributing to Goiabada.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Goiabada was developed in [Go](https://go.dev/) using Linux. The [GitHub repository](https://github.com/leodip/goiabada) includes a VS Code dev container with all dependencies pre-configured.
+
+## Quick start
+
+1. Clone the repository
+2. Install [Microsoft's Dev Containers extension](https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-containers)
+3. Open the repository in the dev container
+4. Run `make serve` from the `src/authserver` directory
+5. Run `make serve` from the `src/adminconsole` directory (in another terminal)
+
+You now have a running Goiabada instance accessible at:
+
+- **Auth server**: http://localhost:19090
+- **Admin console**: http://localhost:19091
+
+Default credentials:
+
+- **Email**: admin@example.com
+- **Password**: changeme
+
+## AI-assisted development
+
+The repository includes a `CLAUDE.md` file at the root with detailed architecture documentation, authentication flow state machines, OAuth2 implementation details, and coding patterns. This file is designed to help AI coding assistants (like Claude, Cursor, or GitHub Copilot) understand the codebase quickly.
+
+## Project structure
+
+```
+src/
+├── authserver/         # Auth server application
+│   ├── cmd/           # Entry point
+│   ├── internal/      # Internal packages
+│   ├── tests/         # Integration tests
+│   └── web/           # Templates and static files
+├── adminconsole/       # Admin console application
+│   ├── cmd/           # Entry point
+│   ├── internal/      # Internal packages
+│   └── web/           # Templates and static files
+├── core/               # Shared code between applications
+└── build/              # Docker and build scripts
+```
+
+
+## Running tests
+
+To run the complete test suite (100% of tests):
+
+```bash
+cd src/authserver
+./run-tests.sh
+```
+
+This script will:
+- Run unit tests for authserver, adminconsole, and core modules
+- Run data layer tests against all supported databases (MySQL, PostgreSQL, SQL Server, SQLite)
+- Run integration tests against all supported databases
+- Automatically handle server startup/shutdown and cleanup
+
+## Technology stack
+
+| Component | Technology |
+|-----------|------------|
+| Language | Go |
+| HTTP Router | [Chi](https://github.com/go-chi/chi) |
+| SQL Builder | [go-sqlbuilder](https://github.com/huandu/go-sqlbuilder) |
+| CSS Framework | [Tailwind CSS](https://tailwindcss.com/) with [DaisyUI](https://daisyui.com/) |
+| Database | MySQL, PostgreSQL, SQL Server, SQLite |
+
+## Contributing
+
+Bug reports and pull requests are encouraged. Looking to contribute? Pick an issue from the [GitHub issues page](https://github.com/leodip/goiabada/issues) and get started. You can reach out at [contact@leodip.com](mailto:contact@leodip.com).
+

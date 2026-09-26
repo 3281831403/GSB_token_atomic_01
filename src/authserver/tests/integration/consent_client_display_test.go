@@ -1,0 +1,263 @@
+package integrationtests
+
+import (
+	"context"
+	"testing"
+
+	"github.com/leodip/goiabada/authserver/internal/models"
+	"github.com/leodip/goiabada/authserver/internal/passwordhash"
+	"github.com/leodip/goiabada/authserver/internal/testutil/fake"
+	"github.com/stretchr/testify/assert"
+)
+
+func TestConsent_ClientDisplay_ShowDisplayName(t *testing.T) {
+	// Create client with display name enabled and consent required
+	client := createClientWithDisplaySettings(t, ClientDisplaySettings{
+		ClientIdentifier: "test-app-" + fake.LetterN(8),
+		DisplayName:      "My Awesome Application",
+		ShowDisplayName:  true,
+		ShowLogo:         false,
+		ShowDescription:  false,
+		ShowWebsiteURL:   false,
+		ConsentRequired:  true, // Consent required
+		DefaultAcrLevel:  models.AcrLevel1,
+	})
+
+	redirectUri := &models.RedirectURI{
+		ClientId: client.Id,
+		URI:      fake.URL(),
+	}
+	err := database.CreateRedirectURI(context.Background(), nil, redirectUri)
+	assert.NoError(t, err)
+
+	// Create user
+	password := fake.Password(8)
+	passwordHashed, err := passwordhash.Hash(password)
+	assert.NoError(t, err)
+
+	user := &models.User{
+		Subject:      fake.UUID(),
+		Enabled:      true,
+		Email:        fake.Email(),
+		PasswordHash: passwordHashed,
+	}
+	err = database.CreateUser(context.Background(), nil, user)
+	assert.NoError(t, err)
+
+	// Navigate to consent screen
+	httpClient := createHttpClient(t)
+	resp := navigateToConsentScreen(t, httpClient, client, user, password, redirectUri.URI)
+	defer func() { _ = resp.Body.Close() }()
+
+	// Parse HTML
+	doc := parseHTMLResponse(t, resp)
+
+	// Assert display name is shown on consent screen
+	assertClientNameInHTML(t, doc, "My Awesome Application")
+	assertClientLogoInHTML(t, doc, client.ClientIdentifier, false)
+	assertClientDescriptionInHTML(t, doc, "", false)
+	assertClientWebsiteUrlInHTML(t, doc, "", false)
+}
+
+func TestConsent_ClientDisplay_ShowLogo_WithLogo(t *testing.T) {
+	// Create client with logo enabled
+	client := createClientWithDisplaySettings(t, ClientDisplaySettings{
+		ClientIdentifier: "test-app-" + fake.LetterN(8),
+		ShowLogo:         true,
+		UploadLogo:       true,
+		ShowDisplayName:  false,
+		ShowDescription:  false,
+		ShowWebsiteURL:   false,
+		ConsentRequired:  true,
+		DefaultAcrLevel:  models.AcrLevel1,
+	})
+
+	redirectUri := &models.RedirectURI{
+		ClientId: client.Id,
+		URI:      fake.URL(),
+	}
+	err := database.CreateRedirectURI(context.Background(), nil, redirectUri)
+	assert.NoError(t, err)
+
+	// Create user
+	password := fake.Password(8)
+	passwordHashed, err := passwordhash.Hash(password)
+	assert.NoError(t, err)
+
+	user := &models.User{
+		Subject:      fake.UUID(),
+		Enabled:      true,
+		Email:        fake.Email(),
+		PasswordHash: passwordHashed,
+	}
+	err = database.CreateUser(context.Background(), nil, user)
+	assert.NoError(t, err)
+
+	// Navigate to consent screen
+	httpClient := createHttpClient(t)
+	resp := navigateToConsentScreen(t, httpClient, client, user, password, redirectUri.URI)
+	defer func() { _ = resp.Body.Close() }()
+
+	// Parse HTML
+	doc := parseHTMLResponse(t, resp)
+
+	// Assert logo is visible on consent screen
+	assertClientNameInHTML(t, doc, client.ClientIdentifier)
+	assertClientLogoInHTML(t, doc, client.ClientIdentifier, true)
+	assertClientDescriptionInHTML(t, doc, "", false)
+	assertClientWebsiteUrlInHTML(t, doc, "", false)
+}
+
+func TestConsent_ClientDisplay_ShowDescription(t *testing.T) {
+	// Create client with description enabled
+	client := createClientWithDisplaySettings(t, ClientDisplaySettings{
+		ClientIdentifier: "test-app-" + fake.LetterN(8),
+		Description:      "The best app for testing OAuth flows",
+		ShowDescription:  true,
+		ShowLogo:         false,
+		ShowDisplayName:  false,
+		ShowWebsiteURL:   false,
+		ConsentRequired:  true,
+		DefaultAcrLevel:  models.AcrLevel1,
+	})
+
+	redirectUri := &models.RedirectURI{
+		ClientId: client.Id,
+		URI:      fake.URL(),
+	}
+	err := database.CreateRedirectURI(context.Background(), nil, redirectUri)
+	assert.NoError(t, err)
+
+	// Create user
+	password := fake.Password(8)
+	passwordHashed, err := passwordhash.Hash(password)
+	assert.NoError(t, err)
+
+	user := &models.User{
+		Subject:      fake.UUID(),
+		Enabled:      true,
+		Email:        fake.Email(),
+		PasswordHash: passwordHashed,
+	}
+	err = database.CreateUser(context.Background(), nil, user)
+	assert.NoError(t, err)
+
+	// Navigate to consent screen
+	httpClient := createHttpClient(t)
+	resp := navigateToConsentScreen(t, httpClient, client, user, password, redirectUri.URI)
+	defer func() { _ = resp.Body.Close() }()
+
+	// Parse HTML
+	doc := parseHTMLResponse(t, resp)
+
+	// Assert description is visible on consent screen
+	assertClientNameInHTML(t, doc, client.ClientIdentifier)
+	assertClientLogoInHTML(t, doc, client.ClientIdentifier, false)
+	assertClientDescriptionInHTML(t, doc, "The best app for testing OAuth flows", true)
+	assertClientWebsiteUrlInHTML(t, doc, "", false)
+}
+
+func TestConsent_ClientDisplay_AllEnabled(t *testing.T) {
+	// Create client with all display settings enabled
+	client := createClientWithDisplaySettings(t, ClientDisplaySettings{
+		ClientIdentifier: "test-app-" + fake.LetterN(8),
+		DisplayName:      "My Awesome Application",
+		Description:      "The best app for testing OAuth flows",
+		WebsiteURL:       "https://example.com",
+		ShowLogo:         true,
+		ShowDisplayName:  true,
+		ShowDescription:  true,
+		ShowWebsiteURL:   true,
+		UploadLogo:       true,
+		ConsentRequired:  true,
+		DefaultAcrLevel:  models.AcrLevel1,
+	})
+
+	redirectUri := &models.RedirectURI{
+		ClientId: client.Id,
+		URI:      fake.URL(),
+	}
+	err := database.CreateRedirectURI(context.Background(), nil, redirectUri)
+	assert.NoError(t, err)
+
+	// Create user
+	password := fake.Password(8)
+	passwordHashed, err := passwordhash.Hash(password)
+	assert.NoError(t, err)
+
+	user := &models.User{
+		Subject:      fake.UUID(),
+		Enabled:      true,
+		Email:        fake.Email(),
+		PasswordHash: passwordHashed,
+	}
+	err = database.CreateUser(context.Background(), nil, user)
+	assert.NoError(t, err)
+
+	// Navigate to consent screen
+	httpClient := createHttpClient(t)
+	resp := navigateToConsentScreen(t, httpClient, client, user, password, redirectUri.URI)
+	defer func() { _ = resp.Body.Close() }()
+
+	// Parse HTML
+	doc := parseHTMLResponse(t, resp)
+
+	// Assert all elements are visible on consent screen
+	assertClientNameInHTML(t, doc, "My Awesome Application")
+	assertClientLogoInHTML(t, doc, client.ClientIdentifier, true)
+	assertClientDescriptionInHTML(t, doc, "The best app for testing OAuth flows", true)
+	assertClientWebsiteUrlInHTML(t, doc, "https://example.com", true)
+}
+
+func TestConsent_ClientDisplay_AllDisabled(t *testing.T) {
+	// Create client with all display settings disabled
+	clientId := "test-app-" + fake.LetterN(8)
+	client := createClientWithDisplaySettings(t, ClientDisplaySettings{
+		ClientIdentifier: clientId,
+		DisplayName:      "My Awesome Application",
+		Description:      "The best app for testing OAuth flows",
+		WebsiteURL:       "https://example.com",
+		ShowLogo:         false,
+		ShowDisplayName:  false,
+		ShowDescription:  false,
+		ShowWebsiteURL:   false,
+		UploadLogo:       true, // Logo exists but hidden
+		ConsentRequired:  true,
+		DefaultAcrLevel:  models.AcrLevel1,
+	})
+
+	redirectUri := &models.RedirectURI{
+		ClientId: client.Id,
+		URI:      fake.URL(),
+	}
+	err := database.CreateRedirectURI(context.Background(), nil, redirectUri)
+	assert.NoError(t, err)
+
+	// Create user
+	password := fake.Password(8)
+	passwordHashed, err := passwordhash.Hash(password)
+	assert.NoError(t, err)
+
+	user := &models.User{
+		Subject:      fake.UUID(),
+		Enabled:      true,
+		Email:        fake.Email(),
+		PasswordHash: passwordHashed,
+	}
+	err = database.CreateUser(context.Background(), nil, user)
+	assert.NoError(t, err)
+
+	// Navigate to consent screen
+	httpClient := createHttpClient(t)
+	resp := navigateToConsentScreen(t, httpClient, client, user, password, redirectUri.URI)
+	defer func() { _ = resp.Body.Close() }()
+
+	// Parse HTML
+	doc := parseHTMLResponse(t, resp)
+
+	// Only client identifier should be visible
+	assertClientNameInHTML(t, doc, clientId)
+	assertClientLogoInHTML(t, doc, client.ClientIdentifier, false)
+	assertClientDescriptionInHTML(t, doc, "The best app for testing OAuth flows", false)
+	assertClientWebsiteUrlInHTML(t, doc, "https://example.com", false)
+}

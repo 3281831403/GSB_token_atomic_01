@@ -1,0 +1,283 @@
+package server
+
+import (
+	"fmt"
+	"net/http"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/leodip/goiabada/adminconsole/internal/apiclient"
+	"github.com/leodip/goiabada/adminconsole/internal/config"
+	"github.com/leodip/goiabada/adminconsole/internal/handlerhelpers"
+	"github.com/leodip/goiabada/adminconsole/internal/handlers"
+	"github.com/leodip/goiabada/adminconsole/internal/handlers/accounthandlers"
+	"github.com/leodip/goiabada/adminconsole/internal/handlers/adminclienthandlers"
+	"github.com/leodip/goiabada/adminconsole/internal/handlers/admingrouphandlers"
+	"github.com/leodip/goiabada/adminconsole/internal/handlers/adminresourcehandlers"
+	"github.com/leodip/goiabada/adminconsole/internal/handlers/adminsettingshandlers"
+	"github.com/leodip/goiabada/adminconsole/internal/handlers/adminuserhandlers"
+	"github.com/leodip/goiabada/adminconsole/internal/middleware"
+	"github.com/leodip/goiabada/adminconsole/internal/oauthclient"
+	"github.com/leodip/goiabada/core/constants"
+	"github.com/leodip/goiabada/core/validators"
+)
+
+func (s *Server) initRoutes(root chi.Router) {
+	// Prefer internal base URL for in-cluster communication
+	authBase := config.GetAuthServer().GetEffectiveBaseURL()
+
+	// Initialize all the service dependencies
+	apiClient := apiclient.NewAuthServerClient(authBase)
+
+	authServerClient := newAuthServerHTTPClient()
+
+	tokenParser := oauthclient.NewJWKSTokenParser(authBase, authServerClient, constants.AdminConsoleClientIdentifier, middleware.SettingsReader{})
+	tokenExchanger := oauthclient.NewTokenExchanger(authServerClient)
+
+	identifierValidator := validators.NewIdentifierValidator()
+
+	httpHelper := handlerhelpers.NewHttpHelper(s.templateFS, middleware.SettingsReader{})
+	authHelper := oauthclient.NewAuthHelper(s.sessionStore, constants.AdminConsoleSessionName, config.GetAdminConsole().BaseURL, config.GetAuthServer().BaseURL)
+
+	// Initialize middleware
+	middlewareJwt := middleware.NewMiddlewareJwt(
+		s.sessionStore,
+		constants.AdminConsoleSessionName,
+		tokenParser,
+		authHelper,
+		httpHelper,
+		authServerClient,
+		authBase,
+		config.GetAdminConsole().BaseURL,
+		constants.AdminConsoleClientIdentifier,
+		config.GetAdminConsole().OAuthClientSecret,
+	)
+	jwtSessionHandler := middlewareJwt.JwtSessionHandler()
+	requiresAdminScope := middlewareJwt.RequiresScope([]string{fmt.Sprintf("%v:%v", constants.AuthServerResourceIdentifier, constants.ManagePermissionIdentifier)})
+	requiresAccountScope := middlewareJwt.RequiresScope([]string{fmt.Sprintf("%v:%v", constants.AuthServerResourceIdentifier, constants.ManageAccountPermissionIdentifier)})
+	// User-locale refinement sits inside each authenticated chain immediately
+	// after JWT validation. It reads the locale claim from the validated JWT
+	// (requires the profile scope, see middleware_jwt.buildScopeString) and
+	// refines the localizer to the user's stored locale unless explicit
+	// request intent (?ui_locales or in-flight AuthContext.UILocales) is
+	// present. Falls through to the existing localizer if the claim is
+	// missing — never silently jumps to English.
+	localeFromJWT := middleware.MiddlewareLocaleFromJWT()
+
+	// Define middleware combinations
+	baseAuth := []func(http.Handler) http.Handler{
+		jwtSessionHandler,
+		localeFromJWT,
+	}
+
+	accountAuth := []func(http.Handler) http.Handler{
+		jwtSessionHandler,
+		localeFromJWT,
+		requiresAccountScope,
+	}
+
+	adminAuth := []func(http.Handler) http.Handler{
+		jwtSessionHandler,
+		localeFromJWT,
+		requiresAdminScope,
+	}
+
+	// Base routes
+	root.NotFound(handlers.HandleNotFoundGet(httpHelper))
+	root.With(baseAuth...).Get("/", handlers.HandleIndexGet(authHelper, httpHelper, s.sessionStore))
+	// /unauthorized is reached by authenticated-but-forbidden users via the
+	// redirect in middleware_jwt's RequiresScope path. Wrapping it through
+	// baseAuth lets the user-locale refinement fire so the page renders
+	// in the user's stored locale. baseAuth tolerates missing-permission
+	// cases — the whole point of this page is that the user is
+	// authenticated but not authorized.
+	root.With(baseAuth...).Get("/unauthorized", handlers.HandleUnauthorizedGet(httpHelper))
+	root.Get("/health", handlers.HandleHealthCheckGet(httpHelper))
+
+	// Auth routes
+	root.With(baseAuth...).Route("/auth", func(r chi.Router) {
+		r.Post("/callback", handlers.HandleAuthCallbackPost(httpHelper, s.sessionStore, tokenParser, tokenExchanger))
+		r.Get("/logout", accounthandlers.HandleAccountLogoutGet(httpHelper, s.sessionStore, apiClient))
+		r.Get("/session-ended", handlers.HandleSessionEndedGet(httpHelper, s.sessionStore))
+	})
+
+	// Account routes
+	root.Route("/account", func(r chi.Router) {
+		r.Use(accountAuth...)
+
+		r.Get("/", func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, config.GetAdminConsole().BaseURL+"/account/profile", http.StatusFound)
+		})
+		r.Get("/profile", accounthandlers.HandleAccountProfileGet(httpHelper, s.sessionStore, apiClient))
+		r.Post("/profile", accounthandlers.HandleAccountProfilePost(httpHelper, s.sessionStore, apiClient))
+		r.Get("/email", accounthandlers.HandleAccountEmailGet(httpHelper, s.sessionStore, apiClient))
+		r.Post("/email", accounthandlers.HandleAccountEmailPost(httpHelper, s.sessionStore, apiClient))
+		r.Get("/email-verification", accounthandlers.HandleAccountEmailVerificationGet(httpHelper, s.sessionStore, apiClient))
+		r.Post("/email-send-verification", accounthandlers.HandleAccountEmailSendVerificationPost(httpHelper, apiClient))
+		r.Post("/email-verification", accounthandlers.HandleAccountEmailVerificationPost(httpHelper, s.sessionStore, apiClient))
+		r.Get("/address", accounthandlers.HandleAccountAddressGet(httpHelper, s.sessionStore, apiClient))
+		r.Post("/address", accounthandlers.HandleAccountAddressPost(httpHelper, s.sessionStore, apiClient))
+		r.Get("/phone", accounthandlers.HandleAccountPhoneGet(httpHelper, s.sessionStore, apiClient))
+		r.Post("/phone", accounthandlers.HandleAccountPhonePost(httpHelper, s.sessionStore, apiClient))
+		r.Get("/change-password", accounthandlers.HandleAccountChangePasswordGet(httpHelper, s.sessionStore, apiClient))
+		r.Post("/change-password", accounthandlers.HandleAccountChangePasswordPost(httpHelper, s.sessionStore, apiClient))
+		r.Get("/otp", accounthandlers.HandleAccountOtpGet(httpHelper, apiClient))
+		r.Post("/otp", accounthandlers.HandleAccountOtpPost(httpHelper, apiClient))
+		r.Get("/manage-consents", accounthandlers.HandleAccountManageConsentsGet(httpHelper, apiClient))
+		r.Post("/manage-consents", accounthandlers.HandleAccountManageConsentsRevokePost(httpHelper, apiClient))
+		r.Get("/sessions", accounthandlers.HandleAccountSessionsGet(httpHelper, apiClient))
+		r.Post("/sessions", accounthandlers.HandleAccountSessionsEndSesssionPost(httpHelper, apiClient))
+
+		// Profile picture page and API routes
+		r.Get("/picture", accounthandlers.HandleAccountPictureGet(httpHelper, apiClient))
+		r.Post("/picture", accounthandlers.HandleAccountProfilePicturePost(httpHelper, apiClient))
+		r.Delete("/picture", accounthandlers.HandleAccountProfilePictureDelete(httpHelper, apiClient))
+	})
+
+	// Admin routes
+	root.Route("/admin", func(r chi.Router) {
+		r.Use(adminAuth...)
+
+		r.Get("/get-permissions", handlers.HandleAdminGetPermissionsGet(httpHelper, apiClient))
+
+		// Client routes
+		r.Get("/clients", adminclienthandlers.HandleAdminClientsGet(httpHelper, apiClient))
+		r.Get("/clients/{clientId}/settings", adminclienthandlers.HandleAdminClientSettingsGet(httpHelper, s.sessionStore, apiClient))
+		r.Post("/clients/{clientId}/settings", adminclienthandlers.HandleAdminClientSettingsPost(httpHelper, s.sessionStore, apiClient))
+		r.Get("/clients/{clientId}/tokens", adminclienthandlers.HandleAdminClientTokensGet(httpHelper, s.sessionStore, apiClient))
+		r.Post("/clients/{clientId}/tokens", adminclienthandlers.HandleAdminClientTokensPost(httpHelper, s.sessionStore, apiClient))
+		r.Get("/clients/{clientId}/authentication", adminclienthandlers.HandleAdminClientAuthenticationGet(httpHelper, s.sessionStore, apiClient))
+		r.Post("/clients/{clientId}/authentication", adminclienthandlers.HandleAdminClientAuthenticationPost(httpHelper, s.sessionStore, apiClient))
+		r.Get("/clients/{clientId}/oauth2-flows", adminclienthandlers.HandleAdminClientOAuth2Get(httpHelper, s.sessionStore, apiClient))
+		r.Post("/clients/{clientId}/oauth2-flows", adminclienthandlers.HandleAdminClientOAuth2Post(httpHelper, s.sessionStore, apiClient))
+		r.Get("/clients/{clientId}/redirect-uris", adminclienthandlers.HandleAdminClientRedirectURIsGet(httpHelper, s.sessionStore, apiClient))
+		r.Post("/clients/{clientId}/redirect-uris", adminclienthandlers.HandleAdminClientRedirectURIsPost(httpHelper, s.sessionStore, apiClient))
+		r.Get("/clients/{clientId}/web-origins", adminclienthandlers.HandleAdminClientWebOriginsGet(httpHelper, s.sessionStore, apiClient))
+		r.Post("/clients/{clientId}/web-origins", adminclienthandlers.HandleAdminClientWebOriginsPost(httpHelper, s.sessionStore, apiClient))
+		r.Get("/clients/{clientId}/user-sessions", adminclienthandlers.HandleAdminClientUserSessionsGet(httpHelper, apiClient))
+		r.Post("/clients/{clientId}/user-sessions/delete", adminclienthandlers.HandleAdminClientUserSessionsPost(httpHelper, apiClient))
+		r.Get("/clients/{clientId}/permissions", adminclienthandlers.HandleAdminClientPermissionsGet(httpHelper, s.sessionStore, apiClient))
+		r.Post("/clients/{clientId}/permissions", adminclienthandlers.HandleAdminClientPermissionsPost(httpHelper, s.sessionStore, apiClient))
+		r.Get("/clients/generate-new-secret", adminclienthandlers.HandleAdminClientGenerateNewSecretGet(httpHelper))
+		r.Get("/clients/{clientId}/delete", adminclienthandlers.HandleAdminClientDeleteGet(httpHelper, apiClient))
+		r.Post("/clients/{clientId}/delete", adminclienthandlers.HandleAdminClientDeletePost(httpHelper, apiClient))
+		r.Get("/clients/{clientId}/logo", adminclienthandlers.HandleAdminClientLogoGet(httpHelper, apiClient))
+		r.Post("/clients/{clientId}/logo", adminclienthandlers.HandleAdminClientLogoPost(httpHelper, apiClient))
+		r.Delete("/clients/{clientId}/logo", adminclienthandlers.HandleAdminClientLogoDelete(httpHelper, apiClient))
+		r.Get("/clients/new", adminclienthandlers.HandleAdminClientNewGet(httpHelper))
+		r.Post("/clients/new", adminclienthandlers.HandleAdminClientNewPost(httpHelper, apiClient))
+
+		// Resource routes
+		r.Get("/resources", adminresourcehandlers.HandleAdminResourcesGet(httpHelper, apiClient))
+		r.Get("/resources/{resourceId}/settings", adminresourcehandlers.HandleAdminResourceSettingsGet(httpHelper, s.sessionStore, apiClient))
+		r.Post("/resources/{resourceId}/settings", adminresourcehandlers.HandleAdminResourceSettingsPost(httpHelper, s.sessionStore, apiClient))
+		r.Get("/resources/{resourceId}/permissions", adminresourcehandlers.HandleAdminResourcePermissionsGet(httpHelper, s.sessionStore, apiClient))
+		r.Post("/resources/{resourceId}/permissions", adminresourcehandlers.HandleAdminResourcePermissionsPost(httpHelper, s.sessionStore, apiClient))
+		r.Post("/resources/validate-permission", adminresourcehandlers.HandleAdminResourceValidatePermissionPost(httpHelper, identifierValidator))
+		r.Get("/resources/{resourceId}/users-with-permission", adminresourcehandlers.HandleAdminResourceUsersWithPermissionGet(httpHelper, s.sessionStore, apiClient))
+		r.Post("/resources/{resourceId}/users-with-permission/remove/{userId}/{permissionId}", adminresourcehandlers.HandleAdminResourceUsersWithPermissionRemovePermissionPost(httpHelper, apiClient))
+		r.Get("/resources/{resourceId}/users-with-permission/add/{permissionId}", adminresourcehandlers.HandleAdminResourceUsersWithPermissionAddGet(httpHelper, apiClient))
+		r.Post("/resources/{resourceId}/users-with-permission/add/{userId}/{permissionId}", adminresourcehandlers.HandleAdminResourceUsersWithPermissionAddPermissionPost(httpHelper, apiClient))
+		r.Get("/resources/{resourceId}/users-with-permission/search/{permissionId}", adminresourcehandlers.HandleAdminResourceUsersWithPermissionSearchGet(httpHelper, apiClient))
+		r.Get("/resources/{resourceId}/groups-with-permission", adminresourcehandlers.HandleAdminResourceGroupsWithPermissionGet(httpHelper, s.sessionStore, apiClient))
+		r.Post("/resources/{resourceId}/groups-with-permission/add/{groupId}/{permissionId}", adminresourcehandlers.HandleAdminResourceGroupsWithPermissionAddPermissionPost(httpHelper, apiClient))
+		r.Post("/resources/{resourceId}/groups-with-permission/remove/{groupId}/{permissionId}", adminresourcehandlers.HandleAdminResourceGroupsWithPermissionRemovePermissionPost(httpHelper, apiClient))
+		r.Get("/resources/{resourceId}/delete", adminresourcehandlers.HandleAdminResourceDeleteGet(httpHelper, apiClient))
+		r.Post("/resources/{resourceId}/delete", adminresourcehandlers.HandleAdminResourceDeletePost(httpHelper, apiClient))
+		r.Get("/resources/new", adminresourcehandlers.HandleAdminResourceNewGet(httpHelper))
+		r.Post("/resources/new", adminresourcehandlers.HandleAdminResourceNewPost(httpHelper, apiClient))
+
+		// Group routes
+		r.Get("/groups", admingrouphandlers.HandleAdminGroupsGet(httpHelper, apiClient))
+		r.Get("/groups/{groupId}/settings", admingrouphandlers.HandleAdminGroupSettingsGet(httpHelper, s.sessionStore, apiClient))
+		r.Get("/groups/{groupId}/attributes", admingrouphandlers.HandleAdminGroupAttributesGet(httpHelper, apiClient))
+		r.Get("/groups/{groupId}/attributes/add", admingrouphandlers.HandleAdminGroupAttributesAddGet(httpHelper, apiClient))
+		r.Post("/groups/{groupId}/attributes/add", admingrouphandlers.HandleAdminGroupAttributesAddPost(httpHelper, apiClient))
+		r.Get("/groups/{groupId}/attributes/edit/{attributeId}", admingrouphandlers.HandleAdminGroupAttributesEditGet(httpHelper, apiClient))
+		r.Post("/groups/{groupId}/attributes/edit/{attributeId}", admingrouphandlers.HandleAdminGroupAttributesEditPost(httpHelper, apiClient))
+		r.Post("/groups/{groupId}/attributes/remove/{attributeId}", admingrouphandlers.HandleAdminGroupAttributesRemovePost(httpHelper, apiClient))
+		r.Post("/groups/{groupId}/settings", admingrouphandlers.HandleAdminGroupSettingsPost(httpHelper, s.sessionStore, apiClient))
+		r.Get("/groups/{groupId}/members", admingrouphandlers.HandleAdminGroupMembersGet(httpHelper, apiClient))
+		r.Get("/groups/{groupId}/members/add", admingrouphandlers.HandleAdminGroupMembersAddGet(httpHelper, apiClient))
+		r.Post("/groups/{groupId}/members/add", admingrouphandlers.HandleAdminGroupMembersAddPost(httpHelper, apiClient))
+		r.Post("/groups/{groupId}/members/remove/{userId}", admingrouphandlers.HandleAdminGroupMembersRemoveUserPost(httpHelper, apiClient))
+		r.Get("/groups/{groupId}/members/search", admingrouphandlers.HandleAdminGroupMembersSearchGet(httpHelper, apiClient))
+		r.Get("/groups/{groupId}/permissions", admingrouphandlers.HandleAdminGroupPermissionsGet(httpHelper, s.sessionStore, apiClient))
+		r.Post("/groups/{groupId}/permissions", admingrouphandlers.HandleAdminGroupPermissionsPost(httpHelper, s.sessionStore, apiClient))
+		r.Get("/groups/{groupId}/delete", admingrouphandlers.HandleAdminGroupDeleteGet(httpHelper, apiClient))
+		r.Post("/groups/{groupId}/delete", admingrouphandlers.HandleAdminGroupDeletePost(httpHelper, apiClient))
+		r.Get("/groups/new", admingrouphandlers.HandleAdminGroupNewGet(httpHelper))
+		r.Post("/groups/new", admingrouphandlers.HandleAdminGroupNewPost(httpHelper, apiClient))
+
+		// User routes
+		r.Get("/users", adminuserhandlers.HandleAdminUsersGet(httpHelper, apiClient))
+		r.Get("/users/{userId}/details", adminuserhandlers.HandleAdminUserDetailsGet(httpHelper, s.sessionStore, apiClient))
+		r.Post("/users/{userId}/details", adminuserhandlers.HandleAdminUserDetailsPost(httpHelper, s.sessionStore, apiClient))
+		r.Get("/users/{userId}/profile", adminuserhandlers.HandleAdminUserProfileGet(httpHelper, s.sessionStore, apiClient))
+		r.Post("/users/{userId}/profile", adminuserhandlers.HandleAdminUserProfilePost(httpHelper, s.sessionStore, apiClient))
+		r.Get("/users/{userId}/email", adminuserhandlers.HandleAdminUserEmailGet(httpHelper, s.sessionStore, apiClient))
+		r.Post("/users/{userId}/email", adminuserhandlers.HandleAdminUserEmailPost(httpHelper, s.sessionStore, apiClient))
+		r.Get("/users/{userId}/phone", adminuserhandlers.HandleAdminUserPhoneGet(httpHelper, s.sessionStore, apiClient))
+		r.Post("/users/{userId}/phone", adminuserhandlers.HandleAdminUserPhonePost(httpHelper, s.sessionStore, apiClient))
+		r.Get("/users/{userId}/address", adminuserhandlers.HandleAdminUserAddressGet(httpHelper, s.sessionStore, apiClient))
+		r.Post("/users/{userId}/address", adminuserhandlers.HandleAdminUserAddressPost(httpHelper, s.sessionStore, apiClient))
+		r.Get("/users/{userId}/authentication", adminuserhandlers.HandleAdminUserAuthenticationGet(httpHelper, s.sessionStore, apiClient))
+		r.Post("/users/{userId}/authentication", adminuserhandlers.HandleAdminUserAuthenticationPost(httpHelper, s.sessionStore, apiClient))
+		r.Get("/users/{userId}/consents", adminuserhandlers.HandleAdminUserConsentsGet(httpHelper, s.sessionStore, apiClient))
+		r.Post("/users/{userId}/consents", adminuserhandlers.HandleAdminUserConsentsPost(httpHelper, apiClient))
+		r.Get("/users/{userId}/sessions", adminuserhandlers.HandleAdminUserSessionsGet(httpHelper, apiClient))
+		r.Post("/users/{userId}/sessions", adminuserhandlers.HandleAdminUserSessionsPost(httpHelper, apiClient))
+		r.Get("/users/{userId}/attributes", adminuserhandlers.HandleAdminUserAttributesGet(httpHelper, apiClient))
+		r.Get("/users/{userId}/attributes/add", adminuserhandlers.HandleAdminUserAttributesAddGet(httpHelper, apiClient))
+		r.Post("/users/{userId}/attributes/add", adminuserhandlers.HandleAdminUserAttributesAddPost(httpHelper, apiClient))
+		r.Get("/users/{userId}/attributes/edit/{attributeId}", adminuserhandlers.HandleAdminUserAttributesEditGet(httpHelper, apiClient))
+		r.Post("/users/{userId}/attributes/edit/{attributeId}", adminuserhandlers.HandleAdminUserAttributesEditPost(httpHelper, apiClient))
+		r.Post("/users/{userId}/attributes/remove/{attributeId}", adminuserhandlers.HandleAdminUserAttributesRemovePost(httpHelper, apiClient))
+		r.Get("/users/{userId}/permissions", adminuserhandlers.HandleAdminUserPermissionsGet(httpHelper, s.sessionStore, apiClient))
+		r.Post("/users/{userId}/permissions", adminuserhandlers.HandleAdminUserPermissionsPost(httpHelper, s.sessionStore, apiClient))
+		r.Get("/users/{userId}/groups", adminuserhandlers.HandleAdminUserGroupsGet(httpHelper, s.sessionStore, apiClient))
+		r.Post("/users/{userId}/groups", adminuserhandlers.HandleAdminUserGroupsPost(httpHelper, s.sessionStore, apiClient))
+		r.Get("/users/{userId}/delete", adminuserhandlers.HandleAdminUserDeleteGet(httpHelper, apiClient))
+		r.Post("/users/{userId}/delete", adminuserhandlers.HandleAdminUserDeletePost(httpHelper, apiClient))
+		r.Get("/users/new", adminuserhandlers.HandleAdminUserNewGet(httpHelper))
+		r.Post("/users/new", adminuserhandlers.HandleAdminUserNewPost(httpHelper, s.sessionStore, apiClient))
+		// User profile picture page and API routes
+		r.Get("/users/{userId}/picture", adminuserhandlers.HandleAdminUserPictureGet(httpHelper, apiClient))
+		r.Post("/users/{userId}/picture", adminuserhandlers.HandleAdminUserProfilePicturePost(httpHelper, apiClient))
+		r.Delete("/users/{userId}/picture", adminuserhandlers.HandleAdminUserProfilePictureDelete(httpHelper, apiClient))
+
+		// Settings routes
+		r.Get("/settings/general", adminsettingshandlers.HandleAdminSettingsGeneralGet(httpHelper, s.sessionStore, apiClient))
+		r.Post("/settings/general", adminsettingshandlers.HandleAdminSettingsGeneralPost(httpHelper, s.sessionStore, apiClient, s.settingsCache))
+		r.Get("/settings/ui-theme", adminsettingshandlers.HandleAdminSettingsUIThemeGet(httpHelper, s.sessionStore, apiClient))
+		r.Post("/settings/ui-theme", adminsettingshandlers.HandleAdminSettingsUIThemePost(httpHelper, s.sessionStore, apiClient, s.settingsCache))
+		r.Get("/settings/sessions", adminsettingshandlers.HandleAdminSettingsSessionsGet(httpHelper, s.sessionStore, apiClient))
+		r.Post("/settings/sessions", adminsettingshandlers.HandleAdminSettingsSessionsPost(httpHelper, s.sessionStore, apiClient))
+		r.Get("/settings/tokens", adminsettingshandlers.HandleAdminSettingsTokensGet(httpHelper, s.sessionStore, apiClient))
+		r.Post("/settings/tokens", adminsettingshandlers.HandleAdminSettingsTokensPost(httpHelper, s.sessionStore, apiClient))
+		r.Get("/settings/keys", adminsettingshandlers.HandleAdminSettingsKeysGet(httpHelper, apiClient))
+		r.Post("/settings/keys/rotate", adminsettingshandlers.HandleAdminSettingsKeysRotatePost(httpHelper, apiClient))
+		r.Post("/settings/keys/revoke", adminsettingshandlers.HandleAdminSettingsKeysRevokePost(httpHelper, apiClient))
+		r.Get("/settings/email", adminsettingshandlers.HandleAdminSettingsEmailGet(httpHelper, s.sessionStore, apiClient))
+		r.Post("/settings/email", adminsettingshandlers.HandleAdminSettingsEmailPost(httpHelper, s.sessionStore, apiClient, s.settingsCache))
+		r.Get("/settings/email/send-test-email", adminsettingshandlers.HandleAdminSettingsEmailSendTestGet(httpHelper, s.sessionStore, apiClient))
+		r.Post("/settings/email/send-test-email", adminsettingshandlers.HandleAdminSettingsEmailSendTestPost(httpHelper, s.sessionStore, apiClient))
+		r.Get("/settings/audit-logs", adminsettingshandlers.HandleAdminSettingsAuditLogsGet(httpHelper, s.sessionStore, apiClient))
+		r.Post("/settings/audit-logs", adminsettingshandlers.HandleAdminSettingsAuditLogsPost(httpHelper, s.sessionStore, apiClient))
+		r.Get("/settings/audit-log-viewer", adminsettingshandlers.HandleAdminSettingsAuditLogViewerGet(httpHelper, apiClient))
+	})
+}
+
+// newAuthServerHTTPClient builds the one client for all three calls this process makes to
+// the auth server: the JWKS fetch, the code-for-token exchange and the refresh grant. Bare
+// &http.Client{} literals here left every one of them with no bound on the wait for
+// response headers or the body, so a peer that accepted the connection and never answered
+// held the handler open indefinitely.
+//
+// A function rather than a literal inline because for one of the three this is the only
+// bound there is. The two grants build their own deadline, being single use and detached
+// from the browser's context, but the JWKS fetch deliberately keeps the request's own
+// context -- it is an idempotent read -- and a browser context carries no deadline. So the
+// timeout here is what bounds it, and a function is what a test can reach (#338).
+func newAuthServerHTTPClient() *http.Client {
+	return &http.Client{Timeout: oauthclient.TokenExchangeTimeout}
+}

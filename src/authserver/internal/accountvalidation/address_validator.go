@@ -1,0 +1,86 @@
+package accountvalidation
+
+import (
+	"github.com/leodip/goiabada/core/countries"
+	"github.com/leodip/goiabada/core/i18n"
+)
+
+type AddressValidator struct {
+}
+
+func NewAddressValidator() *AddressValidator {
+	return &AddressValidator{}
+}
+
+type ValidateAddressInput struct {
+	AddressLine1      string
+	AddressLine2      string
+	AddressLocality   string
+	AddressRegion     string
+	AddressPostalCode string
+	AddressCountry    string
+}
+
+func (val *AddressValidator) ValidateAddress(input *ValidateAddressInput) error {
+
+	// i18n surface: C — admin/account API.
+	if len(input.AddressLine1) > 60 {
+		return i18n.NewLocalizedError(i18n.ErrCodeAddressLine1TooLong, map[string]any{"max": 60})
+	}
+
+	if len(input.AddressLine2) > 60 {
+		return i18n.NewLocalizedError(i18n.ErrCodeAddressLine2TooLong, map[string]any{"max": 60})
+	}
+
+	if len(input.AddressLocality) > 60 {
+		return i18n.NewLocalizedError(i18n.ErrCodeAddressLocalityTooLong, map[string]any{"max": 60})
+	}
+
+	if len(input.AddressRegion) > 60 {
+		return i18n.NewLocalizedError(i18n.ErrCodeAddressRegionTooLong, map[string]any{"max": 60})
+	}
+
+	if len(input.AddressPostalCode) > 30 {
+		return i18n.NewLocalizedError(i18n.ErrCodeAddressPostalCodeTooLong, map[string]any{"max": 30})
+	}
+
+	// Refuse "<" and ">" rather than stripping them, so an accepted address is
+	// stored exactly as it was sent (#275). Country is left to its alpha-2
+	// lookup below, which already excludes both characters.
+	if err := ValidateNoAngleBrackets(input.AddressLine1, i18n.ErrCodeAddressAngleBrackets); err != nil {
+		return err
+	}
+
+	if err := ValidateNoAngleBrackets(input.AddressLine2, i18n.ErrCodeAddressAngleBrackets); err != nil {
+		return err
+	}
+
+	if err := ValidateNoAngleBrackets(input.AddressLocality, i18n.ErrCodeAddressAngleBrackets); err != nil {
+		return err
+	}
+
+	if err := ValidateNoAngleBrackets(input.AddressRegion, i18n.ErrCodeAddressAngleBrackets); err != nil {
+		return err
+	}
+
+	if err := ValidateNoAngleBrackets(input.AddressPostalCode, i18n.ErrCodeAddressAngleBrackets); err != nil {
+		return err
+	}
+
+	// The canonical stored country representation is ISO 3166-1 alpha-2
+	// (e.g. "US", "BR"). The form posts alpha-2 codes; the stored value
+	// is also alpha-2 (a one-time migration converted any pre-existing
+	// alpha-3 values).
+	if len(input.AddressCountry) > 0 {
+		if len(input.AddressCountry) != 2 {
+			return i18n.NewLocalizedError(i18n.ErrCodeAddressCountryInvalid, nil)
+		}
+		// ByAlpha2 is an exact, upper-case-only lookup, so lowercase or unknown
+		// codes are rejected here.
+		if _, ok := countries.ByAlpha2(input.AddressCountry); !ok {
+			return i18n.NewLocalizedError(i18n.ErrCodeAddressCountryInvalid, nil)
+		}
+	}
+
+	return nil
+}

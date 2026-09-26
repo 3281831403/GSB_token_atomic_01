@@ -1,0 +1,1299 @@
+package apihandlers
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/leodip/goiabada/authserver/internal/accountvalidation"
+	"github.com/leodip/goiabada/authserver/internal/apimapping"
+	"github.com/leodip/goiabada/authserver/internal/audit"
+	"github.com/leodip/goiabada/authserver/internal/constants"
+	"github.com/leodip/goiabada/authserver/internal/encryption"
+	"github.com/leodip/goiabada/authserver/internal/models"
+	"github.com/leodip/goiabada/authserver/internal/revocation"
+	"github.com/leodip/goiabada/authserver/internal/urlutil"
+	"github.com/leodip/goiabada/core/api"
+	"github.com/leodip/goiabada/core/errs"
+	"github.com/leodip/goiabada/core/i18n"
+	"github.com/leodip/goiabada/core/stringutil"
+	"github.com/leodip/goiabada/core/validators"
+)
+
+// clientsDatabase is what the client endpoints need: the client row, its redirect URIs and web
+// origins, and the transaction that changes them together.
+//
+// It embeds the revocation port because making a confidential client public revokes the grants it
+// held while it still had to authenticate.
+type clientsDatabase interface {
+	revocation.Database
+
+	AcquireClientRow(ctx context.Context, tx *sql.Tx, clientId int64) error
+	ClientLoadRedirectURIs(ctx context.Context, tx *sql.Tx, client *models.Client) error
+	ClientLoadWebOrigins(ctx context.Context, tx *sql.Tx, client *models.Client) error
+	CreateClient(ctx context.Context, tx *sql.Tx, client *models.Client) error
+	CreateRedirectURI(ctx context.Context, tx *sql.Tx, redirectURI *models.RedirectURI) error
+	CreateWebOrigin(ctx context.Context, tx *sql.Tx, webOrigin *models.WebOrigin) error
+	DeleteClient(ctx context.Context, tx *sql.Tx, clientId int64) error
+	DeleteRedirectURI(ctx context.Context, tx *sql.Tx, redirectURIId int64) error
+	DeleteWebOrigin(ctx context.Context, tx *sql.Tx, webOriginId int64) error
+	GetAllClients(ctx context.Context, tx *sql.Tx) ([]models.Client, error)
+	GetClientByClientIdentifier(ctx context.Context, tx *sql.Tx, clientIdentifier string) (*models.Client, error)
+	GetClientById(ctx context.Context, tx *sql.Tx, clientId int64) (*models.Client, error)
+	RunInTransaction(ctx context.Context, fn func(tx *sql.Tx) error) error
+	SetClientPublic(ctx context.Context, tx *sql.Tx, clientId int64) (bool, error)
+	UpdateClient(ctx context.Context, tx *sql.Tx, client *models.Client) error
+}
+
+// updateClientNotOwningAuthenticationMode writes a client through an endpoint that changes some
+// other part of it. Three of them exist (general settings, OAuth2 flows, token settings) and none
+// of them means to touch how the client authenticates, but UpdateClient writes every mutable
+// column, so each one silently carries is_public and client_secret_encrypted from the copy it
+// loaded at the top of the request back into the row.
+//
+// That is a lost update with a security consequence, which is why it is closed here rather than
+// left to the general concurrency of the endpoint. A save whose loaded copy said "public" and
+// whose row now says "confidential" restores public mode and deletes the newer secret, and the
+// handler doing it has no revocation of its own, so the client's outstanding grants stay
+// redeemable with nothing presented. The confidential-to-public flip is the only write allowed to
+// change this, and it revokes (#245, final review finding 1).
+//
+// So the row is ACQUIRED and then the two authentication-owned columns are re-read inside the
+// transaction and copied over whatever the caller is holding.
+//
+// THE ACQUISITION IS NOT DECORATION, and taking it out reopens the window rather than merely
+// slowing it down. A re-read is not atomic with the write that follows it: another transaction
+// can commit in the gap between them, and this write then carries the value read before that
+// commit. On mysql and postgres the re-read does not even wait for an in-flight writer, so the
+// window is that writer's whole transaction rather than the gap between two statements; SQL
+// Server's shared locks narrow it and do not close it. AcquireClientRow takes the row first, so
+// the re-read happens under this transaction's own lock and nothing can get between it and the
+// write. Measured on all four engines in the agreement's probe/shared_writer_restores_public.out
+// (#245, final review round 3, decision 18).
+//
+// REFRESHING THE MODE IS NOT ENOUGH ON ITS OWN, because two other columns are derived from it.
+// A public client must carry pkce_required true and client_credentials_enabled false, and every
+// one of these endpoints writes both columns from its own snapshot. So a save that loaded the
+// client while it was confidential, with PKCE optional and client credentials on, would preserve
+// the refreshed public mode and restore both forbidden values underneath it. The server would
+// still refuse client credentials and still require PKCE at runtime, because both rules are read
+// at the point of use, but the stored row, the admin API's response and the console would all
+// report the opposite of what the server does, which is the display lie decision 2 exists to
+// prevent. applyPublicClientInvariants therefore runs on every caller's behalf, after the
+// refresh and before the write (#245, final review round 2 finding 2).
+//
+// It does not close the lost update on the columns each endpoint DOES own: two concurrent saves
+// of the same section still last-write-wins, which is how every entity in this codebase behaves
+// and is a separate, wider question.
+func updateClientNotOwningAuthenticationMode(ctx context.Context, database clientsDatabase, client *models.Client) error {
+	// Opened through RunInTransaction, so a deadlock reruns the acquisition, the re-read and the
+	// write together (#301). Safe to rerun: the two columns are copied from the row re-read under
+	// this attempt's own lock, and applyPublicClientInvariants is idempotent on the result.
+	return database.RunInTransaction(ctx, func(tx *sql.Tx) error {
+		if err := database.AcquireClientRow(ctx, tx, client.Id); err != nil {
+			return err
+		}
+
+		current, err := database.GetClientById(ctx, tx, client.Id)
+		if err != nil {
+			return err
+		}
+		if current == nil {
+			return errs.New("client no longer exists")
+		}
+		client.IsPublic = current.IsPublic
+		client.ClientSecretEncrypted = current.ClientSecretEncrypted
+
+		applyPublicClientInvariants(client)
+
+		return database.UpdateClient(ctx, tx, client)
+	})
+}
+
+// applyPublicClientInvariants forces the two columns a public client is not allowed to
+// contradict. One definition, called by every writer that can persist them, because the defect
+// this closes was the same rule living at one write site and not the others.
+//
+// Both are storage-side corrections rather than enforcement: the server already refuses client
+// credentials for a public client and already requires its PKCE whatever these columns hold. What
+// they buy is that the row, the API response built from it and the admin console's rendering of
+// it all say what the server will actually do. A stale false or a nil pkce_required is handed
+// straight back to a reader, and under a global-off deployment nil renders as "inherit from the
+// global setting (currently: optional)", which is the display lie decision 2 exists to prevent
+// (#245).
+func applyPublicClientInvariants(client *models.Client) {
+	if !client.IsPublic {
+		return
+	}
+	// Public clients cannot use the client credentials flow.
+	client.ClientCredentialsEnabled = false
+	// A public client always requires PKCE, so a caller's own value is not read for one:
+	// normalized rather than refused with a 400, so the two public-client rules behave the same
+	// way. It is not silent, because these endpoints answer with the updated client and a caller
+	// who sent false reads back true.
+	pkceRequired := true
+	client.PKCERequired = &pkceRequired
+}
+
+// HandleAPIClientsGet - GET /api/v1/admin/clients
+func HandleAPIClientsGet(
+	database clientsDatabase,
+) http.HandlerFunc {
+
+	return func(w http.ResponseWriter, r *http.Request) {
+
+		clients, err := database.GetAllClients(r.Context(), nil)
+		if err != nil {
+			writeInternalServerError(w, r, errs.Wrap(err, "database error getting all clients"))
+			return
+		}
+
+		// Load RedirectURIs and WebOrigins for each client
+		for i := range clients {
+			err = database.ClientLoadRedirectURIs(r.Context(), nil, &clients[i])
+			if err != nil {
+				writeInternalServerError(w, r, errs.Wrap(err, "database error loading client redirect URIs"), "client_id", clients[i].Id)
+				return
+			}
+
+			err = database.ClientLoadWebOrigins(r.Context(), nil, &clients[i])
+			if err != nil {
+				writeInternalServerError(w, r, errs.Wrap(err, "database error loading client web origins"), "client_id", clients[i].Id)
+				return
+			}
+		}
+
+		clientResponses := apimapping.ToClientResponses(clients)
+
+		response := api.GetClientsResponse{
+			Clients: clientResponses,
+		}
+
+		writeJSON(w, r, http.StatusOK, response)
+	}
+}
+
+// HandleAPIClientGet - GET /api/v1/admin/clients/{id}
+func HandleAPIClientGet(
+	database clientsDatabase,
+) http.HandlerFunc {
+
+	return func(w http.ResponseWriter, r *http.Request) {
+
+		idStr := chi.URLParam(r, "id")
+		if len(idStr) == 0 {
+			writeJSONError(w, "Client ID is required", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		id, err := strconv.ParseInt(idStr, 10, 64)
+		if err != nil {
+			writeJSONError(w, "Invalid client ID", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		client, err := database.GetClientById(r.Context(), nil, id)
+		if err != nil {
+			writeInternalServerError(w, r, errs.Wrap(err, "database error getting client by ID"), "client_id", id)
+			return
+		}
+
+		if client == nil {
+			writeJSONError(w, "Client not found", "NOT_FOUND", http.StatusNotFound)
+			return
+		}
+
+		// Load RedirectURIs and WebOrigins
+		err = database.ClientLoadRedirectURIs(r.Context(), nil, client)
+		if err != nil {
+			writeInternalServerError(w, r, errs.Wrap(err, "database error loading client redirect URIs"), "client_id", client.Id)
+			return
+		}
+
+		err = database.ClientLoadWebOrigins(r.Context(), nil, client)
+		if err != nil {
+			writeInternalServerError(w, r, errs.Wrap(err, "database error loading client web origins"), "client_id", client.Id)
+			return
+		}
+
+		// Do not include permissions in this endpoint for consistency with users/groups
+
+		clientResponse := apimapping.ToClientResponse(client)
+
+		// Decrypt client secret if it exists
+		if client.ClientSecretEncrypted != nil {
+			clientSecretDecrypted, err := encryption.DecryptData(client.ClientSecretEncrypted)
+			if err != nil {
+				writeInternalServerError(w, r, errs.Wrap(err, "failed to decrypt client secret"), "client_id", client.Id)
+				return
+			}
+			clientResponse.ClientSecret = clientSecretDecrypted
+		}
+
+		response := api.GetClientResponse{
+			Client: *clientResponse,
+		}
+
+		writeJSON(w, r, http.StatusOK, response)
+	}
+}
+
+// HandleAPIClientDelete - DELETE /api/v1/admin/clients/{id}
+func HandleAPIClientDelete(
+	database clientsDatabase,
+	auditLogger AuditLogger,
+) http.HandlerFunc {
+
+	return func(w http.ResponseWriter, r *http.Request) {
+
+		idStr := chi.URLParam(r, "id")
+		if idStr == "" {
+			writeJSONError(w, "Client ID is required", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		id, err := strconv.ParseInt(idStr, 10, 64)
+		if err != nil {
+			writeJSONError(w, "Invalid client ID", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		client, err := database.GetClientById(r.Context(), nil, id)
+		if err != nil {
+			writeInternalServerError(w, r, errs.Wrap(err, "database error getting client by ID for deletion"), "client_id", id)
+			return
+		}
+		if client == nil {
+			writeJSONError(w, "Client not found", "NOT_FOUND", http.StatusNotFound)
+			return
+		}
+
+		if client.IsSystemLevelClient() {
+			writeJSONError(w, "Trying to delete a system level client", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		if err := database.DeleteClient(r.Context(), nil, client.Id); err != nil {
+			writeInternalServerError(w, r, errs.Wrap(err, "database error deleting client"), "client_id", client.Id, "client_identifier", client.ClientIdentifier)
+			return
+		}
+
+		auditLogger.Log(r.Context(), audit.AuditDeletedClient, map[string]interface{}{
+			"clientId":         client.Id,
+			"clientIdentifier": client.ClientIdentifier,
+			"loggedInUser":     callerSubject(r),
+		})
+
+		resp := api.SuccessResponse{Success: true}
+		writeJSON(w, r, http.StatusOK, resp)
+	}
+}
+
+// HandleAPIClientCreatePost - POST /api/v1/admin/clients
+func HandleAPIClientCreatePost(
+	database clientsDatabase,
+	identifierValidator *validators.IdentifierValidator,
+	auditLogger AuditLogger,
+) http.HandlerFunc {
+
+	return func(w http.ResponseWriter, r *http.Request) {
+
+		var req api.CreateClientRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSONError(w, "Invalid request body", "INVALID_REQUEST_BODY", http.StatusBadRequest)
+			return
+		}
+
+		// Validate client identifier present
+		if strings.TrimSpace(req.ClientIdentifier) == "" {
+			writeJSONError(w, "Client identifier is required.", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		// Validate description length
+		const maxLengthDescription = 100
+		if len(req.Description) > maxLengthDescription {
+			writeJSONError(w, "The description cannot exceed a maximum length of "+strconv.Itoa(maxLengthDescription)+" characters.", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		if err := accountvalidation.ValidateNoAngleBrackets(req.Description, i18n.ErrCodeDescriptionAngleBrackets); err != nil {
+			writeValidationError(w, r, err)
+			return
+		}
+
+		// Validate display name
+		trimmedDisplayName := strings.TrimSpace(req.DisplayName)
+		const maxLengthDisplayName = 100
+		if len(trimmedDisplayName) > maxLengthDisplayName {
+			writeJSONError(w, "The display name cannot exceed a maximum length of "+strconv.Itoa(maxLengthDisplayName)+" characters.", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		if err := accountvalidation.ValidateNoAngleBrackets(trimmedDisplayName, i18n.ErrCodeDisplayNameAngleBrackets); err != nil {
+			writeValidationError(w, r, err)
+			return
+		}
+
+		// Validate identifier format
+		if err := identifierValidator.ValidateIdentifier(req.ClientIdentifier, true); err != nil {
+			writeValidationError(w, r, err)
+			return
+		}
+
+		// Check uniqueness
+		existingClient, err := database.GetClientByClientIdentifier(r.Context(), nil, req.ClientIdentifier)
+		if err != nil {
+			writeInternalServerError(w, r, errs.Wrap(err, "database error checking client existence by identifier"), "client_identifier", req.ClientIdentifier)
+			return
+		}
+		if existingClient != nil {
+			writeJSONError(w, "The client identifier is already in use.", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		// Generate and encrypt client secret
+		clientSecret := stringutil.GenerateSecurityRandomString(60)
+		clientSecretEncrypted, err := encryption.EncryptData(clientSecret)
+		if err != nil {
+			writeInternalServerError(w, r, errs.Wrap(err, "failed to encrypt client secret"))
+			return
+		}
+
+		// Create client model mimicking current implementation defaults
+		client := &models.Client{
+			ClientIdentifier:                        strings.TrimSpace(req.ClientIdentifier),
+			Description:                             strings.TrimSpace(req.Description),
+			DisplayName:                             trimmedDisplayName,
+			ShowDisplayName:                         trimmedDisplayName != "",
+			ClientSecretEncrypted:                   clientSecretEncrypted,
+			IsPublic:                                false,
+			ConsentRequired:                         false,
+			Enabled:                                 true,
+			DefaultAcrLevel:                         models.AcrLevel2Optional,
+			AuthorizationCodeEnabled:                req.AuthorizationCodeEnabled,
+			ClientCredentialsEnabled:                req.ClientCredentialsEnabled,
+			IncludeOpenIDConnectClaimsInAccessToken: models.ThreeStateSettingDefault.String(),
+		}
+
+		if err := database.CreateClient(r.Context(), nil, client); err != nil {
+			writeInternalServerError(w, r, errs.Wrap(err, "database error creating client"))
+			return
+		}
+
+		// Audit log
+		auditLogger.Log(r.Context(), audit.AuditCreatedClient, map[string]interface{}{
+			"clientId":         client.Id,
+			"clientIdentifier": client.ClientIdentifier,
+			"loggedInUser":     callerSubject(r),
+		})
+
+		// Load related fields for response consistency (fail if these operations fail)
+		if err := database.ClientLoadRedirectURIs(r.Context(), nil, client); err != nil {
+			writeInternalServerError(w, r, errs.Wrap(err, "database error loading client redirect URIs after create"), "client_id", client.Id)
+			return
+		}
+		if err := database.ClientLoadWebOrigins(r.Context(), nil, client); err != nil {
+			writeInternalServerError(w, r, errs.Wrap(err, "database error loading client web origins after create"), "client_id", client.Id)
+			return
+		}
+
+		resp := api.CreateClientResponse{
+			Client: *apimapping.ToClientResponse(client),
+		}
+
+		writeJSON(w, r, http.StatusCreated, resp)
+	}
+}
+
+// HandleAPIClientUpdatePut - PUT /api/v1/admin/clients/{id}
+func HandleAPIClientUpdatePut(
+	database clientsDatabase,
+	identifierValidator *validators.IdentifierValidator,
+	auditLogger AuditLogger,
+) http.HandlerFunc {
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		idStr := chi.URLParam(r, "id")
+		if idStr == "" {
+			writeJSONError(w, "Client ID is required", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		id, err := strconv.ParseInt(idStr, 10, 64)
+		if err != nil {
+			writeJSONError(w, "Invalid client ID", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		client, err := database.GetClientById(r.Context(), nil, id)
+		if err != nil {
+			writeInternalServerError(w, r, errs.Wrap(err, "database error getting client by ID for update"), "client_id", id)
+			return
+		}
+		if client == nil {
+			writeJSONError(w, "Client not found", "NOT_FOUND", http.StatusNotFound)
+			return
+		}
+
+		var updateReq api.UpdateClientSettingsRequest
+		if err := json.NewDecoder(r.Body).Decode(&updateReq); err != nil {
+			writeJSONError(w, "Invalid request body", "INVALID_REQUEST_BODY", http.StatusBadRequest)
+			return
+		}
+
+		// Validate client identifier
+		if strings.TrimSpace(updateReq.ClientIdentifier) == "" {
+			writeJSONError(w, "Client identifier is required.", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		// Validate description length
+		const maxLengthDescription = 100
+		if len(updateReq.Description) > maxLengthDescription {
+			writeJSONError(w, "The description cannot exceed a maximum length of "+strconv.Itoa(maxLengthDescription)+" characters.", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		if err := accountvalidation.ValidateNoAngleBrackets(updateReq.Description, i18n.ErrCodeDescriptionAngleBrackets); err != nil {
+			writeValidationError(w, r, err)
+			return
+		}
+
+		// Prepare the new identifier value
+		trimmedClientIdentifier := strings.TrimSpace(updateReq.ClientIdentifier)
+
+		// The identifier is checked only when the request actually submits a different one, and
+		// that is load bearing rather than an optimisation. A client that registered itself is
+		// given "dcr_" plus a UUID, which is 40 characters, and ValidateIdentifier caps an
+		// identifier at 38: re-checking an unchanged value therefore rejected every update to every
+		// self-registered client, whatever the request was trying to change. That made the escape
+		// hatch this change depends on unusable, since turning consent off for one reviewed client
+		// is done on the same form (#108, decision 17).
+		//
+		// Compared byte for byte against what is stored, deliberately, rather than against the
+		// raw submitted value. "  same-identifier  " has always been refused as an invalid format
+		// and still is; only a request submitting exactly what is already there skips the check.
+		// That also makes the skip provably safe: an identifier that is already stored passed this
+		// same validator, and the assignment below writes back the bytes that are already in the
+		// row.
+		//
+		// Skipping the uniqueness query alongside it changes nothing either: it excludes the
+		// current client, so an unchanged identifier can only ever match the row being updated.
+		if updateReq.ClientIdentifier != client.ClientIdentifier {
+			// Validate identifier format
+			if err := identifierValidator.ValidateIdentifier(updateReq.ClientIdentifier, true); err != nil {
+				writeValidationError(w, r, err)
+				return
+			}
+
+			// Check uniqueness excluding current client
+			existingClient, err := database.GetClientByClientIdentifier(r.Context(), nil, updateReq.ClientIdentifier)
+			if err != nil {
+				writeInternalServerError(w, r, errs.Wrap(err, "database error checking client existence by identifier for update"), "client_identifier", updateReq.ClientIdentifier, "client_id", client.Id)
+				return
+			}
+			if existingClient != nil && existingClient.Id != client.Id {
+				writeJSONError(w, "The client identifier is already in use.", "VALIDATION_ERROR", http.StatusBadRequest)
+				return
+			}
+		}
+
+		// ACR level validation depending on AuthorizationCodeEnabled
+		if !client.AuthorizationCodeEnabled && strings.TrimSpace(updateReq.DefaultAcrLevel) != "" {
+			writeJSONError(w, "Default ACR level is not applicable when authorization code flow is disabled.", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		// Validate website URL (optional field)
+		websiteURL := strings.TrimSpace(updateReq.WebsiteURL)
+		if websiteURL != "" {
+			const maxLengthWebsiteURL = 256
+			if len(websiteURL) > maxLengthWebsiteURL {
+				writeJSONError(w, "The website URL cannot exceed a maximum length of "+strconv.Itoa(maxLengthWebsiteURL)+" characters.", "VALIDATION_ERROR", http.StatusBadRequest)
+				return
+			}
+			parsed, err := url.ParseRequestURI(websiteURL)
+			if err != nil {
+				writeJSONError(w, "Invalid website URL.", "VALIDATION_ERROR", http.StatusBadRequest)
+				return
+			}
+			if parsed.Scheme != "http" && parsed.Scheme != "https" {
+				writeJSONError(w, "Website URL must use http or https scheme.", "VALIDATION_ERROR", http.StatusBadRequest)
+				return
+			}
+		}
+
+		// System-level client protection: block identifier changes
+		if client.IsSystemLevelClient() && trimmedClientIdentifier != client.ClientIdentifier {
+			writeJSONError(w, "The identifier of a system-level client cannot be changed.", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		// Self-registered client protection: block identifier changes too. Until the created_via_dcr
+		// column existed, the dcr_ identifier prefix was the only record that a client had
+		// registered itself, so renaming one here erased that fact permanently: migration 000029
+		// backfills from the prefix, and a client renamed before the upgrade is left unmarked, with
+		// consent off, still issuing codes with no consent screen. The column makes new renames
+		// harmless to the backfill, and blocking the rename keeps the prefix and the column saying
+		// the same thing for anything that still reads a client identifier, a log line or an
+		// operator's eye included (#108, decision 16).
+		//
+		// It blocks the rename and nothing else. Every other setting on a self-registered client
+		// stays editable, Consent required above all: unticking it for one reviewed client is the
+		// escape hatch this whole change rests on, so a guard that refused the update outright
+		// would take away the remedy along with the risk.
+		if client.CreatedViaDCR && trimmedClientIdentifier != client.ClientIdentifier {
+			writeJSONError(w, "The identifier of a self-registered client cannot be changed.", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		client.ClientIdentifier = trimmedClientIdentifier
+		client.Description = strings.TrimSpace(updateReq.Description)
+		client.WebsiteURL = websiteURL
+		client.DisplayName = strings.TrimSpace(updateReq.DisplayName)
+
+		// Validate display name length
+		const maxLengthDisplayName = 100
+		if len(client.DisplayName) > maxLengthDisplayName {
+			writeJSONError(w, "The display name cannot exceed a maximum length of "+strconv.Itoa(maxLengthDisplayName)+" characters.", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		if err := accountvalidation.ValidateNoAngleBrackets(client.DisplayName, i18n.ErrCodeDisplayNameAngleBrackets); err != nil {
+			writeValidationError(w, r, err)
+			return
+		}
+
+		client.Enabled = updateReq.Enabled
+		client.ConsentRequired = updateReq.ConsentRequired
+		client.ShowLogo = updateReq.ShowLogo
+		client.ShowDisplayName = updateReq.ShowDisplayName
+		client.ShowDescription = updateReq.ShowDescription
+		client.ShowWebsiteURL = updateReq.ShowWebsiteURL
+
+		if client.AuthorizationCodeEnabled && strings.TrimSpace(updateReq.DefaultAcrLevel) != "" {
+			acrLevel, err := models.AcrLevelFromString(updateReq.DefaultAcrLevel)
+			if err != nil {
+				writeJSONError(w, "Invalid default ACR level", "VALIDATION_ERROR", http.StatusBadRequest)
+				return
+			}
+			client.DefaultAcrLevel = acrLevel
+		}
+
+		if err := updateClientNotOwningAuthenticationMode(r.Context(), database, client); err != nil {
+			writeInternalServerError(w, r, errs.Wrap(err, "database error updating client"), "client_id", client.Id, "client_identifier", client.ClientIdentifier)
+			return
+		}
+
+		// Load related fields for response consistency
+		if err := database.ClientLoadRedirectURIs(r.Context(), nil, client); err != nil {
+			writeInternalServerError(w, r, errs.Wrap(err, "database error loading client redirect URIs after update"), "client_id", client.Id)
+			return
+		}
+		if err := database.ClientLoadWebOrigins(r.Context(), nil, client); err != nil {
+			writeInternalServerError(w, r, errs.Wrap(err, "database error loading client web origins after update"), "client_id", client.Id)
+			return
+		}
+
+		// Audit log
+		auditLogger.Log(r.Context(), audit.AuditUpdatedClientSettings, map[string]interface{}{
+			"clientId":     client.Id,
+			"loggedInUser": callerSubject(r),
+		})
+
+		response := api.UpdateClientResponse{
+			Client: *apimapping.ToClientResponse(client),
+		}
+
+		writeJSON(w, r, http.StatusOK, response)
+	}
+}
+
+// HandleAPIClientAuthenticationPut - PUT /api/v1/admin/clients/{id}/authentication
+// Changes client's public/confidential mode and client secret.
+func HandleAPIClientAuthenticationPut(
+	database clientsDatabase,
+	auditLogger AuditLogger,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		idStr := chi.URLParam(r, "id")
+		if idStr == "" {
+			writeJSONError(w, "Client ID is required", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		id, err := strconv.ParseInt(idStr, 10, 64)
+		if err != nil {
+			writeJSONError(w, "Invalid client ID", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		client, err := database.GetClientById(r.Context(), nil, id)
+		if err != nil {
+			writeInternalServerError(w, r, errs.Wrap(err, "database error getting client by ID for authentication update"), "client_id", id)
+			return
+		}
+		if client == nil {
+			writeJSONError(w, "Client not found", "NOT_FOUND", http.StatusNotFound)
+			return
+		}
+
+		var req api.UpdateClientAuthenticationRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSONError(w, "Invalid request body", "INVALID_REQUEST_BODY", http.StatusBadRequest)
+			return
+		}
+
+		if req.IsPublic {
+			// Switching to public: remove secret and disable client credentials
+			client.IsPublic = true
+			client.ClientSecretEncrypted = nil
+			// Client credentials off and PKCE required, from the one definition every writer
+			// that can persist those two columns shares (#245).
+			applyPublicClientInvariants(client)
+		} else {
+			// Confidential: require strong secret
+			if err := validateClientSecret(req.ClientSecret); err != nil {
+				writeJSONError(w, "Invalid client secret. Please generate a new one.", "VALIDATION_ERROR", http.StatusBadRequest)
+				return
+			}
+
+			enc, err := encryption.EncryptData(req.ClientSecret)
+			if err != nil {
+				writeInternalServerError(w, r, errs.Wrap(err, "failed to encrypt client secret"), "client_id", client.Id)
+				return
+			}
+			client.IsPublic = false
+			client.ClientSecretEncrypted = enc
+			// Preserve ClientCredentialsEnabled as-is
+		}
+
+		// The confidential-to-public transition is the one that REMOVES the requirement for the
+		// client to authenticate, so it is the one that revokes: every grant this client holds
+		// was issued on the understanding that redeeming it took a secret, and after this write
+		// nothing is presented at all. The reverse transition closes a window rather than opening
+		// one, and rotating a confidential client's secret leaves the requirement in place;
+		// revoking on either would sign real users out to protect against nothing (#245).
+		//
+		// The client write and the revocation share one transaction so the secret cannot be
+		// destroyed while the grants it was protecting survive. The audit event is emitted after
+		// the commit, because a logged revocation that then rolled back would be a false record.
+		//
+		// WHICH TRANSITION THIS IS, IS DECIDED BY THE WRITE ITSELF, not by comparing against a
+		// copy of the client. The two are not the same row: a concurrent request can make this
+		// client confidential and issue it a grant between any read and the write that follows
+		// it, and a classification taken from the stale side then reads "already public", skips
+		// the revocation, and commits a public client holding grants that were issued while a
+		// secret was required. SetClientPublic answers it with the statements that perform the
+		// change, which is the only way the answer and the change cannot disagree (#245, final
+		// review finding 1, decision 17).
+		if req.IsPublic {
+			var becamePublic bool
+			result, err := revocation.RevokeClientGrantsTx(r.Context(), database, client.Id, func(tx *sql.Tx) (bool, error) {
+				var err error
+				becamePublic, err = database.SetClientPublic(r.Context(), tx, client.Id)
+				if err != nil {
+					return false, err
+				}
+				if err := database.UpdateClient(r.Context(), tx, client); err != nil {
+					return false, err
+				}
+				return becamePublic, nil
+			})
+			if err != nil {
+				writeInternalServerError(w, r, errs.Wrap(err, "database error updating client authentication"), "client_id", client.Id)
+				return
+			}
+			// Only a write that really performed the transition gets the event. A save of an
+			// already-public client revoked nothing and must not claim to.
+			if becamePublic {
+				revocation.LogRevokedClientGrants(r.Context(), auditLogger, client.Id,
+					revocation.RevocationReasonClientBecamePublic, callerSubject(r), result)
+			}
+		} else if err := database.UpdateClient(r.Context(), nil, client); err != nil {
+			writeInternalServerError(w, r, errs.Wrap(err, "database error updating client authentication"), "client_id", client.Id)
+			return
+		}
+
+		// Load related fields for response consistency
+		if err := database.ClientLoadRedirectURIs(r.Context(), nil, client); err != nil {
+			writeInternalServerError(w, r, errs.Wrap(err, "database error loading client redirect URIs after auth update"), "client_id", client.Id)
+			return
+		}
+		if err := database.ClientLoadWebOrigins(r.Context(), nil, client); err != nil {
+			writeInternalServerError(w, r, errs.Wrap(err, "database error loading client web origins after auth update"), "client_id", client.Id)
+			return
+		}
+
+		// Audit
+		auditLogger.Log(r.Context(), audit.AuditUpdatedClientAuthentication, map[string]interface{}{
+			"clientId":     client.Id,
+			"loggedInUser": callerSubject(r),
+		})
+
+		resp := api.UpdateClientResponse{Client: *apimapping.ToClientResponse(client)}
+		writeJSON(w, r, http.StatusOK, resp)
+	}
+}
+
+// validateClientSecret enforces a strong secret suitable for confidential clients.
+func validateClientSecret(secret string) error {
+	// Length policy: min 60, max 255
+	if len(secret) < 60 || len(secret) > 255 {
+		return errs.Errorf("invalid length")
+	}
+	// Allowed charset: 0-9 a-z A-Z - _ .
+	for i := 0; i < len(secret); i++ {
+		c := secret[i]
+		if (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '-' || c == '_' || c == '.' {
+			continue
+		}
+		return errs.Errorf("invalid character")
+	}
+	return nil
+}
+
+// HandleAPIClientOAuth2FlowsPut - PUT /api/v1/admin/clients/{id}/oauth2-flows
+// Updates which OAuth2 flows are enabled for the client.
+func HandleAPIClientOAuth2FlowsPut(
+	database clientsDatabase,
+	auditLogger AuditLogger,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		idStr := chi.URLParam(r, "id")
+		if idStr == "" {
+			writeJSONError(w, "Client ID is required", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		id, err := strconv.ParseInt(idStr, 10, 64)
+		if err != nil {
+			writeJSONError(w, "Invalid client ID", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		client, err := database.GetClientById(r.Context(), nil, id)
+		if err != nil {
+			writeInternalServerError(w, r, errs.Wrap(err, "database error getting client by ID for oauth2 flows update"), "client_id", id)
+			return
+		}
+		if client == nil {
+			writeJSONError(w, "Client not found", "NOT_FOUND", http.StatusNotFound)
+			return
+		}
+
+		var req api.UpdateClientOAuth2FlowsRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSONError(w, "Invalid request body", "INVALID_REQUEST_BODY", http.StatusBadRequest)
+			return
+		}
+
+		// Apply changes with current business rules
+		client.AuthorizationCodeEnabled = req.AuthorizationCodeEnabled
+		client.ClientCredentialsEnabled = req.ClientCredentialsEnabled
+		client.PKCERequired = req.PKCERequired
+		client.ImplicitGrantEnabled = req.ImplicitGrantEnabled
+		client.ResourceOwnerPasswordCredentialsEnabled = req.ResourceOwnerPasswordCredentialsEnabled
+
+		// The two public-client rules are applied by the writer below, inside the write's
+		// transaction and against the is_public the row really carries. They cannot run out
+		// here: this endpoint reloads the client at the top of the request, and a client that
+		// became public in between would have its two rules skipped and be saved with client
+		// credentials on and PKCE off, which is the state this whole change exists to make
+		// unreachable (#245, final review finding 1).
+		if err := updateClientNotOwningAuthenticationMode(r.Context(), database, client); err != nil {
+			writeInternalServerError(w, r, errs.Wrap(err, "database error updating client OAuth2 flows"), "client_id", client.Id)
+			return
+		}
+
+		// Load related fields for response consistency
+		if err := database.ClientLoadRedirectURIs(r.Context(), nil, client); err != nil {
+			writeInternalServerError(w, r, errs.Wrap(err, "database error loading client redirect URIs after oauth2 flows update"), "client_id", client.Id)
+			return
+		}
+		if err := database.ClientLoadWebOrigins(r.Context(), nil, client); err != nil {
+			writeInternalServerError(w, r, errs.Wrap(err, "database error loading client web origins after oauth2 flows update"), "client_id", client.Id)
+			return
+		}
+
+		// Audit
+		auditLogger.Log(r.Context(), audit.AuditUpdatedClientOAuth2Flows, map[string]interface{}{
+			"clientId":     client.Id,
+			"loggedInUser": callerSubject(r),
+		})
+
+		resp := api.UpdateClientResponse{Client: *apimapping.ToClientResponse(client)}
+		writeJSON(w, r, http.StatusOK, resp)
+	}
+}
+
+// HandleAPIClientRedirectURIsPut - PUT /api/v1/admin/clients/{id}/redirect-uris
+// Replaces the full set of redirect URIs for the client. The server validates
+// inputs, enforces business rules, computes add/remove, and returns the updated client.
+func HandleAPIClientRedirectURIsPut(
+	database clientsDatabase,
+	auditLogger AuditLogger,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		idStr := chi.URLParam(r, "id")
+		if idStr == "" {
+			writeJSONError(w, "Client ID is required", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		id, err := strconv.ParseInt(idStr, 10, 64)
+		if err != nil {
+			writeJSONError(w, "Invalid client ID", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		client, err := database.GetClientById(r.Context(), nil, id)
+		if err != nil {
+			writeInternalServerError(w, r, errs.Wrap(err, "database error getting client by ID for redirect URIs update"), "client_id", id)
+			return
+		}
+		if client == nil {
+			writeJSONError(w, "Client not found", "NOT_FOUND", http.StatusNotFound)
+			return
+		}
+
+		// A redirect URI belongs to whichever redirect-based flow the client uses, and implicit
+		// is one of them. RFC 6749 section 3.1.2.2 makes registration a MUST for a confidential
+		// client using the implicit grant, and RFC 9700 section 4.1.2 notes that control of the
+		// redirect URI matters more for implicit rather than less, since the response carries the
+		// access token in the fragment. Gating on the authorization code flow alone left an
+		// administrator of an implicit-only client unable to add, rotate or urgently remove the
+		// one setting that makes it work, without first enabling a flow the client does not use
+		// (#250).
+		//
+		// These two flags are the complete enumeration of redirect-based flows here:
+		// protocolvalidation.ResponseTypeInfo.IsImplicitFlow treats any response type containing
+		// "code" as not implicit, so nothing outside the pair can produce a redirect.
+		settings := r.Context().Value(constants.ContextKeySettings).(*models.Settings)
+		if !client.AuthorizationCodeEnabled && !client.IsImplicitGrantEnabled(settings.ImplicitFlowEnabled) {
+			writeJSONError(w, "Redirect URIs are used by the authorization code with PKCE flow and by the implicit flow, and neither is enabled for this client.", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		var req api.UpdateClientRedirectURIsRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSONError(w, "Invalid request body", "INVALID_REQUEST_BODY", http.StatusBadRequest)
+			return
+		}
+
+		// Validate list and entries
+		seen := make(map[string]struct{})
+		normalized := make([]string, 0, len(req.RedirectURIs))
+		for _, raw := range req.RedirectURIs {
+			uri := strings.TrimSpace(raw)
+			if uri == "" {
+				writeJSONError(w, "Redirect URI cannot be empty", "VALIDATION_ERROR", http.StatusBadRequest)
+				return
+			}
+			if _, err := url.ParseRequestURI(uri); err != nil {
+				writeJSONError(w, fmt.Sprintf("Invalid redirect URI: %s", uri), "VALIDATION_ERROR", http.StatusBadRequest)
+				return
+			}
+			// url.ParseRequestURI above accepts "//evil.example/cb", "/relative/cb",
+			// "http://host/cb#frag" and "https:///evil.example/cb", every one of which is
+			// later emitted verbatim into a Location header. RFC 6749 section 3.1.2 is what
+			// refuses them, through the same predicate dynamic registration and the
+			// authorization endpoint use. Ordered after the parse and before the duplicate
+			// check, mirroring the dynamic registration gate.
+			//
+			// Only the absolute-URI rule crosses over from dynamic registration, not that
+			// endpoint's scheme denylist or excluded-character set. The absolute-URI rule is
+			// a protocol requirement and binds an administrator exactly as it binds an
+			// anonymous registrant; the other two exist because that caller is anonymous,
+			// and an administrator has legitimate reasons to register a custom scheme (#122).
+			//
+			// Accepted cost: this PUT replaces the whole set, so a deployment still holding a
+			// legacy non-absolute row cannot save this page until the administrator removes
+			// that URI from the list. The message names the offending value, and taking that
+			// remediation also deletes the row.
+			if !urlutil.IsAbsoluteRedirectURI(uri) {
+				writeJSONError(w, fmt.Sprintf("Redirect URI must be an absolute URI (a scheme is required, a fragment is not permitted, percent-escapes must be well formed, and an http or https URI must name a host): %s", uri), "VALIDATION_ERROR", http.StatusBadRequest)
+				return
+			}
+			if _, exists := seen[uri]; exists {
+				writeJSONError(w, "Duplicate redirect URIs are not allowed", "VALIDATION_ERROR", http.StatusBadRequest)
+				return
+			}
+			seen[uri] = struct{}{}
+			normalized = append(normalized, uri)
+		}
+
+		// Load existing redirect URIs
+		if err := database.ClientLoadRedirectURIs(r.Context(), nil, client); err != nil {
+			writeInternalServerError(w, r, errs.Wrap(err, "database error loading client redirect URIs before update"), "client_id", client.Id)
+			return
+		}
+
+		existingSet := make(map[string]int64)
+		for _, ru := range client.RedirectURIs {
+			existingSet[ru.URI] = ru.Id
+		}
+
+		desiredSet := seen
+
+		// Add new URIs
+		for _, uri := range normalized {
+			if _, ok := existingSet[uri]; !ok {
+				if err := database.CreateRedirectURI(r.Context(), nil, &models.RedirectURI{ClientId: client.Id, URI: uri}); err != nil {
+					writeInternalServerError(w, r, errs.Wrap(err, "database error creating redirect URI"), "client_id", client.Id, "uri", uri)
+					return
+				}
+			}
+		}
+
+		// Delete removed URIs
+		for uri, rid := range existingSet {
+			if _, ok := desiredSet[uri]; !ok {
+				if err := database.DeleteRedirectURI(r.Context(), nil, rid); err != nil {
+					writeInternalServerError(w, r, errs.Wrap(err, "database error deleting redirect URI"), "client_id", client.Id, "uri", uri)
+					return
+				}
+			}
+		}
+
+		// Reload related fields for response consistency
+		if err := database.ClientLoadRedirectURIs(r.Context(), nil, client); err != nil {
+			writeInternalServerError(w, r, errs.Wrap(err, "database error loading client redirect URIs after update"), "client_id", client.Id)
+			return
+		}
+		if err := database.ClientLoadWebOrigins(r.Context(), nil, client); err != nil {
+			writeInternalServerError(w, r, errs.Wrap(err, "database error loading client web origins after redirect URIs update"), "client_id", client.Id)
+			return
+		}
+
+		// Audit
+		auditLogger.Log(r.Context(), audit.AuditUpdatedRedirectURIs, map[string]interface{}{
+			"clientId":     client.Id,
+			"loggedInUser": callerSubject(r),
+		})
+
+		resp := api.UpdateClientResponse{Client: *apimapping.ToClientResponse(client)}
+		writeJSON(w, r, http.StatusOK, resp)
+	}
+}
+
+// maxWebOriginLength is the width of the web_origins.origin column on MySQL, PostgreSQL and SQL
+// Server; sqlite stores TEXT. A standards-valid origin can be 267 characters ("https://" plus a
+// 253-character host plus ":65535"), so a longer value is refused here rather than becoming a 500
+// on three engines out of four, which is what it is today and what no sqlite tier can see. The cap
+// lives at the endpoint and not in urlutil.CanonicalOrigin because it is a fact about storage
+// rather than about what an origin is (#250).
+const maxWebOriginLength = 256
+
+// HandleAPIClientWebOriginsPut - PUT /api/v1/admin/clients/{id}/web-origins
+// Replaces the full set of web origins for the client, in one transaction. Each value is
+// canonicalized to the exact string a browser sends in an Origin header, or refused, so a stored
+// origin is always one CORS can match.
+func HandleAPIClientWebOriginsPut(
+	database clientsDatabase,
+	auditLogger AuditLogger,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		idStr := chi.URLParam(r, "id")
+		if idStr == "" {
+			writeJSONError(w, "Client ID is required", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		id, err := strconv.ParseInt(idStr, 10, 64)
+		if err != nil {
+			writeJSONError(w, "Invalid client ID", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		client, err := database.GetClientById(r.Context(), nil, id)
+		if err != nil {
+			writeInternalServerError(w, r, errs.Wrap(err, "database error getting client by ID for web origins update"), "client_id", id)
+			return
+		}
+		if client == nil {
+			writeJSONError(w, "Client not found", "NOT_FOUND", http.StatusNotFound)
+			return
+		}
+
+		// There is deliberately no flow gate here, and the Redirect URIs endpoint next door
+		// deliberately has one. The criterion for needing a web origin is "this client's app is
+		// JavaScript running in a browser", which no flow flag expresses: an ROPC client calling
+		// /auth/token from the browser needs one and enables no redirect-based flow at all.
+		// Gating this on the authorization code flow, as it was, refused a legitimate
+		// configuration the rest of the server permits, and a registered origin is inert until
+		// MiddlewareCors reads it, so the gate protected nothing. Restoring consistency with the
+		// page next door reintroduces this bug (#250).
+
+		var req api.UpdateClientWebOriginsRequest
+		if decodeErr := json.NewDecoder(r.Body).Decode(&req); decodeErr != nil {
+			writeJSONError(w, "Invalid request body", "INVALID_REQUEST_BODY", http.StatusBadRequest)
+			return
+		}
+
+		// Validate list and entries: non-empty, canonical origin, within the column, no duplicates.
+		//
+		// urlutil.CanonicalOrigin is what makes a saved value one CORS can ever match.
+		// MiddlewareCors compares the stored string to the browser's Origin header byte for
+		// byte, and the validation this replaced accepted anything url.ParseRequestURI parsed
+		// with an http or https scheme, then stored it verbatim in lower case. Six of ten
+		// realistic inputs were accepted and permanently dead, including
+		// "https://app.example.com/", which is what copying a URL out of a browser bar
+		// produces: 200, the value in the list, and CORS failing with nothing explaining why.
+		// Deduplication runs on the canonical form for the same reason, so "https://a.com" and
+		// "https://a.com/" collide in one request rather than both being stored (#250).
+		seen := make(map[string]struct{})
+		normalized := make([]string, 0, len(req.WebOrigins))
+		for _, raw := range req.WebOrigins {
+			val := strings.TrimSpace(raw)
+			if val == "" {
+				writeJSONError(w, "Web origin cannot be empty", "VALIDATION_ERROR", http.StatusBadRequest)
+				return
+			}
+			origin, ok := urlutil.CanonicalOrigin(val)
+			if !ok {
+				writeJSONError(w, fmt.Sprintf("Invalid web origin: %s. A web origin is a scheme, a host and an optional port, with nothing after the host: for example https://www.example.com or https://myapp:8080. The scheme must be http or https; the host must be ASCII, must carry no user information, and must not be an IPv6 literal or an abbreviated IPv4 address; and a port, if present, must be plain decimal below 65536 with no leading zero.", val), "VALIDATION_ERROR", http.StatusBadRequest)
+				return
+			}
+			if len(origin) > maxWebOriginLength {
+				writeJSONError(w, fmt.Sprintf("Web origin is too long (%d characters, the maximum is %d): %s", len(origin), maxWebOriginLength, origin), "VALIDATION_ERROR", http.StatusBadRequest)
+				return
+			}
+			if _, exists := seen[origin]; exists {
+				writeJSONError(w, "Duplicate web origins are not allowed", "VALIDATION_ERROR", http.StatusBadRequest)
+				return
+			}
+			seen[origin] = struct{}{}
+			normalized = append(normalized, origin)
+		}
+
+		// The whole replacement is one transaction, on the sequence
+		// updateClientNotOwningAuthenticationMode uses a few hundred lines up. Two things go
+		// wrong without it. A failure part way through commits half a list under a 500, so an
+		// administrator removing a compromised origin and adding its replacement can end up with
+		// neither or with only the removal, and the response says the save failed either way.
+		// And two administrators saving different lists at once each read the same current list
+		// and each write their own diff of it, producing the union of the two rather than one of
+		// them. AcquireClientRow before the read is what serializes the second case (#250).
+		//
+		// Opened through RunInTransaction, so a deadlock reruns the whole replacement (#301). The
+		// body is safe to rerun: the current list is loaded afresh inside the closure and the
+		// diff is computed from it on every attempt. Each failure is returned wrapped in a
+		// webOriginsWriteFailure that keeps the database's own error in the chain, so the helper's
+		// classifier still sees a deadlock, and nothing is logged or written to the response until
+		// the helper has returned: an attempt that is about to be rerun must not answer.
+		err = database.RunInTransaction(r.Context(), func(tx *sql.Tx) error {
+			if acquireClientRowErr := database.AcquireClientRow(r.Context(), tx, client.Id); acquireClientRowErr != nil {
+				return &webOriginsWriteFailure{
+					logMessage: "database error acquiring client row for web origins update",
+					err:        acquireClientRowErr}
+			}
+
+			// Load existing web origins
+			if clientLoadWebOriginsErr := database.ClientLoadWebOrigins(r.Context(), tx, client); clientLoadWebOriginsErr != nil {
+				return &webOriginsWriteFailure{
+					logMessage: "database error loading client web origins before update",
+					err:        clientLoadWebOriginsErr}
+			}
+
+			// The stored value is already canonical, migration 000034 having repaired the rows
+			// written before this endpoint canonicalized, so it is keyed as it stands rather than
+			// lowercased again on the way past.
+			existingSet := make(map[string]int64)
+			for _, wo := range client.WebOrigins {
+				existingSet[wo.Origin] = wo.Id
+			}
+
+			desiredSet := seen
+
+			// Add new origins
+			for _, origin := range normalized {
+				if _, ok := existingSet[origin]; !ok {
+					if createWebOriginErr := database.CreateWebOrigin(r.Context(), tx, &models.WebOrigin{ClientId: client.Id, Origin: origin}); createWebOriginErr != nil {
+						return &webOriginsWriteFailure{
+							logMessage: "database error creating web origin",
+							origin:     origin, err: createWebOriginErr}
+					}
+				}
+			}
+
+			// Delete removed origins
+			for origin, wid := range existingSet {
+				if _, ok := desiredSet[origin]; !ok {
+					if deleteWebOriginErr := database.DeleteWebOrigin(r.Context(), tx, wid); deleteWebOriginErr != nil {
+						return &webOriginsWriteFailure{
+							logMessage: "database error deleting web origin",
+							origin:     origin, err: deleteWebOriginErr}
+					}
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			// The helper's own failures, a transaction that could not open, a commit that failed
+			// or a deadlock on every attempt, carry no step of their own.
+			failure := &webOriginsWriteFailure{
+				logMessage: "database error in the web origins update transaction",
+				err:        err}
+			var stepFailure *webOriginsWriteFailure
+			if errors.As(err, &stepFailure) {
+				failure = stepFailure
+			}
+			// Two calls rather than one over a conditionally built run, so every key this site
+			// writes is a literal at the call sloglint reads (#320).
+			if failure.origin != "" {
+				writeInternalServerError(w, r, failure, "client_id", client.Id, "origin", failure.origin)
+			} else {
+				writeInternalServerError(w, r, failure, "client_id", client.Id)
+			}
+			return
+		}
+
+		// Reload related fields for response consistency
+		if err := database.ClientLoadRedirectURIs(r.Context(), nil, client); err != nil {
+			writeInternalServerError(w, r, errs.Wrap(err, "database error loading client redirect URIs after web origins update"), "client_id", client.Id)
+			return
+		}
+		if err := database.ClientLoadWebOrigins(r.Context(), nil, client); err != nil {
+			writeInternalServerError(w, r, errs.Wrap(err, "database error loading client web origins after update"), "client_id", client.Id)
+			return
+		}
+
+		// Audit
+		auditLogger.Log(r.Context(), audit.AuditUpdatedWebOrigins, map[string]interface{}{
+			"clientId":     client.Id,
+			"loggedInUser": callerSubject(r),
+		})
+
+		resp := api.UpdateClientResponse{Client: *apimapping.ToClientResponse(client)}
+		writeJSON(w, r, http.StatusOK, resp)
+	}
+}
+
+// webOriginsWriteFailure names which statement of the web-origins replacement failed, so the
+// handler can log and answer it once RunInTransaction has returned. It wraps the database's own
+// error unchanged, which is what lets the helper's classifier recognise a deadlock through it
+// and rerun the body: a sentinel that hid the driver error would exempt this one transaction
+// from the retry every other owner gets (#301).
+type webOriginsWriteFailure struct {
+	// logMessage is the slog line the handler emits, one per statement.
+	logMessage string
+	// origin is the web origin the failed statement was writing; empty for the two statements
+	// that do not name one.
+	origin string
+	err    error
+}
+
+func (f *webOriginsWriteFailure) Error() string { return f.logMessage + ": " + f.err.Error() }
+func (f *webOriginsWriteFailure) Unwrap() error { return f.err }
+
+// HandleAPIClientTokensPut - PUT /api/v1/admin/clients/{id}/tokens
+// Updates token-related settings for a client.
+func HandleAPIClientTokensPut(
+	database clientsDatabase,
+	auditLogger AuditLogger,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		idStr := chi.URLParam(r, "id")
+		if idStr == "" {
+			writeJSONError(w, "Client ID is required", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		id, err := strconv.ParseInt(idStr, 10, 64)
+		if err != nil {
+			writeJSONError(w, "Invalid client ID", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		client, err := database.GetClientById(r.Context(), nil, id)
+		if err != nil {
+			writeInternalServerError(w, r, errs.Wrap(err, "database error getting client by ID for tokens update"), "client_id", id)
+			return
+		}
+		if client == nil {
+			writeJSONError(w, "Client not found", "NOT_FOUND", http.StatusNotFound)
+			return
+		}
+
+		var req api.UpdateClientTokensRequest
+		if decodeErr := json.NewDecoder(r.Body).Decode(&req); decodeErr != nil {
+			writeJSONError(w, "Invalid request body", "INVALID_REQUEST_BODY", http.StatusBadRequest)
+			return
+		}
+
+		// Validate numbers: >= 0 and <= 160000000
+		const maxValue = 160000000
+		if req.TokenExpirationInSeconds < 0 || req.TokenExpirationInSeconds > maxValue {
+			writeJSONError(w, fmt.Sprintf("Token expiration in seconds must be between 0 and %d.", maxValue), "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+		if req.RefreshTokenOfflineIdleTimeoutInSeconds < 0 || req.RefreshTokenOfflineIdleTimeoutInSeconds > maxValue {
+			writeJSONError(w, fmt.Sprintf("Refresh token offline - idle timeout in seconds must be between 0 and %d.", maxValue), "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+		if req.RefreshTokenOfflineMaxLifetimeInSeconds < 0 || req.RefreshTokenOfflineMaxLifetimeInSeconds > maxValue {
+			writeJSONError(w, fmt.Sprintf("Refresh token offline - max lifetime in seconds must be between 0 and %d.", maxValue), "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+		if req.RefreshTokenOfflineIdleTimeoutInSeconds > req.RefreshTokenOfflineMaxLifetimeInSeconds {
+			writeJSONError(w, "Refresh token offline - idle timeout cannot be greater than max lifetime.", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		// Validate three-state settings. The parsed values are what the columns are written from
+		// below, rather than a second independent trim of the same request field: a string that
+		// parsed is one of the three the type declares, so String() gives back exactly what was
+		// trimmed, and the stored value can no longer drift from the value that was validated
+		// (#385).
+		includeClaimsInAccessToken, err := models.ThreeStateSettingFromString(strings.TrimSpace(req.IncludeOpenIDConnectClaimsInAccessToken))
+		if err != nil {
+			writeJSONError(w, "Invalid value for includeOpenIDConnectClaimsInAccessToken.", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+		includeClaimsInIdToken, err := models.ThreeStateSettingFromString(strings.TrimSpace(req.IncludeOpenIDConnectClaimsInIdToken))
+		if err != nil {
+			writeJSONError(w, "Invalid value for includeOpenIDConnectClaimsInIdToken.", "VALIDATION_ERROR", http.StatusBadRequest)
+			return
+		}
+
+		// Apply updates
+		client.TokenExpirationInSeconds = req.TokenExpirationInSeconds
+		client.RefreshTokenOfflineIdleTimeoutInSeconds = req.RefreshTokenOfflineIdleTimeoutInSeconds
+		client.RefreshTokenOfflineMaxLifetimeInSeconds = req.RefreshTokenOfflineMaxLifetimeInSeconds
+		client.IncludeOpenIDConnectClaimsInAccessToken = includeClaimsInAccessToken.String()
+		client.IncludeOpenIDConnectClaimsInIdToken = includeClaimsInIdToken.String()
+
+		if err := updateClientNotOwningAuthenticationMode(r.Context(), database, client); err != nil {
+			writeInternalServerError(w, r, errs.Wrap(err, "database error updating client tokens"), "client_id", client.Id)
+			return
+		}
+
+		// Reload related fields for response consistency
+		if err := database.ClientLoadRedirectURIs(r.Context(), nil, client); err != nil {
+			writeInternalServerError(w, r, errs.Wrap(err, "database error loading client redirect URIs after tokens update"), "client_id", client.Id)
+			return
+		}
+		if err := database.ClientLoadWebOrigins(r.Context(), nil, client); err != nil {
+			writeInternalServerError(w, r, errs.Wrap(err, "database error loading client web origins after tokens update"), "client_id", client.Id)
+			return
+		}
+
+		// Audit
+		auditLogger.Log(r.Context(), audit.AuditUpdatedClientTokens, map[string]interface{}{
+			"clientId":     client.Id,
+			"loggedInUser": callerSubject(r),
+		})
+
+		resp := api.UpdateClientResponse{Client: *apimapping.ToClientResponse(client)}
+		writeJSON(w, r, http.StatusOK, resp)
+	}
+}

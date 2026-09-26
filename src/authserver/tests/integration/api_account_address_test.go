@@ -1,0 +1,256 @@
+package integrationtests
+
+import (
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"strings"
+	"testing"
+
+	"github.com/leodip/goiabada/authserver/internal/config"
+	"github.com/leodip/goiabada/authserver/internal/models"
+	"github.com/leodip/goiabada/core/api"
+	"github.com/leodip/goiabada/core/constants"
+	"github.com/stretchr/testify/assert"
+)
+
+func getUserAccessTokenWithAccountScope_Address(t *testing.T) (string, *models.User) {
+	scope := "openid profile email " + constants.AuthServerResourceIdentifier + ":" + constants.ManageAccountPermissionIdentifier
+	return createUserAccessTokenWithScope(t, scope)
+}
+
+func TestAPIAccountAddressPut_Success(t *testing.T) {
+	accessToken, u := getUserAccessTokenWithAccountScope_Address(t)
+
+	url := config.GetAuthServer().BaseURL + "/api/v1/account/address"
+	reqBody := api.UpdateUserAddressRequest{
+		AddressLine1:      "123 Main Street",
+		AddressLine2:      "Apt 4B",
+		AddressLocality:   "New York",
+		AddressRegion:     "NY",
+		AddressPostalCode: "10001",
+		AddressCountry:    "US",
+	}
+	resp := makeAPIRequest(t, "PUT", url, accessToken, reqBody)
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d. body: %s", resp.StatusCode, string(body))
+	}
+	assert.Equal(t, "application/json", resp.Header.Get("Content-Type"))
+
+	var updateResp api.UpdateUserResponse
+	err := json.NewDecoder(resp.Body).Decode(&updateResp)
+	assert.NoError(t, err)
+	assert.Equal(t, u.Id, updateResp.User.Id)
+	assert.Equal(t, reqBody.AddressLine1, updateResp.User.AddressLine1)
+	assert.Equal(t, reqBody.AddressLine2, updateResp.User.AddressLine2)
+	assert.Equal(t, reqBody.AddressLocality, updateResp.User.AddressLocality)
+	assert.Equal(t, reqBody.AddressRegion, updateResp.User.AddressRegion)
+	assert.Equal(t, reqBody.AddressPostalCode, updateResp.User.AddressPostalCode)
+	assert.Equal(t, reqBody.AddressCountry, updateResp.User.AddressCountry)
+
+	// Verify persisted changes
+	updatedUser, err := database.GetUserById(context.Background(), nil, u.Id)
+	assert.NoError(t, err)
+	assert.NotNil(t, updatedUser)
+	assert.Equal(t, reqBody.AddressLine1, updatedUser.AddressLine1)
+	assert.Equal(t, reqBody.AddressLine2, updatedUser.AddressLine2)
+	assert.Equal(t, reqBody.AddressLocality, updatedUser.AddressLocality)
+	assert.Equal(t, reqBody.AddressRegion, updatedUser.AddressRegion)
+	assert.Equal(t, reqBody.AddressPostalCode, updatedUser.AddressPostalCode)
+	assert.Equal(t, reqBody.AddressCountry, updatedUser.AddressCountry)
+}
+
+func TestAPIAccountAddressPut_PartialAddress(t *testing.T) {
+	accessToken, _ := getUserAccessTokenWithAccountScope_Address(t)
+
+	// Update only some fields; unspecified fields should be cleared to empty
+	url := config.GetAuthServer().BaseURL + "/api/v1/account/address"
+	reqBody := api.UpdateUserAddressRequest{
+		AddressLine1:    "New Address",
+		AddressLocality: "New City",
+		// others omitted -> empty strings
+	}
+	resp := makeAPIRequest(t, "PUT", url, accessToken, reqBody)
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	var updateResp api.UpdateUserResponse
+	err := json.NewDecoder(resp.Body).Decode(&updateResp)
+	assert.NoError(t, err)
+	assert.Equal(t, reqBody.AddressLine1, updateResp.User.AddressLine1)
+	assert.Equal(t, "", updateResp.User.AddressLine2)
+	assert.Equal(t, reqBody.AddressLocality, updateResp.User.AddressLocality)
+	assert.Equal(t, "", updateResp.User.AddressRegion)
+	assert.Equal(t, "", updateResp.User.AddressPostalCode)
+	assert.Equal(t, "", updateResp.User.AddressCountry)
+}
+
+func TestAPIAccountAddressPut_ClearAllFields(t *testing.T) {
+	accessToken, _ := getUserAccessTokenWithAccountScope_Address(t)
+
+	// Clear all address fields by sending empty values
+	url := config.GetAuthServer().BaseURL + "/api/v1/account/address"
+	reqBody := api.UpdateUserAddressRequest{}
+	resp := makeAPIRequest(t, "PUT", url, accessToken, reqBody)
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	var updateResp api.UpdateUserResponse
+	err := json.NewDecoder(resp.Body).Decode(&updateResp)
+	assert.NoError(t, err)
+	assert.Equal(t, "", updateResp.User.AddressLine1)
+	assert.Equal(t, "", updateResp.User.AddressLine2)
+	assert.Equal(t, "", updateResp.User.AddressLocality)
+	assert.Equal(t, "", updateResp.User.AddressRegion)
+	assert.Equal(t, "", updateResp.User.AddressPostalCode)
+	assert.Equal(t, "", updateResp.User.AddressCountry)
+}
+
+func TestAPIAccountAddressPut_ValidationErrors(t *testing.T) {
+	accessToken, _ := getUserAccessTokenWithAccountScope_Address(t)
+	url := config.GetAuthServer().BaseURL + "/api/v1/account/address"
+
+	// AddressLine1 too long (>60)
+	long60 := strings.Repeat("a", 61)
+	resp1 := makeAPIRequest(t, "PUT", url, accessToken, api.UpdateUserAddressRequest{AddressLine1: long60})
+	defer func() { _ = resp1.Body.Close() }()
+	assert.Equal(t, http.StatusBadRequest, resp1.StatusCode)
+	var err1 api.ErrorResponse
+	_ = json.NewDecoder(resp1.Body).Decode(&err1)
+	assert.Equal(t, "Please ensure the address line 1 is no longer than 60 characters.", err1.ErrorDescription)
+
+	// AddressLine2 too long (>60)
+	resp2 := makeAPIRequest(t, "PUT", url, accessToken, api.UpdateUserAddressRequest{AddressLine2: long60})
+	defer func() { _ = resp2.Body.Close() }()
+	assert.Equal(t, http.StatusBadRequest, resp2.StatusCode)
+	var err2 api.ErrorResponse
+	_ = json.NewDecoder(resp2.Body).Decode(&err2)
+	assert.Equal(t, "Please ensure the address line 2 is no longer than 60 characters.", err2.ErrorDescription)
+
+	// Locality too long (>60)
+	resp3 := makeAPIRequest(t, "PUT", url, accessToken, api.UpdateUserAddressRequest{AddressLocality: long60})
+	defer func() { _ = resp3.Body.Close() }()
+	assert.Equal(t, http.StatusBadRequest, resp3.StatusCode)
+	var err3 api.ErrorResponse
+	_ = json.NewDecoder(resp3.Body).Decode(&err3)
+	assert.Equal(t, "Please ensure the locality is no longer than 60 characters.", err3.ErrorDescription)
+
+	// Region too long (>60)
+	resp4 := makeAPIRequest(t, "PUT", url, accessToken, api.UpdateUserAddressRequest{AddressRegion: long60})
+	defer func() { _ = resp4.Body.Close() }()
+	assert.Equal(t, http.StatusBadRequest, resp4.StatusCode)
+	var err4 api.ErrorResponse
+	_ = json.NewDecoder(resp4.Body).Decode(&err4)
+	assert.Equal(t, "Please ensure the region is no longer than 60 characters.", err4.ErrorDescription)
+
+	// Postal code too long (>30)
+	long31 := strings.Repeat("1", 31)
+	resp5 := makeAPIRequest(t, "PUT", url, accessToken, api.UpdateUserAddressRequest{AddressPostalCode: long31})
+	defer func() { _ = resp5.Body.Close() }()
+	assert.Equal(t, http.StatusBadRequest, resp5.StatusCode)
+	var err5 api.ErrorResponse
+	_ = json.NewDecoder(resp5.Body).Decode(&err5)
+	assert.Equal(t, "Please ensure the postal code is no longer than 30 characters.", err5.ErrorDescription)
+
+	// Invalid country
+	resp6 := makeAPIRequest(t, "PUT", url, accessToken, api.UpdateUserAddressRequest{AddressCountry: "INVALID_COUNTRY"})
+	defer func() { _ = resp6.Body.Close() }()
+	assert.Equal(t, http.StatusBadRequest, resp6.StatusCode)
+	var err6 api.ErrorResponse
+	_ = json.NewDecoder(resp6.Body).Decode(&err6)
+	assert.Equal(t, "Invalid country.", err6.ErrorDescription)
+}
+
+// Angle brackets are refused rather than stripped (#275): the endpoint answers
+// 400 with the address validator's code, and nothing reaches the row.
+func TestAPIAccountAddressPut_AngleBracketsRefused(t *testing.T) {
+	accessToken, _ := getUserAccessTokenWithAccountScope_Address(t)
+	url := config.GetAuthServer().BaseURL + "/api/v1/account/address"
+
+	resp := makeAPIRequest(t, "PUT", url, accessToken, api.UpdateUserAddressRequest{
+		AddressLine1:   "<b>x</b>",
+		AddressCountry: "US",
+	})
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	var errResp api.ErrorResponse
+	_ = json.NewDecoder(resp.Body).Decode(&errResp)
+	assert.Equal(t, "validator.address.angle_brackets", errResp.ErrorCode)
+	assert.Equal(t, "Address fields cannot contain the characters < or >.", errResp.ErrorDescription)
+}
+
+// Only "<" and ">" are refused (#275, decision 2). An address carrying an
+// ampersand, an apostrophe and quotes comes back byte for byte as it was sent,
+// which is the property that replaces the sanitizer's rewriting.
+func TestAPIAccountAddressPut_AmpersandAndQuotesStoredVerbatim(t *testing.T) {
+	accessToken, _ := getUserAccessTokenWithAccountScope_Address(t)
+	url := config.GetAuthServer().BaseURL + "/api/v1/account/address"
+
+	line1 := `O'Brien & Sons, "The Mews"`
+	resp := makeAPIRequest(t, "PUT", url, accessToken, api.UpdateUserAddressRequest{
+		AddressLine1:   line1,
+		AddressCountry: "US",
+	})
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	var updateResp api.UpdateUserResponse
+	err := json.NewDecoder(resp.Body).Decode(&updateResp)
+	assert.NoError(t, err)
+	assert.Equal(t, line1, updateResp.User.AddressLine1)
+}
+
+func TestAPIAccountAddressPut_UnauthorizedAndScope(t *testing.T) {
+	url := config.GetAuthServer().BaseURL + "/api/v1/account/address"
+
+	// No token
+	req, err := http.NewRequest("PUT", url, nil)
+	assert.NoError(t, err)
+	httpClient := createHttpClient(t)
+	resp, err := httpClient.Do(req)
+	assert.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+	body1, _ := io.ReadAll(resp.Body)
+	assert.Equal(t, "application/json", resp.Header.Get("Content-Type"))
+	assert.Contains(t, string(body1), "Access token required.")
+
+	// Invalid token
+	respInvalid := makeAPIRequest(t, "PUT", url, "invalid-token", api.UpdateUserAddressRequest{AddressLine1: "X"})
+	defer func() { _ = respInvalid.Body.Close() }()
+	assert.Equal(t, http.StatusUnauthorized, respInvalid.StatusCode)
+	bodyInvalid, _ := io.ReadAll(respInvalid.Body)
+	assert.Contains(t, string(bodyInvalid), "Access token required.")
+
+	// Insufficient scope
+	tok := createClientCredentialsTokenWithScope(t, constants.AuthServerResourceIdentifier, constants.UserinfoPermissionIdentifier)
+	resp2 := makeAPIRequest(t, "PUT", url, tok, api.UpdateUserAddressRequest{AddressLine1: "X"})
+	defer func() { _ = resp2.Body.Close() }()
+	assert.Equal(t, http.StatusForbidden, resp2.StatusCode)
+	body2, _ := io.ReadAll(resp2.Body)
+	assert.Contains(t, string(body2), "Insufficient scope.")
+}
+
+func TestAPIAccountAddressPut_InvalidRequestBody(t *testing.T) {
+	accessToken, _ := getUserAccessTokenWithAccountScope_Address(t)
+	url := config.GetAuthServer().BaseURL + "/api/v1/account/address"
+
+	// Invalid JSON (no body)
+	req, err := http.NewRequest("PUT", url, nil)
+	assert.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Content-Type", "application/json")
+	httpClient := createHttpClient(t)
+	resp, err := httpClient.Do(req)
+	assert.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	var errResp api.ErrorResponse
+	_ = json.NewDecoder(resp.Body).Decode(&errResp)
+	assert.Equal(t, "Invalid request body", errResp.ErrorDescription)
+}

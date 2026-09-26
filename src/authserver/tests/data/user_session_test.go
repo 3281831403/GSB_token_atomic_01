@@ -1,0 +1,1193 @@
+package datatests
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/leodip/goiabada/authserver/internal/data"
+	"github.com/leodip/goiabada/authserver/internal/models"
+	"github.com/leodip/goiabada/authserver/internal/testutil/fake"
+)
+
+// testUserAgent and testUserAgentUpdated are raw User-Agent headers, not parsed labels: the
+// column stores what the browser sent. Two distinct values so the create round trip and the
+// update path each compare something other than two empty strings (#281).
+const (
+	testUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+		"(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+	testUserAgentUpdated = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_1 like Mac OS X) " +
+		"AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Mobile/15E148 Safari/604.1"
+)
+
+func TestCreateUserSession(t *testing.T) {
+	user := createTestUser(t)
+	userSession := createTestUserSession(t, user.Id)
+
+	if userSession.Id == 0 {
+		t.Error("Expected non-zero ID after creation")
+	}
+	if !userSession.CreatedAt.Valid || userSession.CreatedAt.Time.IsZero() {
+		t.Error("Expected CreatedAt to be set")
+	}
+	if !userSession.UpdatedAt.Valid || userSession.UpdatedAt.Time.IsZero() {
+		t.Error("Expected UpdatedAt to be set")
+	}
+
+	retrievedUserSession, err := database.GetUserSessionById(context.Background(), nil, userSession.Id)
+	if err != nil {
+		t.Fatalf("Failed to retrieve created user session: %v", err)
+	}
+
+	assertUserSessionEqual(t, userSession, retrievedUserSession)
+}
+
+func TestUpdateUserSession(t *testing.T) {
+	user := createTestUser(t)
+	userSession := createTestUserSession(t, user.Id)
+
+	// Update all properties
+	userSession.SessionIdentifier = "updated_" + fake.UUID()
+	userSession.Started = time.Now().UTC().Add(-1 * time.Hour).Truncate(time.Microsecond)
+	userSession.LastAccessed = time.Now().UTC().Truncate(time.Microsecond)
+	userSession.AuthMethods = "pwd,otp"
+	userSession.AcrLevel = models.AcrLevel2Optional.String()
+	userSession.AuthTime = time.Now().UTC().Add(-30 * time.Minute).Truncate(time.Microsecond)
+	userSession.IpAddress = "192.168.1.2"
+	userSession.DeviceName = "Updated Device"
+	userSession.DeviceType = "tablet"
+	userSession.DeviceOS = "iOS"
+	userSession.UserAgent = testUserAgentUpdated
+	userSession.UserId = user.Id // This shouldn't change, but we'll update it to ensure it's not accidentally modified
+
+	time.Sleep(timestampTick)
+
+	err := database.UpdateUserSession(context.Background(), nil, userSession)
+	if err != nil {
+		t.Fatalf("Failed to update user session: %v", err)
+	}
+
+	updatedUserSession, err := database.GetUserSessionById(context.Background(), nil, userSession.Id)
+	if err != nil {
+		t.Fatalf("Failed to retrieve updated user session: %v", err)
+	}
+
+	assertUserSessionEqual(t, userSession, updatedUserSession)
+
+	if !updatedUserSession.UpdatedAt.Time.After(updatedUserSession.CreatedAt.Time) {
+		t.Error("Expected UpdatedAt to be after CreatedAt")
+	}
+}
+
+func TestGetUserSessionById(t *testing.T) {
+	user := createTestUser(t)
+	userSession := createTestUserSession(t, user.Id)
+
+	retrievedUserSession, err := database.GetUserSessionById(context.Background(), nil, userSession.Id)
+	if err != nil {
+		t.Fatalf("Failed to get user session by ID: %v", err)
+	}
+
+	assertUserSessionEqual(t, userSession, retrievedUserSession)
+
+	nonExistentUserSession, err := database.GetUserSessionById(context.Background(), nil, 99999)
+	if err != nil {
+		t.Errorf("Expected no error for non-existent user session, got: %v", err)
+	}
+	if nonExistentUserSession != nil {
+		t.Errorf("Expected nil for non-existent user session, got a user session with ID: %d", nonExistentUserSession.Id)
+	}
+}
+
+func TestGetUserSessionBySessionIdentifier(t *testing.T) {
+	user := createTestUser(t)
+	userSession := createTestUserSession(t, user.Id)
+
+	retrievedUserSession, err := database.GetUserSessionBySessionIdentifier(context.Background(), nil, userSession.SessionIdentifier)
+	if err != nil {
+		t.Fatalf("Failed to get user session by session identifier: %v", err)
+	}
+
+	assertUserSessionEqual(t, userSession, retrievedUserSession)
+
+	nonExistentUserSession, err := database.GetUserSessionBySessionIdentifier(context.Background(), nil, "non_existent_identifier")
+	if err != nil {
+		t.Errorf("Expected no error for non-existent user session, got: %v", err)
+	}
+	if nonExistentUserSession != nil {
+		t.Errorf("Expected nil for non-existent user session, got a user session with ID: %d", nonExistentUserSession.Id)
+	}
+}
+
+func TestGetUserSessionsByClientIdPaginated(t *testing.T) {
+	user := createTestUser(t)
+	client := createTestClient(t)
+	createTestUserSessionsWithClient(t, user.Id, client.Id, 25)
+
+	// Test first page
+	userSessionsPage1, total1, err := database.GetUserSessionsByClientIdPaginated(context.Background(), nil, client.Id, 1, 10)
+	if err != nil {
+		t.Fatalf("Failed to get paginated user sessions (page 1): %v", err)
+	}
+
+	if len(userSessionsPage1) != 10 {
+		t.Errorf("Expected 10 user sessions on the first page, got %d", len(userSessionsPage1))
+	}
+
+	if total1 != 25 {
+		t.Errorf("Expected total to be 25, got %d", total1)
+	}
+
+	// Test second page
+	userSessionsPage2, total2, err := database.GetUserSessionsByClientIdPaginated(context.Background(), nil, client.Id, 2, 10)
+	if err != nil {
+		t.Fatalf("Failed to get second page of paginated user sessions: %v", err)
+	}
+
+	if len(userSessionsPage2) != 10 {
+		t.Errorf("Expected 10 user sessions on the second page, got %d", len(userSessionsPage2))
+	}
+
+	if total2 != 25 {
+		t.Errorf("Expected total to be 25, got %d", total2)
+	}
+
+	// Test last page
+	userSessionsPage3, total3, err := database.GetUserSessionsByClientIdPaginated(context.Background(), nil, client.Id, 3, 10)
+	if err != nil {
+		t.Fatalf("Failed to get last page of paginated user sessions: %v", err)
+	}
+
+	if len(userSessionsPage3) != 5 {
+		t.Errorf("Expected 5 user sessions on the last page, got %d", len(userSessionsPage3))
+	}
+
+	if total3 != 25 {
+		t.Errorf("Expected total to be 25, got %d", total3)
+	}
+
+	// Test page beyond total
+	userSessionsPage4, total4, err := database.GetUserSessionsByClientIdPaginated(context.Background(), nil, client.Id, 4, 10)
+	if err != nil {
+		t.Fatalf("Failed to get page beyond total: %v", err)
+	}
+
+	if len(userSessionsPage4) != 0 {
+		t.Errorf("Expected 0 user sessions on page beyond total, got %d", len(userSessionsPage4))
+	}
+
+	if total4 != 25 {
+		t.Errorf("Expected total to be 25, got %d", total4)
+	}
+
+	// Validate that all returned user sessions belong to the correct client
+	allReturnedSessions := append(append(userSessionsPage1, userSessionsPage2...), userSessionsPage3...)
+	for _, us := range allReturnedSessions {
+		if err := database.UserSessionLoadClients(context.Background(), nil, &us); err != nil {
+			t.Fatalf("Failed to load clients for user session: %v", err)
+		}
+		if len(us.Clients) != 1 || us.Clients[0].ClientId != client.Id {
+			t.Errorf("User session %d is not associated with the correct client", us.Id)
+		}
+	}
+}
+
+func TestUserSessionsLoadUsers(t *testing.T) {
+	user := createTestUser(t)
+	userSessions := createTestUserSessions(t, user.Id, 5)
+
+	err := database.UserSessionsLoadUsers(context.Background(), nil, userSessions)
+	if err != nil {
+		t.Fatalf("Failed to load users for user sessions: %v", err)
+	}
+
+	for _, us := range userSessions {
+		if us.User.Id != user.Id {
+			t.Errorf("Expected user ID %d, got %d", user.Id, us.User.Id)
+		}
+	}
+}
+
+func TestUserSessionsLoadClients(t *testing.T) {
+	user := createTestUser(t)
+	client := createTestClient(t)
+	userSessions := createTestUserSessionsWithClient(t, user.Id, client.Id, 5)
+
+	err := database.UserSessionsLoadClients(context.Background(), nil, userSessions)
+	if err != nil {
+		t.Fatalf("Failed to load clients for user sessions: %v", err)
+	}
+
+	for _, us := range userSessions {
+		if len(us.Clients) != 1 {
+			t.Errorf("Expected 1 client, got %d", len(us.Clients))
+		}
+		if us.Clients[0].ClientId != client.Id {
+			t.Errorf("Expected client ID %d, got %d", client.Id, us.Clients[0].ClientId)
+		}
+	}
+}
+
+// Both loaders return early on a nil slice, and must also survive an empty
+// non-nil one: that guard tests userSessions == nil, so an empty page falls
+// through to the batch reader with an empty id list. Every sibling loader is
+// asserted this way (see TestUsersLoadPermissions_NilAndEmptySlices and
+// friends in load_helpers_test.go); these two were the only ones missing it.
+func TestUserSessionsLoadUsers_NilAndEmptySlices(t *testing.T) {
+	if err := database.UserSessionsLoadUsers(context.Background(), nil, nil); err != nil {
+		t.Errorf("UserSessionsLoadUsers(nil) should be a no-op, got: %v", err)
+	}
+	if err := database.UserSessionsLoadUsers(context.Background(), nil, []models.UserSession{}); err != nil {
+		t.Errorf("UserSessionsLoadUsers(empty) should be a no-op, got: %v", err)
+	}
+}
+
+func TestUserSessionsLoadClients_NilAndEmptySlices(t *testing.T) {
+	if err := database.UserSessionsLoadClients(context.Background(), nil, nil); err != nil {
+		t.Errorf("UserSessionsLoadClients(nil) should be a no-op, got: %v", err)
+	}
+	if err := database.UserSessionsLoadClients(context.Background(), nil, []models.UserSession{}); err != nil {
+		t.Errorf("UserSessionsLoadClients(empty) should be a no-op, got: %v", err)
+	}
+}
+
+func TestUserSessionLoadClients(t *testing.T) {
+	user := createTestUser(t)
+	client := createTestClient(t)
+	userSession := createTestUserSessionWithClient(t, user.Id, client.Id)
+
+	err := database.UserSessionLoadClients(context.Background(), nil, userSession)
+	if err != nil {
+		t.Fatalf("Failed to load clients for user session: %v", err)
+	}
+
+	if len(userSession.Clients) != 1 {
+		t.Errorf("Expected 1 client, got %d", len(userSession.Clients))
+	}
+	if userSession.Clients[0].ClientId != client.Id {
+		t.Errorf("Expected client ID %d, got %d", client.Id, userSession.Clients[0].ClientId)
+	}
+}
+
+func TestUserSessionLoadUser(t *testing.T) {
+	user := createTestUser(t)
+	userSession := createTestUserSession(t, user.Id)
+
+	err := database.UserSessionLoadUser(context.Background(), nil, userSession)
+	if err != nil {
+		t.Fatalf("Failed to load user for user session: %v", err)
+	}
+
+	if userSession.User.Id != user.Id {
+		t.Errorf("Expected user ID %d, got %d", user.Id, userSession.User.Id)
+	}
+}
+
+func TestGetUserSessionsByUserId(t *testing.T) {
+	user := createTestUser(t)
+	createTestUserSessions(t, user.Id, 5)
+
+	retrievedUserSessions, err := database.GetUserSessionsByUserId(context.Background(), nil, user.Id)
+	if err != nil {
+		t.Fatalf("Failed to get user sessions by user ID: %v", err)
+	}
+
+	if len(retrievedUserSessions) != 5 {
+		t.Errorf("Expected 5 user sessions, got %d", len(retrievedUserSessions))
+	}
+
+	for _, us := range retrievedUserSessions {
+		if us.UserId != user.Id {
+			t.Errorf("Expected user ID %d, got %d", user.Id, us.UserId)
+		}
+	}
+}
+
+func TestDeleteUserSession(t *testing.T) {
+	user := createTestUser(t)
+	userSession := createTestUserSession(t, user.Id)
+
+	err := database.DeleteUserSession(context.Background(), nil, userSession.Id)
+	if err != nil {
+		t.Fatalf("Failed to delete user session: %v", err)
+	}
+
+	deletedUserSession, err := database.GetUserSessionById(context.Background(), nil, userSession.Id)
+	if err != nil {
+		t.Fatalf("Error while checking for deleted user session: %v", err)
+	}
+	if deletedUserSession != nil {
+		t.Errorf("User session still exists after deletion")
+	}
+
+	err = database.DeleteUserSession(context.Background(), nil, 99999)
+	if err != nil {
+		t.Errorf("Expected no error when deleting non-existent user session, got: %v", err)
+	}
+}
+
+// createTestUserSession seeds a session on the package's shared handle; createTestUserSessionOn
+// takes the handle, for the reason createTestUserOn does.
+func createTestUserSession(t *testing.T, userId int64) *models.UserSession {
+	return createTestUserSessionOn(t, database, userId)
+}
+
+func createTestUserSessionOn(t *testing.T, db data.Database, userId int64) *models.UserSession {
+	userSession := &models.UserSession{
+		SessionIdentifier: fake.UUID(),
+		Started:           time.Now().UTC().Truncate(time.Microsecond),
+		LastAccessed:      time.Now().UTC().Truncate(time.Microsecond),
+		AuthMethods:       "pwd",
+		AcrLevel:          models.AcrLevel1.String(),
+		AuthTime:          time.Now().UTC().Truncate(time.Microsecond),
+		IpAddress:         fake.IPv4Address(),
+		DeviceName:        fake.Name(),
+		DeviceType:        "desktop",
+		DeviceOS:          "Windows",
+		UserAgent:         testUserAgent,
+		UserId:            userId,
+	}
+	err := db.CreateUserSession(context.Background(), nil, userSession)
+	if err != nil {
+		t.Fatalf("Failed to create test user session: %v", err)
+	}
+	return userSession
+}
+
+func createTestUserSessions(t *testing.T, userId int64, count int) []models.UserSession {
+	var userSessions []models.UserSession
+	for i := 0; i < count; i++ {
+		userSession := createTestUserSession(t, userId)
+		userSessions = append(userSessions, *userSession)
+	}
+	return userSessions
+}
+
+func createTestUserSessionWithClient(t *testing.T, userId, clientId int64) *models.UserSession {
+	return createTestUserSessionWithClientOn(t, database, userId, clientId)
+}
+
+func createTestUserSessionWithClientOn(t *testing.T, db data.Database, userId, clientId int64) *models.UserSession {
+	userSession := createTestUserSessionOn(t, db, userId)
+	userSessionClient := &models.UserSessionClient{
+		UserSessionId: userSession.Id,
+		ClientId:      clientId,
+		Started:       time.Now().UTC().Truncate(time.Microsecond),
+		LastAccessed:  time.Now().UTC().Truncate(time.Microsecond),
+	}
+	err := db.CreateUserSessionClient(context.Background(), nil, userSessionClient)
+	if err != nil {
+		t.Fatalf("Failed to create test user session client: %v", err)
+	}
+	return userSession
+}
+
+func createTestUserSessionsWithClient(t *testing.T, userId, clientId int64, count int) []models.UserSession {
+	var userSessions []models.UserSession
+	for i := 0; i < count; i++ {
+		userSession := createTestUserSessionWithClient(t, userId, clientId)
+		userSessions = append(userSessions, *userSession)
+	}
+	return userSessions
+}
+
+func assertUserSessionEqual(t *testing.T, expected, actual *models.UserSession) {
+	if actual.Id != expected.Id {
+		t.Errorf("Expected ID %d, got %d", expected.Id, actual.Id)
+	}
+	if actual.SessionIdentifier != expected.SessionIdentifier {
+		t.Errorf("Expected SessionIdentifier %s, got %s", expected.SessionIdentifier, actual.SessionIdentifier)
+	}
+	if !actual.Started.Equal(expected.Started) {
+		t.Errorf("Expected Started %v, got %v", expected.Started, actual.Started)
+	}
+	if !actual.LastAccessed.Equal(expected.LastAccessed) {
+		t.Errorf("Expected LastAccessed %v, got %v", expected.LastAccessed, actual.LastAccessed)
+	}
+	if actual.AuthMethods != expected.AuthMethods {
+		t.Errorf("Expected AuthMethods %s, got %s", expected.AuthMethods, actual.AuthMethods)
+	}
+	if actual.AcrLevel != expected.AcrLevel {
+		t.Errorf("Expected AcrLevel %s, got %s", expected.AcrLevel, actual.AcrLevel)
+	}
+	if !actual.AuthTime.Equal(expected.AuthTime) {
+		t.Errorf("Expected AuthTime %v, got %v", expected.AuthTime, actual.AuthTime)
+	}
+	if actual.IpAddress != expected.IpAddress {
+		t.Errorf("Expected IpAddress %s, got %s", expected.IpAddress, actual.IpAddress)
+	}
+	if actual.DeviceName != expected.DeviceName {
+		t.Errorf("Expected DeviceName %s, got %s", expected.DeviceName, actual.DeviceName)
+	}
+	if actual.DeviceType != expected.DeviceType {
+		t.Errorf("Expected DeviceType %s, got %s", expected.DeviceType, actual.DeviceType)
+	}
+	if actual.DeviceOS != expected.DeviceOS {
+		t.Errorf("Expected DeviceOS %s, got %s", expected.DeviceOS, actual.DeviceOS)
+	}
+	// The raw header, compared exactly: StartNewUserSession decides two logins came from the
+	// same device by comparing this string and the IP, so a value the storage round trip alters
+	// changes which sessions supersede which (#281).
+	if actual.UserAgent != expected.UserAgent {
+		t.Errorf("Expected UserAgent %s, got %s", expected.UserAgent, actual.UserAgent)
+	}
+	if actual.UserId != expected.UserId {
+		t.Errorf("Expected UserId %d, got %d", expected.UserId, actual.UserId)
+	}
+	if !actual.CreatedAt.Valid || actual.CreatedAt.Time.IsZero() {
+		t.Error("Expected CreatedAt to be set")
+	}
+	if !actual.UpdatedAt.Valid || actual.UpdatedAt.Time.IsZero() {
+		t.Error("Expected UpdatedAt to be set")
+	}
+}
+
+func TestDeleteIdleSessions(t *testing.T) {
+	// Create a test user
+	user := &models.User{
+		Username:      fake.Username(),
+		Email:         fake.Email(),
+		EmailVerified: true,
+		PasswordHash:  fake.Password(32),
+		Subject:       fake.UUID(),
+		Enabled:       true,
+		GivenName:     fake.FirstName(),
+		FamilyName:    fake.LastName(),
+		OTPEnabled:    false,
+	}
+	err := database.CreateUser(context.Background(), nil, user)
+	if err != nil {
+		t.Fatalf("Failed to create test user: %v", err)
+	}
+
+	// Create a test client
+	client := &models.Client{
+		ClientIdentifier:                        fake.UUID(),
+		Description:                             "Test Client",
+		Enabled:                                 true,
+		ConsentRequired:                         true,
+		IsPublic:                                false,
+		AuthorizationCodeEnabled:                true,
+		ClientCredentialsEnabled:                true,
+		TokenExpirationInSeconds:                3600,
+		RefreshTokenOfflineIdleTimeoutInSeconds: 86400,
+		RefreshTokenOfflineMaxLifetimeInSeconds: 86400 * 30, // 30 days
+		IncludeOpenIDConnectClaimsInAccessToken: "no",
+		DefaultAcrLevel:                         models.AcrLevel1,
+	}
+	err = database.CreateClient(context.Background(), nil, client)
+	if err != nil {
+		t.Fatalf("Failed to create test client: %v", err)
+	}
+
+	// Create sessions with different last accessed times
+	now := time.Now().UTC()
+
+	// Create an active session (accessed 10 minutes ago)
+	activeSession := &models.UserSession{
+		SessionIdentifier: fake.UUID(),
+		Started:           now.Add(-10 * time.Minute),
+		LastAccessed:      now.Add(-10 * time.Minute),
+		AuthMethods:       "pwd",
+		AcrLevel:          models.AcrLevel1.String(),
+		AuthTime:          now.Add(-10 * time.Minute),
+		IpAddress:         fake.IPv4Address(),
+		DeviceName:        fake.Name(),
+		DeviceType:        "desktop",
+		DeviceOS:          "Windows",
+		UserId:            user.Id,
+	}
+	err = database.CreateUserSession(context.Background(), nil, activeSession)
+	if err != nil {
+		t.Fatalf("Failed to create active session: %v", err)
+	}
+
+	// Create UserSessionClient for active session
+	activeSessionClient := &models.UserSessionClient{
+		UserSessionId: activeSession.Id,
+		ClientId:      client.Id,
+		Started:       activeSession.Started,
+		LastAccessed:  activeSession.LastAccessed,
+	}
+	err = database.CreateUserSessionClient(context.Background(), nil, activeSessionClient)
+	if err != nil {
+		t.Fatalf("Failed to create active session client: %v", err)
+	}
+
+	// Create an idle session (accessed 2 hours ago)
+	idleSession := &models.UserSession{
+		SessionIdentifier: fake.UUID(),
+		Started:           now.Add(-3 * time.Hour),
+		LastAccessed:      now.Add(-2 * time.Hour),
+		AuthMethods:       "pwd",
+		AcrLevel:          models.AcrLevel1.String(),
+		AuthTime:          now.Add(-3 * time.Hour),
+		IpAddress:         fake.IPv4Address(),
+		DeviceName:        fake.Name(),
+		DeviceType:        "desktop",
+		DeviceOS:          "Windows",
+		UserId:            user.Id,
+	}
+	err = database.CreateUserSession(context.Background(), nil, idleSession)
+	if err != nil {
+		t.Fatalf("Failed to create idle session: %v", err)
+	}
+
+	// Create UserSessionClient for idle session
+	idleSessionClient := &models.UserSessionClient{
+		UserSessionId: idleSession.Id,
+		ClientId:      client.Id,
+		Started:       idleSession.Started,
+		LastAccessed:  idleSession.LastAccessed,
+	}
+	err = database.CreateUserSessionClient(context.Background(), nil, idleSessionClient)
+	if err != nil {
+		t.Fatalf("Failed to create idle session client: %v", err)
+	}
+
+	// Create a very idle session (accessed 4 hours ago)
+	veryIdleSession := &models.UserSession{
+		SessionIdentifier: fake.UUID(),
+		Started:           now.Add(-5 * time.Hour),
+		LastAccessed:      now.Add(-4 * time.Hour),
+		AuthMethods:       "pwd",
+		AcrLevel:          models.AcrLevel1.String(),
+		AuthTime:          now.Add(-5 * time.Hour),
+		IpAddress:         fake.IPv4Address(),
+		DeviceName:        fake.Name(),
+		DeviceType:        "desktop",
+		DeviceOS:          "Windows",
+		UserId:            user.Id,
+	}
+	err = database.CreateUserSession(context.Background(), nil, veryIdleSession)
+	if err != nil {
+		t.Fatalf("Failed to create very idle session: %v", err)
+	}
+
+	// Create UserSessionClient for very idle session
+	veryIdleSessionClient := &models.UserSessionClient{
+		UserSessionId: veryIdleSession.Id,
+		ClientId:      client.Id,
+		Started:       veryIdleSession.Started,
+		LastAccessed:  veryIdleSession.LastAccessed,
+	}
+	err = database.CreateUserSessionClient(context.Background(), nil, veryIdleSessionClient)
+	if err != nil {
+		t.Fatalf("Failed to create very idle session client: %v", err)
+	}
+
+	// Set idle timeout to 1 hour
+	idleTimeout := 1 * time.Hour
+
+	// Delete idle sessions
+	err = database.DeleteIdleSessions(context.Background(), nil, idleTimeout)
+	if err != nil {
+		t.Fatalf("Failed to delete idle sessions: %v", err)
+	}
+
+	// Check if active session still exists
+	activeExists, err := database.GetUserSessionById(context.Background(), nil, activeSession.Id)
+	if err != nil {
+		t.Fatalf("Error checking active session: %v", err)
+	}
+	if activeExists == nil {
+		t.Error("Active session was incorrectly deleted")
+	}
+
+	// Verify active session's client association still exists
+	activeSessionClients, err := database.GetUserSessionClientsByUserSessionId(context.Background(), nil, activeSession.Id)
+	if err != nil {
+		t.Fatalf("Error checking active session clients: %v", err)
+	}
+	if len(activeSessionClients) != 1 {
+		t.Error("Active session client was incorrectly deleted")
+	}
+
+	// Check if idle session was deleted
+	idleExists, err := database.GetUserSessionById(context.Background(), nil, idleSession.Id)
+	if err != nil {
+		t.Fatalf("Error checking idle session: %v", err)
+	}
+	if idleExists != nil {
+		t.Error("Idle session was not deleted")
+	}
+
+	// Verify idle session's client association was also deleted
+	idleSessionClients, err := database.GetUserSessionClientsByUserSessionId(context.Background(), nil, idleSession.Id)
+	if err != nil {
+		t.Fatalf("Error checking idle session clients: %v", err)
+	}
+	if len(idleSessionClients) != 0 {
+		t.Error("Idle session client was not deleted")
+	}
+
+	// Check if very idle session was deleted
+	veryIdleExists, err := database.GetUserSessionById(context.Background(), nil, veryIdleSession.Id)
+	if err != nil {
+		t.Fatalf("Error checking very idle session: %v", err)
+	}
+	if veryIdleExists != nil {
+		t.Error("Very idle session was not deleted")
+	}
+
+	// Verify very idle session's client association was also deleted
+	veryIdleSessionClients, err := database.GetUserSessionClientsByUserSessionId(context.Background(), nil, veryIdleSession.Id)
+	if err != nil {
+		t.Fatalf("Error checking very idle session clients: %v", err)
+	}
+	if len(veryIdleSessionClients) != 0 {
+		t.Error("Very idle session client was not deleted")
+	}
+}
+
+func TestDeleteExpiredSessions(t *testing.T) {
+	// Create a test user
+	user := &models.User{
+		Username:      fake.Username(),
+		Email:         fake.Email(),
+		EmailVerified: true,
+		PasswordHash:  fake.Password(32),
+		Subject:       fake.UUID(),
+		Enabled:       true,
+		GivenName:     fake.FirstName(),
+		FamilyName:    fake.LastName(),
+		OTPEnabled:    false,
+	}
+	err := database.CreateUser(context.Background(), nil, user)
+	if err != nil {
+		t.Fatalf("Failed to create test user: %v", err)
+	}
+
+	// Create a test client
+	client := &models.Client{
+		ClientIdentifier:                        fake.UUID(),
+		Description:                             "Test Client",
+		Enabled:                                 true,
+		ConsentRequired:                         true,
+		IsPublic:                                false,
+		AuthorizationCodeEnabled:                true,
+		ClientCredentialsEnabled:                true,
+		TokenExpirationInSeconds:                3600,
+		RefreshTokenOfflineIdleTimeoutInSeconds: 86400,
+		RefreshTokenOfflineMaxLifetimeInSeconds: 86400 * 30, // 30 days
+		IncludeOpenIDConnectClaimsInAccessToken: "no",
+		DefaultAcrLevel:                         models.AcrLevel1,
+	}
+	err = database.CreateClient(context.Background(), nil, client)
+	if err != nil {
+		t.Fatalf("Failed to create test client: %v", err)
+	}
+
+	// Create sessions with different start times
+	now := time.Now().UTC()
+
+	// Create a recent session (started 1 hour ago)
+	recentSession := &models.UserSession{
+		SessionIdentifier: fake.UUID(),
+		Started:           now.Add(-1 * time.Hour),
+		LastAccessed:      now,
+		AuthMethods:       "pwd",
+		AcrLevel:          models.AcrLevel1.String(),
+		AuthTime:          now.Add(-1 * time.Hour),
+		IpAddress:         fake.IPv4Address(),
+		DeviceName:        fake.Name(),
+		DeviceType:        "desktop",
+		DeviceOS:          "Windows",
+		UserId:            user.Id,
+	}
+	err = database.CreateUserSession(context.Background(), nil, recentSession)
+	if err != nil {
+		t.Fatalf("Failed to create recent session: %v", err)
+	}
+
+	// Create UserSessionClient for recent session
+	recentSessionClient := &models.UserSessionClient{
+		UserSessionId: recentSession.Id,
+		ClientId:      client.Id,
+		Started:       recentSession.Started,
+		LastAccessed:  recentSession.LastAccessed,
+	}
+	err = database.CreateUserSessionClient(context.Background(), nil, recentSessionClient)
+	if err != nil {
+		t.Fatalf("Failed to create recent session client: %v", err)
+	}
+
+	// Create an old session (started 2 days ago)
+	oldSession := &models.UserSession{
+		SessionIdentifier: fake.UUID(),
+		Started:           now.Add(-48 * time.Hour),
+		LastAccessed:      now,
+		AuthMethods:       "pwd",
+		AcrLevel:          models.AcrLevel1.String(),
+		AuthTime:          now.Add(-48 * time.Hour),
+		IpAddress:         fake.IPv4Address(),
+		DeviceName:        fake.Name(),
+		DeviceType:        "desktop",
+		DeviceOS:          "Windows",
+		UserId:            user.Id,
+	}
+	err = database.CreateUserSession(context.Background(), nil, oldSession)
+	if err != nil {
+		t.Fatalf("Failed to create old session: %v", err)
+	}
+
+	// Create UserSessionClient for old session
+	oldSessionClient := &models.UserSessionClient{
+		UserSessionId: oldSession.Id,
+		ClientId:      client.Id,
+		Started:       oldSession.Started,
+		LastAccessed:  oldSession.LastAccessed,
+	}
+	err = database.CreateUserSessionClient(context.Background(), nil, oldSessionClient)
+	if err != nil {
+		t.Fatalf("Failed to create old session client: %v", err)
+	}
+
+	// Create a very old session (started 5 days ago)
+	veryOldSession := &models.UserSession{
+		SessionIdentifier: fake.UUID(),
+		Started:           now.Add(-120 * time.Hour),
+		LastAccessed:      now,
+		AuthMethods:       "pwd",
+		AcrLevel:          models.AcrLevel1.String(),
+		AuthTime:          now.Add(-120 * time.Hour),
+		IpAddress:         fake.IPv4Address(),
+		DeviceName:        fake.Name(),
+		DeviceType:        "desktop",
+		DeviceOS:          "Windows",
+		UserId:            user.Id,
+	}
+	err = database.CreateUserSession(context.Background(), nil, veryOldSession)
+	if err != nil {
+		t.Fatalf("Failed to create very old session: %v", err)
+	}
+
+	// Create UserSessionClient for very old session
+	veryOldSessionClient := &models.UserSessionClient{
+		UserSessionId: veryOldSession.Id,
+		ClientId:      client.Id,
+		Started:       veryOldSession.Started,
+		LastAccessed:  veryOldSession.LastAccessed,
+	}
+	err = database.CreateUserSessionClient(context.Background(), nil, veryOldSessionClient)
+	if err != nil {
+		t.Fatalf("Failed to create very old session client: %v", err)
+	}
+
+	// Set maximum lifetime to 24 hours
+	maxLifetime := 24 * time.Hour
+
+	// Delete expired sessions
+	err = database.DeleteExpiredSessions(context.Background(), nil, maxLifetime)
+	if err != nil {
+		t.Fatalf("Failed to delete expired sessions: %v", err)
+	}
+
+	// Check if recent session still exists
+	recentExists, err := database.GetUserSessionById(context.Background(), nil, recentSession.Id)
+	if err != nil {
+		t.Fatalf("Error checking recent session: %v", err)
+	}
+	if recentExists == nil {
+		t.Error("Recent session was incorrectly deleted")
+	}
+
+	// Verify recent session's client association still exists
+	recentSessionClients, err := database.GetUserSessionClientsByUserSessionId(context.Background(), nil, recentSession.Id)
+	if err != nil {
+		t.Fatalf("Error checking recent session clients: %v", err)
+	}
+	if len(recentSessionClients) != 1 {
+		t.Error("Recent session client was incorrectly deleted")
+	}
+
+	// Check if old session was deleted
+	oldExists, err := database.GetUserSessionById(context.Background(), nil, oldSession.Id)
+	if err != nil {
+		t.Fatalf("Error checking old session: %v", err)
+	}
+	if oldExists != nil {
+		t.Error("Old session was not deleted")
+	}
+
+	// Verify old session's client association was also deleted
+	oldSessionClients, err := database.GetUserSessionClientsByUserSessionId(context.Background(), nil, oldSession.Id)
+	if err != nil {
+		t.Fatalf("Error checking old session clients: %v", err)
+	}
+	if len(oldSessionClients) != 0 {
+		t.Error("Old session client was not deleted")
+	}
+
+	// Check if very old session was deleted
+	veryOldExists, err := database.GetUserSessionById(context.Background(), nil, veryOldSession.Id)
+	if err != nil {
+		t.Fatalf("Error checking very old session: %v", err)
+	}
+	if veryOldExists != nil {
+		t.Error("Very old session was not deleted")
+	}
+
+	// Verify very old session's client association was also deleted
+	veryOldSessionClients, err := database.GetUserSessionClientsByUserSessionId(context.Background(), nil, veryOldSession.Id)
+	if err != nil {
+		t.Fatalf("Error checking very old session clients: %v", err)
+	}
+	if len(veryOldSessionClients) != 0 {
+		t.Error("Very old session client was not deleted")
+	}
+}
+
+// TestUpdateUserSession_DoesNotClobberAuthStateGeneration pins decision 11(b) of
+// #106 for sessions. See TestUpdateUser_DoesNotClobberAuthStateGeneration for why
+// the tag matters and why the value is deliberately nonzero.
+//
+// The session case is the one that keeps decision 4 working: a self-service password
+// change promotes the caller's session to the new generation, and BumpUserSession
+// writes the whole row on every request afterwards. Without the tag, the first bump
+// would undo the promotion and sign the user out.
+func TestUpdateUserSession_DoesNotClobberAuthStateGeneration(t *testing.T) {
+	user := createTestUser(t)
+	userSession := createTestUserSession(t, user.Id)
+
+	userSession.AuthStateGeneration = 7
+	// 5 rather than 7, so a mapping that crossed the two columns would be caught here rather
+	// than passing silently.
+	userSession.OtpConfigGeneration = 5
+	userSession.Id = 0
+	userSession.SessionIdentifier = fake.UUID()
+	if err := database.CreateUserSession(context.Background(), nil, userSession); err != nil {
+		t.Fatalf("Failed to create user session with a generation: %v", err)
+	}
+
+	created, err := database.GetUserSessionById(context.Background(), nil, userSession.Id)
+	if err != nil {
+		t.Fatalf("Failed to reload created user session: %v", err)
+	}
+	if created.AuthStateGeneration != 7 {
+		t.Fatalf("CreateUserSession must persist auth_state_generation, got %d want 7",
+			created.AuthStateGeneration)
+	}
+	if created.OtpConfigGeneration != 5 {
+		t.Fatalf("CreateUserSession must persist otp_config_generation, got %d want 5",
+			created.OtpConfigGeneration)
+	}
+
+	created.AuthStateGeneration = 0
+	// otp_config_generation is tagged dont-update for the same reason, and the hazard is the
+	// one this issue exists to close: BumpUserSession writes the whole row on every request,
+	// so in the ordinary update set a stale model would regress the snapshot and hand every
+	// session of the user a re-prompt it does not owe, or discharge one it does (#242).
+	created.OtpConfigGeneration = 0
+	created.DeviceName = "the rest of the update still applies"
+	if updateUserSessionErr := database.UpdateUserSession(context.Background(), nil, created); updateUserSessionErr != nil {
+		t.Fatalf("Failed to update user session: %v", updateUserSessionErr)
+	}
+
+	after, err := database.GetUserSessionById(context.Background(), nil, userSession.Id)
+	if err != nil {
+		t.Fatalf("Failed to reload updated user session: %v", err)
+	}
+	if after.AuthStateGeneration != 7 {
+		t.Errorf("UpdateUserSession regressed auth_state_generation to %d, want 7 (is the dont-update tag missing?)",
+			after.AuthStateGeneration)
+	}
+	if after.OtpConfigGeneration != 5 {
+		t.Errorf("UpdateUserSession regressed otp_config_generation to %d, want 5 (is the dont-update tag missing?)",
+			after.OtpConfigGeneration)
+	}
+	if after.DeviceName != "the rest of the update still applies" {
+		t.Errorf("the rest of the update must still apply, DeviceName is %q", after.DeviceName)
+	}
+}
+
+// TestPromoteUserSessionGeneration checks promotion touches only the named session.
+//
+// This is the method that keeps the self-service password-change exception working: the
+// caller's own session is carried forward to the new generation while every other session
+// is deleted, so getting the scope wrong here would either sign the caller out or leave
+// another device on the superseded generation still working (#106).
+func TestPromoteUserSessionGeneration(t *testing.T) {
+	user := createTestUser(t)
+	named := createTestUserSession(t, user.Id)
+	unnamed := createTestUserSession(t, user.Id)
+
+	if err := database.PromoteUserSessionGeneration(context.Background(), nil, named.Id, 7); err != nil {
+		t.Fatalf("PromoteUserSessionGeneration failed: %v", err)
+	}
+
+	reload := func(id int64) *models.UserSession {
+		us, err := database.GetUserSessionById(context.Background(), nil, id)
+		if err != nil {
+			t.Fatalf("Failed to reload user session %d: %v", id, err)
+		}
+		return us
+	}
+
+	if got := reload(named.Id).AuthStateGeneration; got != 7 {
+		t.Errorf("named session generation = %d, want 7", got)
+	}
+	if got := reload(unnamed.Id).AuthStateGeneration; got != 0 {
+		t.Errorf("unnamed session generation = %d, want 0 (promotion must not touch it)", got)
+	}
+
+	if err := database.PromoteUserSessionGeneration(context.Background(), nil, 0, 7); err == nil {
+		t.Error("expected an error promoting the generation of user session id 0")
+	}
+
+	// A nonzero id that does not exist must also error rather than silently succeeding.
+	// The caller preserves a session and its refresh tokens together, so a promotion
+	// that matched nothing would leave that half applied: the tokens promoted, the
+	// session not, and the session then rejected on its next request.
+	if err := database.PromoteUserSessionGeneration(context.Background(), nil, unnamed.Id+1_000_000, 7); err == nil {
+		t.Error("expected an error promoting the generation of an unknown user session id")
+	}
+}
+
+// TestAcquireUserSessionRow covers the semantics the ordering rests on: the acquisition
+// reports whether the session row is still there, and writing it costs the session
+// nothing a reader can observe.
+//
+// The report is the point. A ceremony that has just acquired the row acts on the answer
+// directly and never re-reads the session, so an acquisition that returned only an error
+// would leave "the session is gone" to be decided somewhere else, where it could disagree
+// (#139).
+func TestAcquireUserSessionRow(t *testing.T) {
+	user := createTestUser(t)
+	session := createTestUserSession(t, user.Id)
+
+	tx := beginTx(t)
+	live, err := database.AcquireUserSessionRow(context.Background(), tx, session.SessionIdentifier)
+	if err != nil {
+		t.Fatalf("AcquireUserSessionRow on a live session returned error: %v", err)
+	}
+	if !live {
+		t.Fatal("expected a live session to report true")
+	}
+	if commitErr := database.CommitTransaction(context.Background(), tx); commitErr != nil {
+		t.Fatalf("CommitTransaction: %v", commitErr)
+	}
+
+	// Only updated_at moves. Session validity is measured from started and last_accessed,
+	// so a statement that touched either would make acquiring the row extend or shorten
+	// the session it was only meant to lock.
+	reloaded, err := database.GetUserSessionById(context.Background(), nil, session.Id)
+	if err != nil {
+		t.Fatalf("GetUserSessionById after acquiring: %v", err)
+	}
+	if reloaded == nil {
+		t.Fatal("acquiring a session row must not remove it")
+	}
+	if !reloaded.Started.Equal(session.Started) {
+		t.Errorf("Started moved: expected %v, got %v", session.Started, reloaded.Started)
+	}
+	if !reloaded.LastAccessed.Equal(session.LastAccessed) {
+		t.Errorf("LastAccessed moved: expected %v, got %v", session.LastAccessed, reloaded.LastAccessed)
+	}
+
+	// The row is gone. This is the answer the ceremony refuses on, and it is a report
+	// rather than an error: nothing went wrong, the session simply ended first.
+	if deleteUserSessionErr := database.DeleteUserSession(context.Background(), nil, session.Id); deleteUserSessionErr != nil {
+		t.Fatalf("DeleteUserSession: %v", deleteUserSessionErr)
+	}
+	gone := beginTx(t)
+	live, err = database.AcquireUserSessionRow(context.Background(), gone, session.SessionIdentifier)
+	if err != nil {
+		t.Fatalf("AcquireUserSessionRow on a deleted session returned error: %v", err)
+	}
+	if live {
+		t.Error("expected a deleted session to report false")
+	}
+	if err := database.RollbackTransaction(context.Background(), gone); err != nil {
+		t.Fatalf("RollbackTransaction: %v", err)
+	}
+}
+
+// TestAcquireUserSessionRow_RefusedArguments pins the two arguments the method refuses,
+// each for a reason that would otherwise be silent.
+//
+// A nil transaction autocommits, which releases the row before the caller can use it, so
+// the caller would hold nothing while believing it held the session. An empty identifier
+// matches no row on any engine, so the method would report every session gone and every
+// ceremony would refuse.
+func TestAcquireUserSessionRow_RefusedArguments(t *testing.T) {
+	user := createTestUser(t)
+	session := createTestUserSession(t, user.Id)
+
+	live, err := database.AcquireUserSessionRow(context.Background(), nil, session.SessionIdentifier)
+	if err == nil {
+		t.Error("expected an error acquiring a user session row without a transaction")
+	}
+	if live {
+		t.Error("a refused acquisition must report false")
+	}
+
+	tx := beginTx(t)
+	live, err = database.AcquireUserSessionRow(context.Background(), tx, "")
+	if err == nil {
+		t.Error("expected an error acquiring a user session row with an empty session identifier")
+	}
+	if live {
+		t.Error("a refused acquisition must report false")
+	}
+}
+
+// TestAcquireUserSessionRow_TransactionAndFailurePath answers the two questions a mock
+// cannot: does the statement enlist in the caller's transaction rather than writing
+// through the pool, and does a statement that could not run return an error rather than a
+// benign false.
+//
+// Both matter more here than for an ordinary write. A method that escaped its caller's
+// transaction would take the row on another connection and release it immediately, so the
+// ordering the ceremony depends on would be gone while every test still passed. And a
+// fault collapsed into (false, nil) reads exactly like "the session ended", which would
+// send a legitimate sign-in back to the login page whenever the database hiccuped.
+func TestAcquireUserSessionRow_TransactionAndFailurePath(t *testing.T) {
+	user := createTestUser(t)
+	session := createTestUserSession(t, user.Id)
+
+	before, err := database.GetUserSessionById(context.Background(), nil, session.Id)
+	if err != nil {
+		t.Fatalf("GetUserSessionById before acquiring: %v", err)
+	}
+
+	tx := beginTx(t)
+	live, err := database.AcquireUserSessionRow(context.Background(), tx, session.SessionIdentifier)
+	if err != nil {
+		t.Fatalf("AcquireUserSessionRow in a transaction returned error: %v", err)
+	}
+	if !live {
+		t.Fatal("expected a live session to report true inside the transaction")
+	}
+	if rollbackErr := database.RollbackTransaction(context.Background(), tx); rollbackErr != nil {
+		t.Fatalf("RollbackTransaction: %v", rollbackErr)
+	}
+
+	// Had the statement gone through the pool it would have survived the rollback.
+	after, err := database.GetUserSessionById(context.Background(), nil, session.Id)
+	if err != nil {
+		t.Fatalf("GetUserSessionById after rollback: %v", err)
+	}
+	if after == nil {
+		t.Fatal("the session must survive a rolled-back acquisition")
+	}
+	if !after.UpdatedAt.Time.Equal(before.UpdatedAt.Time) {
+		t.Errorf("an acquisition rolled back must leave updated_at at %v, got %v",
+			before.UpdatedAt.Time, after.UpdatedAt.Time)
+	}
+
+	// The failure path, forced by the same finished transaction.
+	live, err = database.AcquireUserSessionRow(context.Background(), tx, session.SessionIdentifier)
+	if err == nil {
+		t.Error("a statement that cannot run must return an error, not a benign false")
+	}
+	if live {
+		t.Error("a failed acquisition must report false")
+	}
+}
+
+// TestUpdateUserSession_TheOwnerIsNotRewritten pins that user_id is outside the update set. A
+// session's owner never changes, and on SQL Server re-assigning a foreign key column to its own
+// value re-checks the constraint with a shared lock on the users row, a lock the ordinary SSO
+// bump has no business taking (#139). A stale model carrying another
+// user's id must therefore leave the stored owner alone rather than move the session.
+func TestUpdateUserSession_TheOwnerIsNotRewritten(t *testing.T) {
+	owner := createTestUser(t)
+	other := createTestUser(t)
+	userSession := createTestUserSession(t, owner.Id)
+
+	userSession.UserId = other.Id
+	userSession.DeviceName = "moved-" + fake.LetterN(6)
+	err := database.UpdateUserSession(context.Background(), nil, userSession)
+	if err != nil {
+		t.Fatalf("Failed to update user session: %v", err)
+	}
+
+	stored, err := database.GetUserSessionById(context.Background(), nil, userSession.Id)
+	if err != nil {
+		t.Fatalf("Failed to retrieve updated user session: %v", err)
+	}
+	if stored.UserId != owner.Id {
+		t.Errorf("Expected the session to still belong to user %d, got %d: user_id must not be in the update set", owner.Id, stored.UserId)
+	}
+	if stored.DeviceName != userSession.DeviceName {
+		t.Errorf("Expected the ordinary columns to have been written, DeviceName %q, got %q", userSession.DeviceName, stored.DeviceName)
+	}
+}
+
+// TestGetUserSessionsByClientIdPaginated_EnlistsInTheCallersTransaction pins the last of #413's
+// five sites: the count query beside the page passed nil where the page took the caller's
+// transaction, so the two halves of one answer were read on two connections.
+//
+// The rows are created inside the transaction for the reason ClientLoadPermissions' case gives.
+func TestGetUserSessionsByClientIdPaginated_EnlistsInTheCallersTransaction(t *testing.T) {
+	tx := beginTx(t)
+
+	client := &models.Client{
+		ClientIdentifier: "tx_client_" + fake.LetterN(8),
+		Description:      "Transaction pass-through client",
+	}
+	if err := database.CreateClient(context.Background(), tx, client); err != nil {
+		t.Fatalf("Failed to create client inside the transaction: %v", err)
+	}
+
+	user := &models.User{
+		Enabled:   true,
+		Subject:   fake.UUID(),
+		Username:  "u" + fake.LetterN(12),
+		GivenName: "TxSession" + fake.LetterN(6),
+		Email:     fake.LetterN(12) + "@example.com",
+	}
+	if err := database.CreateUser(context.Background(), tx, user); err != nil {
+		t.Fatalf("Failed to create user inside the transaction: %v", err)
+	}
+
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	userSession := &models.UserSession{
+		SessionIdentifier: fake.UUID(),
+		Started:           now,
+		LastAccessed:      now,
+		AuthMethods:       "pwd",
+		AcrLevel:          models.AcrLevel1.String(),
+		AuthTime:          now,
+		IpAddress:         fake.IPv4Address(),
+		DeviceName:        fake.Name(),
+		DeviceType:        "desktop",
+		DeviceOS:          "Windows",
+		UserAgent:         testUserAgent,
+		UserId:            user.Id,
+	}
+	if err := database.CreateUserSession(context.Background(), tx, userSession); err != nil {
+		t.Fatalf("Failed to create user session inside the transaction: %v", err)
+	}
+
+	userSessionClient := &models.UserSessionClient{
+		UserSessionId: userSession.Id,
+		ClientId:      client.Id,
+		Started:       now,
+		LastAccessed:  now,
+	}
+	if err := database.CreateUserSessionClient(context.Background(), tx, userSessionClient); err != nil {
+		t.Fatalf("Failed to create user_session_clients row inside the transaction: %v", err)
+	}
+
+	sessions, total, err := database.GetUserSessionsByClientIdPaginated(context.Background(), tx, client.Id, 1, 10)
+	if err != nil {
+		t.Fatalf("GetUserSessionsByClientIdPaginated through the transaction: %v", err)
+	}
+
+	if len(sessions) != 1 {
+		t.Fatalf("Expected the transaction's own session, got %d", len(sessions))
+	}
+	if sessions[0].Id != userSession.Id {
+		t.Errorf("Expected user session %d, got %d", userSession.Id, sessions[0].Id)
+	}
+	if total != 1 {
+		t.Errorf("Expected a total of 1 to agree with the one session on the page, got %d: "+
+			"the count query ran outside the caller's transaction (#413)", total)
+	}
+
+	if err := database.RollbackTransaction(context.Background(), tx); err != nil {
+		t.Fatalf("RollbackTransaction: %v", err)
+	}
+}

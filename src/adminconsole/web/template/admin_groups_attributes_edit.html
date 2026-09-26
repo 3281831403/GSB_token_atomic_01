@@ -1,0 +1,103 @@
+{{define "title"}}{{ .appName }} - {{ T $.ctx "adminconsole.admin_groups.attributes_form.edit_page_title_prefix" }}{{.attribute.Key}}{{end}}
+{{define "pageTitle"}}{{ T $.ctx "adminconsole.admin_groups.attributes_form.edit_page_title_prefix" }}<span class="text-accent">{{.attribute.Key}}</span>{{end}}
+{{define "subTitle"}}{{end}}
+{{define "menu"}}
+    {{template "admin_menu" . }}
+{{end}}
+
+{{define "head"}}
+
+
+
+{{end}}
+
+{{define "body"}}
+
+{{template "manage_groups_tabs" (args "attributes" .group.Id $.ctx) }}
+
+<form method="post">
+
+    <div class="grid grid-cols-1 gap-6 mt-6 lg:grid-cols-2">
+
+        <div class="w-full h-full pb-6 bg-base-100">
+
+            <div class="w-full form-control">
+                <p class="pl-1">{{ T $.ctx "adminconsole.admin_groups.attributes_form.edit_intro_prefix" }}<span class="text-accent">{{.group.GroupIdentifier}}</span>.</p>
+            </div>
+
+            <div class="w-full mt-6 form-control">
+                <label class="label">
+                    <span class="label-text text-base-content">
+                        {{ T $.ctx "adminconsole.admin_groups.attributes_form.field.key" }}
+                    </span>
+                </label>
+                <input id="attributeKey" type="text" name="attributeKey" value="{{.attribute.Key}}"
+                    class="w-full input input-bordered " autocomplete="off" autofocus />
+            </div>
+
+            <div class="w-full mt-6 form-control">
+                <label class="label">
+                    <span class="label-text text-base-content">
+                        {{ T $.ctx "adminconsole.admin_groups.attributes_form.field.value" }}
+                        <div class="tooltip tooltip-top"
+                            data-tip="{{ T $.ctx "adminconsole.admin_groups.attributes_form.value_tooltip" }}">
+                            <svg class="inline-block w-6 h-6 ml-1 align-middle cursor-pointer"
+                                xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5"
+                                stroke="currentColor">
+                                <path stroke-linecap="round" stroke-linejoin="round"
+                                    d="M11.25 11.25l.041-.02a.75.75 0 011.063.852l-.708 2.836a.75.75 0 001.063.853l.041-.021M21 12a9 9 0 11-18 0 9 9 0 0118 0zm-9-3.75h.008v.008H12V8.25z" />
+                            </svg>
+                        </div>
+                    </span>
+                </label>
+                <input type="text" name="attributeValue" value="{{.attribute.Value}}"
+                    class="w-full input input-bordered " autocomplete="off" />
+            </div>
+
+            <div class="w-full mt-6 form-control">
+                <label class="cursor-pointer label">
+                    <span class="label-text">
+                        {{ T $.ctx "adminconsole.admin_groups.attributes_form.include_access_prefix" }}<span class="text-accent">{{ T $.ctx "adminconsole.admin_groups.attributes_form.include_access_em" }}</span>{{ T $.ctx "adminconsole.admin_groups.attributes_form.include_access_suffix" }}
+                    </span>
+                    <input type="checkbox" name="includeInAccessToken" class="ml-2 toggle" {{if .attribute.IncludeInAccessToken}}checked{{end}} />
+                </label>
+            </div>
+
+            <div class="w-full mt-6 form-control">
+                <label class="cursor-pointer label">
+                    <span class="label-text">
+                        {{ T $.ctx "adminconsole.admin_groups.attributes_form.include_id_prefix" }}<span class="text-accent">{{ T $.ctx "adminconsole.admin_groups.attributes_form.include_id_em" }}</span>{{ T $.ctx "adminconsole.admin_groups.attributes_form.include_id_suffix" }}
+                    </span>
+                    <input type="checkbox" name="includeInIdToken" class="ml-2 toggle" {{if .attribute.IncludeInIdToken}}checked{{end}} />
+                </label>
+            </div>
+
+        </div>
+
+    </div>
+
+    <div class="grid grid-cols-1 gap-6 mt-8 lg:grid-cols-2">
+        <div>
+            {{if .error}}
+                <div class="mb-4 text-right text-error">
+                    <p>{{.error}}</p>
+                </div>
+            {{end}}
+            <div class="float-left p-3">
+                <a class="link-secondary" href="/admin/groups/{{.group.Id}}/attributes">
+                    <svg class="inline-block w-6 h-6 align-middle" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" d="M10.5 19.5L3 12m0 0l7.5-7.5M3 12h18" />
+                    </svg>
+                    <span class="ml-1 align-middle">{{ T $.ctx "adminconsole.admin_groups.attributes_form.back_to_attributes" }}</span>
+                </a>
+            </div>
+            <button id="btnSave" class="float-right btn btn-primary">{{ T $.ctx "adminconsole.admin_groups.save_button" }}</button>
+        </div>
+    </div>
+
+</form>
+
+
+
+{{end}}
+

@@ -1,0 +1,159 @@
+package adminuserhandlers
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"strconv"
+	"strings"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/leodip/goiabada/adminconsole/internal/constants"
+	"github.com/leodip/goiabada/adminconsole/internal/handlers"
+	"github.com/leodip/goiabada/adminconsole/internal/oauthclient"
+	"github.com/leodip/goiabada/core/api"
+	"github.com/leodip/goiabada/core/errs"
+)
+
+// userAttributesAddAPI is what the add user attribute page needs: the user it belongs to, and the
+// create.
+type userAttributesAddAPI interface {
+	CreateUserAttribute(ctx context.Context, accessToken string, request *api.CreateUserAttributeRequest) (*api.UserAttributeResponse, error)
+	GetUserById(ctx context.Context, accessToken string, userId int64) (*api.UserResponse, error)
+}
+
+func HandleAdminUserAttributesAddGet(
+	httpHelper handlers.HttpHelper,
+	apiClient userAttributesAddAPI,
+) http.HandlerFunc {
+
+	return func(w http.ResponseWriter, r *http.Request) {
+
+		idStr := chi.URLParam(r, "userId")
+		if len(idStr) == 0 {
+			httpHelper.NotFound(w, r)
+			return
+		}
+
+		id, err := strconv.ParseInt(idStr, 10, 64)
+		if err != nil {
+			httpHelper.NotFound(w, r)
+			return
+		}
+
+		// Get JWT info from context to extract access token
+		jwtInfo, ok := r.Context().Value(constants.ContextKeyJwtInfo).(oauthclient.JwtInfo)
+		if !ok {
+			httpHelper.InternalServerError(w, r, errs.New("no JWT info found in context"))
+			return
+		}
+
+		user, err := apiClient.GetUserById(r.Context(), jwtInfo.TokenResponse.AccessToken, id)
+		if err != nil {
+			handlers.HandleAPIError(httpHelper, w, r, err)
+			return
+		}
+		if user == nil {
+			httpHelper.NotFound(w, r)
+			return
+		}
+
+		bind := map[string]interface{}{
+			"user":                 user,
+			"includeInAccessToken": true,
+			"includeInIdToken":     true,
+			"page":                 r.URL.Query().Get("page"),
+			"query":                r.URL.Query().Get("query"),
+		}
+
+		err = httpHelper.RenderTemplate(w, r, "/layouts/menu_layout.html", "/admin_users_attributes_add.html", bind)
+		if err != nil {
+			httpHelper.InternalServerError(w, r, err)
+			return
+		}
+	}
+}
+
+func HandleAdminUserAttributesAddPost(
+	httpHelper handlers.HttpHelper,
+	apiClient userAttributesAddAPI,
+) http.HandlerFunc {
+
+	return func(w http.ResponseWriter, r *http.Request) {
+
+		idStr := chi.URLParam(r, "userId")
+		if len(idStr) == 0 {
+			httpHelper.NotFound(w, r)
+			return
+		}
+
+		id, err := strconv.ParseInt(idStr, 10, 64)
+		if err != nil {
+			httpHelper.NotFound(w, r)
+			return
+		}
+
+		// Get JWT info from context to extract access token
+		jwtInfo, ok := r.Context().Value(constants.ContextKeyJwtInfo).(oauthclient.JwtInfo)
+		if !ok {
+			httpHelper.InternalServerError(w, r, errs.New("no JWT info found in context"))
+			return
+		}
+
+		user, err := apiClient.GetUserById(r.Context(), jwtInfo.TokenResponse.AccessToken, id)
+		if err != nil {
+			handlers.HandleAPIError(httpHelper, w, r, err)
+			return
+		}
+		if user == nil {
+			httpHelper.NotFound(w, r)
+			return
+		}
+
+		renderError := func(message string) {
+			bind := map[string]interface{}{
+				"user":                 user,
+				"attributeKey":         r.FormValue("attributeKey"),
+				"attributeValue":       r.FormValue("attributeValue"),
+				"includeInAccessToken": r.FormValue("includeInAccessToken") == "on",
+				"includeInIdToken":     r.FormValue("includeInIdToken") == "on",
+				"error":                message,
+				"page":                 r.URL.Query().Get("page"),
+				"query":                r.URL.Query().Get("query"),
+			}
+
+			renderErr := httpHelper.RenderTemplate(w, r, "/layouts/menu_layout.html", "/admin_users_attributes_add.html", bind)
+			if renderErr != nil {
+				httpHelper.InternalServerError(w, r, renderErr)
+			}
+		}
+
+		attrKey := strings.TrimSpace(r.FormValue("attributeKey"))
+		attrValue := strings.TrimSpace(r.FormValue("attributeValue"))
+
+		if len(attrKey) == 0 {
+			renderError("Attribute key is required")
+			return
+		}
+
+		includeInAccessToken := r.FormValue("includeInAccessToken") == "on"
+		includeInIdToken := r.FormValue("includeInIdToken") == "on"
+
+		// Create request for API
+		request := &api.CreateUserAttributeRequest{
+			Key:                  attrKey,
+			Value:                attrValue,
+			IncludeInAccessToken: includeInAccessToken,
+			IncludeInIdToken:     includeInIdToken,
+			UserId:               user.Id,
+		}
+
+		_, err = apiClient.CreateUserAttribute(r.Context(), jwtInfo.TokenResponse.AccessToken, request)
+		if err != nil {
+			handlers.HandleAPIErrorWithCallback(httpHelper, w, r, err, renderError)
+			return
+		}
+
+		http.Redirect(w, r, withListPosition(fmt.Sprintf("/admin/users/%v/attributes", user.Id), r), http.StatusFound)
+	}
+}

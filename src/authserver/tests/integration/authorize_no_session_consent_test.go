@@ -1,0 +1,2338 @@
+package integrationtests
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/leodip/goiabada/authserver/internal/ceremony"
+	"github.com/leodip/goiabada/authserver/internal/config"
+	"github.com/leodip/goiabada/authserver/internal/models"
+	"github.com/leodip/goiabada/authserver/internal/passwordhash"
+	"github.com/leodip/goiabada/authserver/internal/testutil/fake"
+	"github.com/pquerna/otp/totp"
+	"github.com/stretchr/testify/assert"
+)
+
+func TestAuthorize_NoExistingSession_AcrLevel1_Pwd_ConsentIsRequired_ConsentIsFullyGranted(t *testing.T) {
+	client := &models.Client{
+		ClientIdentifier:         "test-client-" + fake.LetterN(8),
+		Enabled:                  true,
+		AuthorizationCodeEnabled: true,
+		ConsentRequired:          true,
+		DefaultAcrLevel:          models.AcrLevel1,
+	}
+
+	err := database.CreateClient(context.Background(), nil, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	redirectUri := &models.RedirectURI{
+		ClientId: client.Id,
+		URI:      fake.URL(),
+	}
+
+	err = database.CreateRedirectURI(context.Background(), nil, redirectUri)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	password := fake.Password(8)
+	passwordHashed, err := passwordhash.Hash(password)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	user := &models.User{
+		Subject:      fake.UUID(),
+		Enabled:      true,
+		Email:        fake.Email(),
+		PasswordHash: passwordHashed,
+	}
+
+	err = database.CreateUser(context.Background(), nil, user)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resource1 := createResource(t)
+	permission1 := createPermission(t, resource1.Id)
+
+	resource2 := createResource(t)
+	permission2 := createPermission(t, resource2.Id)
+
+	assignPermissionToUser(t, user.Id, permission1.Id)
+	assignPermissionToUser(t, user.Id, permission2.Id)
+
+	requestCodeChallenge := fake.LetterN(43)
+	requestState := fake.LetterN(8)
+	requestNonce := fake.LetterN(8)
+	requestScope := "openid profile email " + resource1.ResourceIdentifier + ":" + permission1.PermissionIdentifier + " " +
+		resource2.ResourceIdentifier + ":" + permission2.PermissionIdentifier
+
+	destUrl := config.GetAuthServer().BaseURL + "/auth/authorize/?client_id=" + client.ClientIdentifier +
+		"&redirect_uri=" + url.QueryEscape(redirectUri.URI) +
+		"&response_type=code" +
+		"&code_challenge_method=S256" +
+		"&code_challenge=" + requestCodeChallenge +
+		"&scope=" + url.QueryEscape(requestScope) +
+		"&state=" + requestState +
+		"&nonce=" + requestNonce
+
+	httpClient := createHttpClient(t)
+
+	resp, err := httpClient.Get(destUrl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation := assertRedirect(t, resp, "/auth/level1")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/pwd")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	resp = authenticateWithPassword(t, httpClient, redirectLocation, resp, user.Email, password)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/level1completed")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/completed")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/consent")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	resp = postConsent(t, httpClient, redirectLocation, resp, []int{0, 1, 2, 3, 4})
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/issue")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	codeVal, stateVal := getCodeAndStateFromUrl(t, resp)
+	assert.Equal(t, requestState, stateVal)
+
+	code := loadCodeFromDatabase(t, codeVal)
+
+	assert.Equal(t, client.ClientIdentifier, code.Client.ClientIdentifier)
+	assert.Equal(t, requestCodeChallenge, code.CodeChallenge.String)
+	assert.Equal(t, "S256", code.CodeChallengeMethod.String)
+	assert.Equal(t, requestScope, code.Scope)
+	assert.Equal(t, requestState, code.State)
+	assert.Equal(t, requestNonce, code.Nonce)
+	assert.Equal(t, redirectUri.URI, code.RedirectURI)
+	assert.Equal(t, user.Id, code.User.Id)
+	assert.Equal(t, "query", code.ResponseMode)
+	assertWithinLastXSeconds(t, code.AuthenticatedAt, 3)
+	assert.Equal(t, models.AcrLevel1.String(), code.AcrLevel)
+	assert.Equal(t, ceremony.AuthMethodPassword.String(), code.AuthMethods)
+	assert.Equal(t, false, code.Used)
+
+	consent, err := database.GetConsentByUserIdAndClientId(context.Background(), nil, user.Id, client.Id)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	assert.NotNil(t, consent)
+	assert.Equal(t, user.Id, consent.UserId)
+	assert.Equal(t, client.Id, consent.ClientId)
+	assertWithinLastXSeconds(t, consent.GrantedAt.Time, 3)
+	assert.Equal(t, requestScope, consent.Scope)
+}
+
+func TestAuthorize_NoExistingSession_AcrLevel1_Pwd_ConsentIsRequired_ConsentIsPartiallyGranted(t *testing.T) {
+	client := &models.Client{
+		ClientIdentifier:         "test-client-" + fake.LetterN(8),
+		Enabled:                  true,
+		AuthorizationCodeEnabled: true,
+		ConsentRequired:          true,
+		DefaultAcrLevel:          models.AcrLevel1,
+	}
+
+	err := database.CreateClient(context.Background(), nil, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	redirectUri := &models.RedirectURI{
+		ClientId: client.Id,
+		URI:      fake.URL(),
+	}
+
+	err = database.CreateRedirectURI(context.Background(), nil, redirectUri)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	password := fake.Password(8)
+	passwordHashed, err := passwordhash.Hash(password)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	user := &models.User{
+		Subject:      fake.UUID(),
+		Enabled:      true,
+		Email:        fake.Email(),
+		PasswordHash: passwordHashed,
+	}
+
+	err = database.CreateUser(context.Background(), nil, user)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resource1 := createResource(t)
+	permission1 := createPermission(t, resource1.Id)
+
+	resource2 := createResource(t)
+	permission2 := createPermission(t, resource2.Id)
+
+	assignPermissionToUser(t, user.Id, permission1.Id)
+	assignPermissionToUser(t, user.Id, permission2.Id)
+
+	requestCodeChallenge := fake.LetterN(43)
+	requestState := fake.LetterN(8)
+	requestNonce := fake.LetterN(8)
+	requestScope := "openid profile email " + resource1.ResourceIdentifier + ":" + permission1.PermissionIdentifier + " " +
+		resource2.ResourceIdentifier + ":" + permission2.PermissionIdentifier
+
+	destUrl := config.GetAuthServer().BaseURL + "/auth/authorize/?client_id=" + client.ClientIdentifier +
+		"&redirect_uri=" + url.QueryEscape(redirectUri.URI) +
+		"&response_type=code" +
+		"&code_challenge_method=S256" +
+		"&code_challenge=" + requestCodeChallenge +
+		"&scope=" + url.QueryEscape(requestScope) +
+		"&state=" + requestState +
+		"&nonce=" + requestNonce
+
+	httpClient := createHttpClient(t)
+
+	resp, err := httpClient.Get(destUrl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation := assertRedirect(t, resp, "/auth/level1")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/pwd")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	resp = authenticateWithPassword(t, httpClient, redirectLocation, resp, user.Email, password)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/level1completed")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/completed")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/consent")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	resp = postConsent(t, httpClient, redirectLocation, resp, []int{0, 2, 4})
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/issue")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	codeVal, stateVal := getCodeAndStateFromUrl(t, resp)
+	assert.Equal(t, requestState, stateVal)
+
+	code := loadCodeFromDatabase(t, codeVal)
+
+	// partially granted consent
+	expectedScope := "openid email " + resource2.ResourceIdentifier + ":" + permission2.PermissionIdentifier
+
+	assert.Equal(t, client.ClientIdentifier, code.Client.ClientIdentifier)
+	assert.Equal(t, requestCodeChallenge, code.CodeChallenge.String)
+	assert.Equal(t, "S256", code.CodeChallengeMethod.String)
+	assert.Equal(t, expectedScope, code.Scope)
+	assert.Equal(t, requestState, code.State)
+	assert.Equal(t, requestNonce, code.Nonce)
+	assert.Equal(t, redirectUri.URI, code.RedirectURI)
+	assert.Equal(t, user.Id, code.User.Id)
+	assert.Equal(t, "query", code.ResponseMode)
+	assertWithinLastXSeconds(t, code.AuthenticatedAt, 3)
+	assert.Equal(t, models.AcrLevel1.String(), code.AcrLevel)
+	assert.Equal(t, ceremony.AuthMethodPassword.String(), code.AuthMethods)
+	assert.Equal(t, false, code.Used)
+
+	consent, err := database.GetConsentByUserIdAndClientId(context.Background(), nil, user.Id, client.Id)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	assert.NotNil(t, consent)
+	assert.Equal(t, user.Id, consent.UserId)
+	assert.Equal(t, client.Id, consent.ClientId)
+	assertWithinLastXSeconds(t, consent.GrantedAt.Time, 3)
+	assert.Equal(t, expectedScope, consent.Scope)
+}
+
+func TestAuthorize_NoExistingSession_AcrLevel2Optional_Pwd_OtpDisabled_ConsentIsRequired_ConsentIsFullyGranted(t *testing.T) {
+	client := &models.Client{
+		ClientIdentifier:         "test-client-" + fake.LetterN(8),
+		Enabled:                  true,
+		AuthorizationCodeEnabled: true,
+		ConsentRequired:          true,
+		DefaultAcrLevel:          models.AcrLevel2Optional,
+	}
+
+	err := database.CreateClient(context.Background(), nil, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	redirectUri := &models.RedirectURI{
+		ClientId: client.Id,
+		URI:      fake.URL(),
+	}
+
+	err = database.CreateRedirectURI(context.Background(), nil, redirectUri)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	password := fake.Password(8)
+	passwordHashed, err := passwordhash.Hash(password)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	user := &models.User{
+		Subject:      fake.UUID(),
+		Enabled:      true,
+		Email:        fake.Email(),
+		PasswordHash: passwordHashed,
+		OTPEnabled:   false,
+	}
+
+	err = database.CreateUser(context.Background(), nil, user)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resource1 := createResource(t)
+	permission1 := createPermission(t, resource1.Id)
+
+	resource2 := createResource(t)
+	permission2 := createPermission(t, resource2.Id)
+
+	assignPermissionToUser(t, user.Id, permission1.Id)
+	assignPermissionToUser(t, user.Id, permission2.Id)
+
+	requestCodeChallenge := fake.LetterN(43)
+	requestState := fake.LetterN(8)
+	requestNonce := fake.LetterN(8)
+	requestScope := "openid profile email " + resource1.ResourceIdentifier + ":" + permission1.PermissionIdentifier + " " +
+		resource2.ResourceIdentifier + ":" + permission2.PermissionIdentifier
+
+	destUrl := config.GetAuthServer().BaseURL + "/auth/authorize/?client_id=" + client.ClientIdentifier +
+		"&redirect_uri=" + url.QueryEscape(redirectUri.URI) +
+		"&response_type=code" +
+		"&code_challenge_method=S256" +
+		"&code_challenge=" + requestCodeChallenge +
+		"&scope=" + url.QueryEscape(requestScope) +
+		"&state=" + requestState +
+		"&nonce=" + requestNonce
+
+	httpClient := createHttpClient(t)
+
+	resp, err := httpClient.Get(destUrl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation := assertRedirect(t, resp, "/auth/level1")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/pwd")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	resp = authenticateWithPassword(t, httpClient, redirectLocation, resp, user.Email, password)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/level1completed")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/level2")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/completed")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/consent")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	resp = postConsent(t, httpClient, redirectLocation, resp, []int{0, 1, 2, 3, 4})
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/issue")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	codeVal, stateVal := getCodeAndStateFromUrl(t, resp)
+	assert.Equal(t, requestState, stateVal)
+
+	code := loadCodeFromDatabase(t, codeVal)
+
+	assert.Equal(t, client.ClientIdentifier, code.Client.ClientIdentifier)
+	assert.Equal(t, requestCodeChallenge, code.CodeChallenge.String)
+	assert.Equal(t, "S256", code.CodeChallengeMethod.String)
+	assert.Equal(t, requestScope, code.Scope)
+	assert.Equal(t, requestState, code.State)
+	assert.Equal(t, requestNonce, code.Nonce)
+	assert.Equal(t, redirectUri.URI, code.RedirectURI)
+	assert.Equal(t, user.Id, code.User.Id)
+	assert.Equal(t, "query", code.ResponseMode)
+	assertWithinLastXSeconds(t, code.AuthenticatedAt, 3)
+	assert.Equal(t, models.AcrLevel2Optional.String(), code.AcrLevel)
+	assert.Equal(t, ceremony.AuthMethodPassword.String(), code.AuthMethods)
+	assert.Equal(t, false, code.Used)
+
+	consent, err := database.GetConsentByUserIdAndClientId(context.Background(), nil, user.Id, client.Id)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	assert.NotNil(t, consent)
+	assert.Equal(t, user.Id, consent.UserId)
+	assert.Equal(t, client.Id, consent.ClientId)
+	assertWithinLastXSeconds(t, consent.GrantedAt.Time, 3)
+	assert.Equal(t, requestScope, consent.Scope)
+}
+
+func TestAuthorize_NoExistingSession_AcrLevel2Optional_Pwd_OtpDisabled_ConsentIsRequired_ConsentIsPartiallyGranted(t *testing.T) {
+	client := &models.Client{
+		ClientIdentifier:         "test-client-" + fake.LetterN(8),
+		Enabled:                  true,
+		AuthorizationCodeEnabled: true,
+		ConsentRequired:          true,
+		DefaultAcrLevel:          models.AcrLevel2Optional,
+	}
+
+	err := database.CreateClient(context.Background(), nil, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	redirectUri := &models.RedirectURI{
+		ClientId: client.Id,
+		URI:      fake.URL(),
+	}
+
+	err = database.CreateRedirectURI(context.Background(), nil, redirectUri)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	password := fake.Password(8)
+	passwordHashed, err := passwordhash.Hash(password)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	user := &models.User{
+		Subject:      fake.UUID(),
+		Enabled:      true,
+		Email:        fake.Email(),
+		PasswordHash: passwordHashed,
+		OTPEnabled:   false,
+	}
+
+	err = database.CreateUser(context.Background(), nil, user)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resource1 := createResource(t)
+	permission1 := createPermission(t, resource1.Id)
+
+	resource2 := createResource(t)
+	permission2 := createPermission(t, resource2.Id)
+
+	assignPermissionToUser(t, user.Id, permission1.Id)
+	assignPermissionToUser(t, user.Id, permission2.Id)
+
+	requestCodeChallenge := fake.LetterN(43)
+	requestState := fake.LetterN(8)
+	requestNonce := fake.LetterN(8)
+	requestScope := "openid profile email " + resource1.ResourceIdentifier + ":" + permission1.PermissionIdentifier + " " +
+		resource2.ResourceIdentifier + ":" + permission2.PermissionIdentifier
+
+	destUrl := config.GetAuthServer().BaseURL + "/auth/authorize/?client_id=" + client.ClientIdentifier +
+		"&redirect_uri=" + url.QueryEscape(redirectUri.URI) +
+		"&response_type=code" +
+		"&code_challenge_method=S256" +
+		"&code_challenge=" + requestCodeChallenge +
+		"&scope=" + url.QueryEscape(requestScope) +
+		"&state=" + requestState +
+		"&nonce=" + requestNonce
+
+	httpClient := createHttpClient(t)
+
+	resp, err := httpClient.Get(destUrl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation := assertRedirect(t, resp, "/auth/level1")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/pwd")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	resp = authenticateWithPassword(t, httpClient, redirectLocation, resp, user.Email, password)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/level1completed")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/level2")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/completed")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/consent")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	// Partially grant consent (only for openid, email, and one resource permission)
+	resp = postConsent(t, httpClient, redirectLocation, resp, []int{0, 2, 4})
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/issue")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	codeVal, stateVal := getCodeAndStateFromUrl(t, resp)
+	assert.Equal(t, requestState, stateVal)
+
+	code := loadCodeFromDatabase(t, codeVal)
+
+	// Expected scope after partial consent
+	expectedScope := "openid email " + resource2.ResourceIdentifier + ":" + permission2.PermissionIdentifier
+
+	assert.Equal(t, client.ClientIdentifier, code.Client.ClientIdentifier)
+	assert.Equal(t, requestCodeChallenge, code.CodeChallenge.String)
+	assert.Equal(t, "S256", code.CodeChallengeMethod.String)
+	assert.Equal(t, expectedScope, code.Scope)
+	assert.Equal(t, requestState, code.State)
+	assert.Equal(t, requestNonce, code.Nonce)
+	assert.Equal(t, redirectUri.URI, code.RedirectURI)
+	assert.Equal(t, user.Id, code.User.Id)
+	assert.Equal(t, "query", code.ResponseMode)
+	assertWithinLastXSeconds(t, code.AuthenticatedAt, 3)
+	assert.Equal(t, models.AcrLevel2Optional.String(), code.AcrLevel)
+	assert.Equal(t, ceremony.AuthMethodPassword.String(), code.AuthMethods)
+	assert.Equal(t, false, code.Used)
+
+	consent, err := database.GetConsentByUserIdAndClientId(context.Background(), nil, user.Id, client.Id)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	assert.NotNil(t, consent)
+	assert.Equal(t, user.Id, consent.UserId)
+	assert.Equal(t, client.Id, consent.ClientId)
+	assertWithinLastXSeconds(t, consent.GrantedAt.Time, 3)
+	assert.Equal(t, expectedScope, consent.Scope)
+}
+
+func TestAuthorize_NoExistingSession_AcrLevel2Optional_Pwd_OtpEnabled_ConsentIsRequired_ConsentIsFullyGranted(t *testing.T) {
+	client := &models.Client{
+		ClientIdentifier:         "test-client-" + fake.LetterN(8),
+		Enabled:                  true,
+		AuthorizationCodeEnabled: true,
+		ConsentRequired:          true,
+		DefaultAcrLevel:          models.AcrLevel2Optional,
+	}
+
+	err := database.CreateClient(context.Background(), nil, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	redirectUri := &models.RedirectURI{
+		ClientId: client.Id,
+		URI:      fake.URL(),
+	}
+
+	err = database.CreateRedirectURI(context.Background(), nil, redirectUri)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	password := fake.Password(8)
+	passwordHashed, err := passwordhash.Hash(password)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	userEmail := fake.Email()
+	key, err := totp.Generate(totp.GenerateOpts{
+		Issuer:      "Goiabada",
+		AccountName: userEmail,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	user := &models.User{
+		Subject:            fake.UUID(),
+		Enabled:            true,
+		Email:              userEmail,
+		PasswordHash:       passwordHashed,
+		OTPSecretEncrypted: encryptOTPSecretForTest(t, key.Secret()),
+		OTPEnabled:         true,
+	}
+
+	err = database.CreateUser(context.Background(), nil, user)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resource1 := createResource(t)
+	permission1 := createPermission(t, resource1.Id)
+
+	resource2 := createResource(t)
+	permission2 := createPermission(t, resource2.Id)
+
+	assignPermissionToUser(t, user.Id, permission1.Id)
+	assignPermissionToUser(t, user.Id, permission2.Id)
+
+	requestCodeChallenge := fake.LetterN(43)
+	requestState := fake.LetterN(8)
+	requestNonce := fake.LetterN(8)
+	requestScope := "openid profile email " + resource1.ResourceIdentifier + ":" + permission1.PermissionIdentifier + " " +
+		resource2.ResourceIdentifier + ":" + permission2.PermissionIdentifier
+
+	destUrl := config.GetAuthServer().BaseURL + "/auth/authorize/?client_id=" + client.ClientIdentifier +
+		"&redirect_uri=" + url.QueryEscape(redirectUri.URI) +
+		"&response_type=code" +
+		"&code_challenge_method=S256" +
+		"&code_challenge=" + requestCodeChallenge +
+		"&scope=" + url.QueryEscape(requestScope) +
+		"&state=" + requestState +
+		"&nonce=" + requestNonce
+
+	httpClient := createHttpClient(t)
+
+	resp, err := httpClient.Get(destUrl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation := assertRedirect(t, resp, "/auth/level1")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/pwd")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	resp = authenticateWithPassword(t, httpClient, redirectLocation, resp, user.Email, password)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/level1completed")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/level2")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/otp")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	otpCode, err := totp.GenerateCode(key.Secret(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp = authenticateWithOtp(t, httpClient, redirectLocation, resp, otpCode)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/completed")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/consent")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	resp = postConsent(t, httpClient, redirectLocation, resp, []int{0, 1, 2, 3, 4})
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/issue")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	codeVal, stateVal := getCodeAndStateFromUrl(t, resp)
+	assert.Equal(t, requestState, stateVal)
+
+	code := loadCodeFromDatabase(t, codeVal)
+
+	assert.Equal(t, client.ClientIdentifier, code.Client.ClientIdentifier)
+	assert.Equal(t, requestCodeChallenge, code.CodeChallenge.String)
+	assert.Equal(t, "S256", code.CodeChallengeMethod.String)
+	assert.Equal(t, requestScope, code.Scope)
+	assert.Equal(t, requestState, code.State)
+	assert.Equal(t, requestNonce, code.Nonce)
+	assert.Equal(t, redirectUri.URI, code.RedirectURI)
+	assert.Equal(t, user.Id, code.User.Id)
+	assert.Equal(t, "query", code.ResponseMode)
+	assertWithinLastXSeconds(t, code.AuthenticatedAt, 3)
+	assert.Equal(t, models.AcrLevel2Optional.String(), code.AcrLevel)
+	assert.Equal(t, fmt.Sprintf("%s %s", ceremony.AuthMethodPassword.String(), ceremony.AuthMethodOTP.String()), code.AuthMethods)
+	assert.Equal(t, false, code.Used)
+
+	consent, err := database.GetConsentByUserIdAndClientId(context.Background(), nil, user.Id, client.Id)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	assert.NotNil(t, consent)
+	assert.Equal(t, user.Id, consent.UserId)
+	assert.Equal(t, client.Id, consent.ClientId)
+	assertWithinLastXSeconds(t, consent.GrantedAt.Time, 3)
+	assert.Equal(t, requestScope, consent.Scope)
+}
+
+func TestAuthorize_NoExistingSession_AcrLevel2Optional_Pwd_OtpEnabled_ConsentIsRequired_ConsentIsPartiallyGranted(t *testing.T) {
+	client := &models.Client{
+		ClientIdentifier:         "test-client-" + fake.LetterN(8),
+		Enabled:                  true,
+		AuthorizationCodeEnabled: true,
+		ConsentRequired:          true,
+		DefaultAcrLevel:          models.AcrLevel2Optional,
+	}
+
+	err := database.CreateClient(context.Background(), nil, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	redirectUri := &models.RedirectURI{
+		ClientId: client.Id,
+		URI:      fake.URL(),
+	}
+
+	err = database.CreateRedirectURI(context.Background(), nil, redirectUri)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	password := fake.Password(8)
+	passwordHashed, err := passwordhash.Hash(password)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	userEmail := fake.Email()
+	key, err := totp.Generate(totp.GenerateOpts{
+		Issuer:      "Goiabada",
+		AccountName: userEmail,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	user := &models.User{
+		Subject:            fake.UUID(),
+		Enabled:            true,
+		Email:              userEmail,
+		PasswordHash:       passwordHashed,
+		OTPSecretEncrypted: encryptOTPSecretForTest(t, key.Secret()),
+		OTPEnabled:         true,
+	}
+
+	err = database.CreateUser(context.Background(), nil, user)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resource1 := createResource(t)
+	permission1 := createPermission(t, resource1.Id)
+
+	resource2 := createResource(t)
+	permission2 := createPermission(t, resource2.Id)
+
+	assignPermissionToUser(t, user.Id, permission1.Id)
+	assignPermissionToUser(t, user.Id, permission2.Id)
+
+	requestCodeChallenge := fake.LetterN(43)
+	requestState := fake.LetterN(8)
+	requestNonce := fake.LetterN(8)
+	requestScope := "openid profile email " + resource1.ResourceIdentifier + ":" + permission1.PermissionIdentifier + " " +
+		resource2.ResourceIdentifier + ":" + permission2.PermissionIdentifier
+
+	destUrl := config.GetAuthServer().BaseURL + "/auth/authorize/?client_id=" + client.ClientIdentifier +
+		"&redirect_uri=" + url.QueryEscape(redirectUri.URI) +
+		"&response_type=code" +
+		"&code_challenge_method=S256" +
+		"&code_challenge=" + requestCodeChallenge +
+		"&scope=" + url.QueryEscape(requestScope) +
+		"&state=" + requestState +
+		"&nonce=" + requestNonce
+
+	httpClient := createHttpClient(t)
+
+	resp, err := httpClient.Get(destUrl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation := assertRedirect(t, resp, "/auth/level1")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/pwd")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	resp = authenticateWithPassword(t, httpClient, redirectLocation, resp, user.Email, password)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/level1completed")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/level2")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/otp")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	otpCode, err := totp.GenerateCode(key.Secret(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp = authenticateWithOtp(t, httpClient, redirectLocation, resp, otpCode)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/completed")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/consent")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	// Simulate partial consent by only consenting to some scopes
+	resp = postConsent(t, httpClient, redirectLocation, resp, []int{0, 2, 4})
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/issue")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	codeVal, stateVal := getCodeAndStateFromUrl(t, resp)
+	assert.Equal(t, requestState, stateVal)
+
+	code := loadCodeFromDatabase(t, codeVal)
+
+	// Expected scope after partial consent
+	expectedScope := "openid email " + resource2.ResourceIdentifier + ":" + permission2.PermissionIdentifier
+
+	assert.Equal(t, client.ClientIdentifier, code.Client.ClientIdentifier)
+	assert.Equal(t, requestCodeChallenge, code.CodeChallenge.String)
+	assert.Equal(t, "S256", code.CodeChallengeMethod.String)
+	assert.Equal(t, expectedScope, code.Scope)
+	assert.Equal(t, requestState, code.State)
+	assert.Equal(t, requestNonce, code.Nonce)
+	assert.Equal(t, redirectUri.URI, code.RedirectURI)
+	assert.Equal(t, user.Id, code.User.Id)
+	assert.Equal(t, "query", code.ResponseMode)
+	assertWithinLastXSeconds(t, code.AuthenticatedAt, 3)
+	assert.Equal(t, models.AcrLevel2Optional.String(), code.AcrLevel)
+	assert.Equal(t, fmt.Sprintf("%s %s", ceremony.AuthMethodPassword.String(), ceremony.AuthMethodOTP.String()), code.AuthMethods)
+	assert.Equal(t, false, code.Used)
+
+	consent, err := database.GetConsentByUserIdAndClientId(context.Background(), nil, user.Id, client.Id)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	assert.NotNil(t, consent)
+	assert.Equal(t, user.Id, consent.UserId)
+	assert.Equal(t, client.Id, consent.ClientId)
+	assertWithinLastXSeconds(t, consent.GrantedAt.Time, 3)
+	assert.Equal(t, expectedScope, consent.Scope)
+}
+
+func TestAuthorize_NoExistingSession_AcrLevel2Mandatory_Pwd_OtpDisabled_ConsentIsRequired_ConsentIsFullyGranted(t *testing.T) {
+	client := &models.Client{
+		ClientIdentifier:         "test-client-" + fake.LetterN(8),
+		Enabled:                  true,
+		AuthorizationCodeEnabled: true,
+		ConsentRequired:          true,
+		DefaultAcrLevel:          models.AcrLevel2Mandatory,
+	}
+
+	err := database.CreateClient(context.Background(), nil, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	redirectUri := &models.RedirectURI{
+		ClientId: client.Id,
+		URI:      fake.URL(),
+	}
+
+	err = database.CreateRedirectURI(context.Background(), nil, redirectUri)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	password := fake.Password(8)
+	passwordHashed, err := passwordhash.Hash(password)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	userEmail := fake.Email()
+	user := &models.User{
+		Subject:      fake.UUID(),
+		Enabled:      true,
+		Email:        userEmail,
+		PasswordHash: passwordHashed,
+		OTPEnabled:   false,
+	}
+
+	err = database.CreateUser(context.Background(), nil, user)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resource1 := createResource(t)
+	permission1 := createPermission(t, resource1.Id)
+
+	resource2 := createResource(t)
+	permission2 := createPermission(t, resource2.Id)
+
+	assignPermissionToUser(t, user.Id, permission1.Id)
+	assignPermissionToUser(t, user.Id, permission2.Id)
+
+	requestCodeChallenge := fake.LetterN(43)
+	requestState := fake.LetterN(8)
+	requestNonce := fake.LetterN(8)
+	requestScope := "openid profile email " + resource1.ResourceIdentifier + ":" + permission1.PermissionIdentifier + " " +
+		resource2.ResourceIdentifier + ":" + permission2.PermissionIdentifier
+
+	destUrl := config.GetAuthServer().BaseURL + "/auth/authorize/?client_id=" + client.ClientIdentifier +
+		"&redirect_uri=" + url.QueryEscape(redirectUri.URI) +
+		"&response_type=code" +
+		"&code_challenge_method=S256" +
+		"&code_challenge=" + requestCodeChallenge +
+		"&scope=" + url.QueryEscape(requestScope) +
+		"&state=" + requestState +
+		"&nonce=" + requestNonce
+
+	httpClient := createHttpClient(t)
+
+	resp, err := httpClient.Get(destUrl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation := assertRedirect(t, resp, "/auth/level1")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/pwd")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	resp = authenticateWithPassword(t, httpClient, redirectLocation, resp, user.Email, password)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/level1completed")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/level2")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/otp")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	otpSecret := getOtpSecretFromEnrollmentPage(t, resp)
+	otpCode, err := totp.GenerateCode(otpSecret, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp = authenticateWithOtp(t, httpClient, redirectLocation, resp, otpCode)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/completed")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/consent")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	resp = postConsent(t, httpClient, redirectLocation, resp, []int{0, 1, 2, 3, 4})
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/issue")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	codeVal, stateVal := getCodeAndStateFromUrl(t, resp)
+	assert.Equal(t, requestState, stateVal)
+
+	code := loadCodeFromDatabase(t, codeVal)
+
+	assert.Equal(t, client.ClientIdentifier, code.Client.ClientIdentifier)
+	assert.Equal(t, requestCodeChallenge, code.CodeChallenge.String)
+	assert.Equal(t, "S256", code.CodeChallengeMethod.String)
+	assert.Equal(t, requestScope, code.Scope)
+	assert.Equal(t, requestState, code.State)
+	assert.Equal(t, requestNonce, code.Nonce)
+	assert.Equal(t, redirectUri.URI, code.RedirectURI)
+	assert.Equal(t, user.Id, code.User.Id)
+	assert.Equal(t, "query", code.ResponseMode)
+	assertWithinLastXSeconds(t, code.AuthenticatedAt, 3)
+	assert.Equal(t, models.AcrLevel2Mandatory.String(), code.AcrLevel)
+	assert.Equal(t, fmt.Sprintf("%s %s", ceremony.AuthMethodPassword.String(), ceremony.AuthMethodOTP.String()), code.AuthMethods)
+	assert.Equal(t, false, code.Used)
+
+	consent, err := database.GetConsentByUserIdAndClientId(context.Background(), nil, user.Id, client.Id)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	assert.NotNil(t, consent)
+	assert.Equal(t, user.Id, consent.UserId)
+	assert.Equal(t, client.Id, consent.ClientId)
+	assertWithinLastXSeconds(t, consent.GrantedAt.Time, 3)
+	assert.Equal(t, requestScope, consent.Scope)
+}
+
+func TestAuthorize_NoExistingSession_AcrLevel2Mandatory_Pwd_OtpDisabled_ConsentIsRequired_ConsentIsPartiallyGranted(t *testing.T) {
+	client := &models.Client{
+		ClientIdentifier:         "test-client-" + fake.LetterN(8),
+		Enabled:                  true,
+		AuthorizationCodeEnabled: true,
+		ConsentRequired:          true,
+		DefaultAcrLevel:          models.AcrLevel2Mandatory,
+	}
+
+	err := database.CreateClient(context.Background(), nil, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	redirectUri := &models.RedirectURI{
+		ClientId: client.Id,
+		URI:      fake.URL(),
+	}
+
+	err = database.CreateRedirectURI(context.Background(), nil, redirectUri)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	password := fake.Password(8)
+	passwordHashed, err := passwordhash.Hash(password)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	userEmail := fake.Email()
+	user := &models.User{
+		Subject:      fake.UUID(),
+		Enabled:      true,
+		Email:        userEmail,
+		PasswordHash: passwordHashed,
+		OTPEnabled:   false,
+	}
+
+	err = database.CreateUser(context.Background(), nil, user)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resource1 := createResource(t)
+	permission1 := createPermission(t, resource1.Id)
+
+	resource2 := createResource(t)
+	permission2 := createPermission(t, resource2.Id)
+
+	assignPermissionToUser(t, user.Id, permission1.Id)
+	assignPermissionToUser(t, user.Id, permission2.Id)
+
+	requestCodeChallenge := fake.LetterN(43)
+	requestState := fake.LetterN(8)
+	requestNonce := fake.LetterN(8)
+	requestScope := "openid profile email " + resource1.ResourceIdentifier + ":" + permission1.PermissionIdentifier + " " +
+		resource2.ResourceIdentifier + ":" + permission2.PermissionIdentifier
+
+	destUrl := config.GetAuthServer().BaseURL + "/auth/authorize/?client_id=" + client.ClientIdentifier +
+		"&redirect_uri=" + url.QueryEscape(redirectUri.URI) +
+		"&response_type=code" +
+		"&code_challenge_method=S256" +
+		"&code_challenge=" + requestCodeChallenge +
+		"&scope=" + url.QueryEscape(requestScope) +
+		"&state=" + requestState +
+		"&nonce=" + requestNonce
+
+	httpClient := createHttpClient(t)
+
+	resp, err := httpClient.Get(destUrl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation := assertRedirect(t, resp, "/auth/level1")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/pwd")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	resp = authenticateWithPassword(t, httpClient, redirectLocation, resp, user.Email, password)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/level1completed")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/level2")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/otp")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	otpSecret := getOtpSecretFromEnrollmentPage(t, resp)
+	otpCode, err := totp.GenerateCode(otpSecret, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp = authenticateWithOtp(t, httpClient, redirectLocation, resp, otpCode)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/completed")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/consent")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	// Partially grant consent (only for openid, email, and the second resource/permission)
+	resp = postConsent(t, httpClient, redirectLocation, resp, []int{0, 2, 4})
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/issue")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	codeVal, stateVal := getCodeAndStateFromUrl(t, resp)
+	assert.Equal(t, requestState, stateVal)
+
+	code := loadCodeFromDatabase(t, codeVal)
+
+	// Expected scope after partial consent
+	expectedScope := "openid email " + resource2.ResourceIdentifier + ":" + permission2.PermissionIdentifier
+
+	assert.Equal(t, client.ClientIdentifier, code.Client.ClientIdentifier)
+	assert.Equal(t, requestCodeChallenge, code.CodeChallenge.String)
+	assert.Equal(t, "S256", code.CodeChallengeMethod.String)
+	assert.Equal(t, expectedScope, code.Scope)
+	assert.Equal(t, requestState, code.State)
+	assert.Equal(t, requestNonce, code.Nonce)
+	assert.Equal(t, redirectUri.URI, code.RedirectURI)
+	assert.Equal(t, user.Id, code.User.Id)
+	assert.Equal(t, "query", code.ResponseMode)
+	assertWithinLastXSeconds(t, code.AuthenticatedAt, 3)
+	assert.Equal(t, models.AcrLevel2Mandatory.String(), code.AcrLevel)
+	assert.Equal(t, fmt.Sprintf("%s %s", ceremony.AuthMethodPassword.String(), ceremony.AuthMethodOTP.String()), code.AuthMethods)
+	assert.Equal(t, false, code.Used)
+
+	consent, err := database.GetConsentByUserIdAndClientId(context.Background(), nil, user.Id, client.Id)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	assert.NotNil(t, consent)
+	assert.Equal(t, user.Id, consent.UserId)
+	assert.Equal(t, client.Id, consent.ClientId)
+	assertWithinLastXSeconds(t, consent.GrantedAt.Time, 3)
+	assert.Equal(t, expectedScope, consent.Scope)
+}
+
+func TestAuthorize_NoExistingSession_AcrLevel2Mandatory_Pwd_OtpEnabled_ConsentIsRequired_ConsentIsFullyGranted(t *testing.T) {
+	client := &models.Client{
+		ClientIdentifier:         "test-client-" + fake.LetterN(8),
+		Enabled:                  true,
+		AuthorizationCodeEnabled: true,
+		ConsentRequired:          true,
+		DefaultAcrLevel:          models.AcrLevel2Mandatory,
+	}
+
+	err := database.CreateClient(context.Background(), nil, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	redirectUri := &models.RedirectURI{
+		ClientId: client.Id,
+		URI:      fake.URL(),
+	}
+
+	err = database.CreateRedirectURI(context.Background(), nil, redirectUri)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	password := fake.Password(8)
+	passwordHashed, err := passwordhash.Hash(password)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	userEmail := fake.Email()
+	key, err := totp.Generate(totp.GenerateOpts{
+		Issuer:      "Goiabada",
+		AccountName: userEmail,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	user := &models.User{
+		Subject:            fake.UUID(),
+		Enabled:            true,
+		Email:              userEmail,
+		PasswordHash:       passwordHashed,
+		OTPSecretEncrypted: encryptOTPSecretForTest(t, key.Secret()),
+		OTPEnabled:         true,
+	}
+
+	err = database.CreateUser(context.Background(), nil, user)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resource1 := createResource(t)
+	permission1 := createPermission(t, resource1.Id)
+
+	resource2 := createResource(t)
+	permission2 := createPermission(t, resource2.Id)
+
+	assignPermissionToUser(t, user.Id, permission1.Id)
+	assignPermissionToUser(t, user.Id, permission2.Id)
+
+	requestCodeChallenge := fake.LetterN(43)
+	requestState := fake.LetterN(8)
+	requestNonce := fake.LetterN(8)
+	requestScope := "openid profile email " + resource1.ResourceIdentifier + ":" + permission1.PermissionIdentifier + " " +
+		resource2.ResourceIdentifier + ":" + permission2.PermissionIdentifier
+
+	destUrl := config.GetAuthServer().BaseURL + "/auth/authorize/?client_id=" + client.ClientIdentifier +
+		"&redirect_uri=" + url.QueryEscape(redirectUri.URI) +
+		"&response_type=code" +
+		"&code_challenge_method=S256" +
+		"&code_challenge=" + requestCodeChallenge +
+		"&scope=" + url.QueryEscape(requestScope) +
+		"&state=" + requestState +
+		"&nonce=" + requestNonce
+
+	httpClient := createHttpClient(t)
+
+	resp, err := httpClient.Get(destUrl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation := assertRedirect(t, resp, "/auth/level1")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/pwd")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	resp = authenticateWithPassword(t, httpClient, redirectLocation, resp, user.Email, password)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/level1completed")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/level2")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/otp")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	otpCode, err := totp.GenerateCode(key.Secret(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp = authenticateWithOtp(t, httpClient, redirectLocation, resp, otpCode)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/completed")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/consent")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	resp = postConsent(t, httpClient, redirectLocation, resp, []int{0, 1, 2, 3, 4})
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/issue")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	codeVal, stateVal := getCodeAndStateFromUrl(t, resp)
+	assert.Equal(t, requestState, stateVal)
+
+	code := loadCodeFromDatabase(t, codeVal)
+
+	assert.Equal(t, client.ClientIdentifier, code.Client.ClientIdentifier)
+	assert.Equal(t, requestCodeChallenge, code.CodeChallenge.String)
+	assert.Equal(t, "S256", code.CodeChallengeMethod.String)
+	assert.Equal(t, requestScope, code.Scope)
+	assert.Equal(t, requestState, code.State)
+	assert.Equal(t, requestNonce, code.Nonce)
+	assert.Equal(t, redirectUri.URI, code.RedirectURI)
+	assert.Equal(t, user.Id, code.User.Id)
+	assert.Equal(t, "query", code.ResponseMode)
+	assertWithinLastXSeconds(t, code.AuthenticatedAt, 3)
+	assert.Equal(t, models.AcrLevel2Mandatory.String(), code.AcrLevel)
+	assert.Equal(t, fmt.Sprintf("%s %s", ceremony.AuthMethodPassword.String(), ceremony.AuthMethodOTP.String()), code.AuthMethods)
+	assert.Equal(t, false, code.Used)
+
+	consent, err := database.GetConsentByUserIdAndClientId(context.Background(), nil, user.Id, client.Id)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	assert.NotNil(t, consent)
+	assert.Equal(t, user.Id, consent.UserId)
+	assert.Equal(t, client.Id, consent.ClientId)
+	assertWithinLastXSeconds(t, consent.GrantedAt.Time, 3)
+	assert.Equal(t, requestScope, consent.Scope)
+}
+
+func TestAuthorize_NoExistingSession_AcrLevel2Mandatory_Pwd_OtpEnabled_ConsentIsRequired_ConsentIsPartiallyGranted(t *testing.T) {
+	client := &models.Client{
+		ClientIdentifier:         "test-client-" + fake.LetterN(8),
+		Enabled:                  true,
+		AuthorizationCodeEnabled: true,
+		ConsentRequired:          true,
+		DefaultAcrLevel:          models.AcrLevel2Mandatory,
+	}
+
+	err := database.CreateClient(context.Background(), nil, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	redirectUri := &models.RedirectURI{
+		ClientId: client.Id,
+		URI:      fake.URL(),
+	}
+
+	err = database.CreateRedirectURI(context.Background(), nil, redirectUri)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	password := fake.Password(8)
+	passwordHashed, err := passwordhash.Hash(password)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	userEmail := fake.Email()
+	key, err := totp.Generate(totp.GenerateOpts{
+		Issuer:      "Goiabada",
+		AccountName: userEmail,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	user := &models.User{
+		Subject:            fake.UUID(),
+		Enabled:            true,
+		Email:              userEmail,
+		PasswordHash:       passwordHashed,
+		OTPSecretEncrypted: encryptOTPSecretForTest(t, key.Secret()),
+		OTPEnabled:         true,
+	}
+
+	err = database.CreateUser(context.Background(), nil, user)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resource1 := createResource(t)
+	permission1 := createPermission(t, resource1.Id)
+
+	resource2 := createResource(t)
+	permission2 := createPermission(t, resource2.Id)
+
+	assignPermissionToUser(t, user.Id, permission1.Id)
+	assignPermissionToUser(t, user.Id, permission2.Id)
+
+	requestCodeChallenge := fake.LetterN(43)
+	requestState := fake.LetterN(8)
+	requestNonce := fake.LetterN(8)
+	requestScope := "openid profile email " + resource1.ResourceIdentifier + ":" + permission1.PermissionIdentifier + " " +
+		resource2.ResourceIdentifier + ":" + permission2.PermissionIdentifier
+
+	destUrl := config.GetAuthServer().BaseURL + "/auth/authorize/?client_id=" + client.ClientIdentifier +
+		"&redirect_uri=" + url.QueryEscape(redirectUri.URI) +
+		"&response_type=code" +
+		"&code_challenge_method=S256" +
+		"&code_challenge=" + requestCodeChallenge +
+		"&scope=" + url.QueryEscape(requestScope) +
+		"&state=" + requestState +
+		"&nonce=" + requestNonce
+
+	httpClient := createHttpClient(t)
+
+	resp, err := httpClient.Get(destUrl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation := assertRedirect(t, resp, "/auth/level1")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/pwd")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	resp = authenticateWithPassword(t, httpClient, redirectLocation, resp, user.Email, password)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/level1completed")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/level2")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/otp")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	otpCode, err := totp.GenerateCode(key.Secret(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp = authenticateWithOtp(t, httpClient, redirectLocation, resp, otpCode)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/completed")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/consent")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	// Partially grant consent (only for openid, email, and the second resource/permission)
+	resp = postConsent(t, httpClient, redirectLocation, resp, []int{0, 2, 4})
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/issue")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	codeVal, stateVal := getCodeAndStateFromUrl(t, resp)
+	assert.Equal(t, requestState, stateVal)
+
+	code := loadCodeFromDatabase(t, codeVal)
+
+	// Expected scope after partial consent
+	expectedScope := "openid email " + resource2.ResourceIdentifier + ":" + permission2.PermissionIdentifier
+
+	assert.Equal(t, client.ClientIdentifier, code.Client.ClientIdentifier)
+	assert.Equal(t, requestCodeChallenge, code.CodeChallenge.String)
+	assert.Equal(t, "S256", code.CodeChallengeMethod.String)
+	assert.Equal(t, expectedScope, code.Scope)
+	assert.Equal(t, requestState, code.State)
+	assert.Equal(t, requestNonce, code.Nonce)
+	assert.Equal(t, redirectUri.URI, code.RedirectURI)
+	assert.Equal(t, user.Id, code.User.Id)
+	assert.Equal(t, "query", code.ResponseMode)
+	assertWithinLastXSeconds(t, code.AuthenticatedAt, 3)
+	assert.Equal(t, models.AcrLevel2Mandatory.String(), code.AcrLevel)
+	assert.Equal(t, fmt.Sprintf("%s %s", ceremony.AuthMethodPassword.String(), ceremony.AuthMethodOTP.String()), code.AuthMethods)
+	assert.Equal(t, false, code.Used)
+
+	consent, err := database.GetConsentByUserIdAndClientId(context.Background(), nil, user.Id, client.Id)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	assert.NotNil(t, consent)
+	assert.Equal(t, user.Id, consent.UserId)
+	assert.Equal(t, client.Id, consent.ClientId)
+	assertWithinLastXSeconds(t, consent.GrantedAt.Time, 3)
+	assert.Equal(t, expectedScope, consent.Scope)
+}
+
+func TestAuthorize_NoExistingSession_AcrLevel1_Pwd_ConsentIsRequired_ConsentIsCancelled(t *testing.T) {
+	client := &models.Client{
+		ClientIdentifier:         "test-client-" + fake.LetterN(8),
+		Enabled:                  true,
+		AuthorizationCodeEnabled: true,
+		ConsentRequired:          true,
+		DefaultAcrLevel:          models.AcrLevel1,
+	}
+
+	err := database.CreateClient(context.Background(), nil, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	redirectUri := &models.RedirectURI{
+		ClientId: client.Id,
+		URI:      fake.URL(),
+	}
+
+	err = database.CreateRedirectURI(context.Background(), nil, redirectUri)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	password := fake.Password(8)
+	passwordHashed, err := passwordhash.Hash(password)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	user := &models.User{
+		Subject:      fake.UUID(),
+		Enabled:      true,
+		Email:        fake.Email(),
+		PasswordHash: passwordHashed,
+	}
+
+	err = database.CreateUser(context.Background(), nil, user)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resource1 := createResource(t)
+	permission1 := createPermission(t, resource1.Id)
+
+	resource2 := createResource(t)
+	permission2 := createPermission(t, resource2.Id)
+
+	assignPermissionToUser(t, user.Id, permission1.Id)
+	assignPermissionToUser(t, user.Id, permission2.Id)
+
+	requestCodeChallenge := fake.LetterN(43)
+	requestState := fake.LetterN(8)
+	requestNonce := fake.LetterN(8)
+	requestScope := "openid profile email " + resource1.ResourceIdentifier + ":" + permission1.PermissionIdentifier + " " +
+		resource2.ResourceIdentifier + ":" + permission2.PermissionIdentifier
+
+	destUrl := config.GetAuthServer().BaseURL + "/auth/authorize/?client_id=" + client.ClientIdentifier +
+		"&redirect_uri=" + url.QueryEscape(redirectUri.URI) +
+		"&response_type=code" +
+		"&code_challenge_method=S256" +
+		"&code_challenge=" + requestCodeChallenge +
+		"&scope=" + url.QueryEscape(requestScope) +
+		"&state=" + requestState +
+		"&nonce=" + requestNonce
+
+	httpClient := createHttpClient(t)
+
+	// The hops below reassign one resp, so each body is passed into its deferred close rather than
+	// read out of resp when the test returns: the bare `defer func() { _ = resp.Body.Close() }()`
+	// used elsewhere in this file captures the variable, so under reassignment every defer closes
+	// the last response and the earlier ones are never closed.
+	resp, err := httpClient.Get(destUrl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func(body io.ReadCloser) { _ = body.Close() }(resp.Body)
+
+	redirectLocation := assertRedirect(t, resp, "/auth/level1")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func(body io.ReadCloser) { _ = body.Close() }(resp.Body)
+
+	redirectLocation = assertRedirect(t, resp, "/auth/pwd")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func(body io.ReadCloser) { _ = body.Close() }(resp.Body)
+
+	resp = authenticateWithPassword(t, httpClient, redirectLocation, resp, user.Email, password)
+	defer func(body io.ReadCloser) { _ = body.Close() }(resp.Body)
+
+	redirectLocation = assertRedirect(t, resp, "/auth/level1completed")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func(body io.ReadCloser) { _ = body.Close() }(resp.Body)
+
+	redirectLocation = assertRedirect(t, resp, "/auth/completed")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func(body io.ReadCloser) { _ = body.Close() }(resp.Body)
+
+	consentUrl := assertRedirect(t, resp, "/auth/consent")
+	resp = loadPage(t, httpClient, consentUrl)
+	defer func(body io.ReadCloser) { _ = body.Close() }(resp.Body)
+
+	resp = postConsent(t, httpClient, consentUrl, resp, []int{}) // Cancel consent
+	defer func(body io.ReadCloser) { _ = body.Close() }(resp.Body)
+
+	assert.Equal(t, http.StatusFound, resp.StatusCode)
+
+	redirectLocationUrl, err := url.Parse(resp.Header.Get("Location"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	errorCode := redirectLocationUrl.Query().Get("error")
+	errorDescription := redirectLocationUrl.Query().Get("error_description")
+
+	assert.Equal(t, "access_denied", errorCode)
+	assert.Equal(t, "The user did not provide consent", errorDescription)
+
+	// The refusal ended the ceremony, so the auth context is gone from the browser and the replay
+	// has nothing to resume: it lands on the account profile rather than rendering the consent
+	// screen again. Without the clear reaching the browser the retained context stays in
+	// requires_consent, which this handler accepts, and the user could approve on the second
+	// screen: the client would then get access_denied and a code for the same authorization
+	// request (#141).
+	resp = loadPage(t, httpClient, consentUrl)
+	defer func(body io.ReadCloser) { _ = body.Close() }(resp.Body)
+
+	assert.Equal(t, http.StatusFound, resp.StatusCode)
+	assert.Equal(t, config.GetAdminConsole().BaseURL+"/account/profile", resp.Header.Get("Location"),
+		"replaying the refused ceremony must not reach the auth context again")
+}
+
+func TestAuthorize_NoExistingSession_AcrLevel2Optional_Pwd_OtpDisabled_ConsentIsRequired_ConsentIsCancelled(t *testing.T) {
+	client := &models.Client{
+		ClientIdentifier:         "test-client-" + fake.LetterN(8),
+		Enabled:                  true,
+		AuthorizationCodeEnabled: true,
+		ConsentRequired:          true,
+		DefaultAcrLevel:          models.AcrLevel2Optional,
+	}
+
+	err := database.CreateClient(context.Background(), nil, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	redirectUri := &models.RedirectURI{
+		ClientId: client.Id,
+		URI:      fake.URL(),
+	}
+
+	err = database.CreateRedirectURI(context.Background(), nil, redirectUri)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	password := fake.Password(8)
+	passwordHashed, err := passwordhash.Hash(password)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	user := &models.User{
+		Subject:      fake.UUID(),
+		Enabled:      true,
+		Email:        fake.Email(),
+		PasswordHash: passwordHashed,
+		OTPEnabled:   false,
+	}
+
+	err = database.CreateUser(context.Background(), nil, user)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resource1 := createResource(t)
+	permission1 := createPermission(t, resource1.Id)
+
+	resource2 := createResource(t)
+	permission2 := createPermission(t, resource2.Id)
+
+	assignPermissionToUser(t, user.Id, permission1.Id)
+	assignPermissionToUser(t, user.Id, permission2.Id)
+
+	requestCodeChallenge := fake.LetterN(43)
+	requestState := fake.LetterN(8)
+	requestNonce := fake.LetterN(8)
+	requestScope := "openid profile email " + resource1.ResourceIdentifier + ":" + permission1.PermissionIdentifier + " " +
+		resource2.ResourceIdentifier + ":" + permission2.PermissionIdentifier
+
+	destUrl := config.GetAuthServer().BaseURL + "/auth/authorize/?client_id=" + client.ClientIdentifier +
+		"&redirect_uri=" + url.QueryEscape(redirectUri.URI) +
+		"&response_type=code" +
+		"&code_challenge_method=S256" +
+		"&code_challenge=" + requestCodeChallenge +
+		"&scope=" + url.QueryEscape(requestScope) +
+		"&state=" + requestState +
+		"&nonce=" + requestNonce
+
+	httpClient := createHttpClient(t)
+
+	resp, err := httpClient.Get(destUrl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation := assertRedirect(t, resp, "/auth/level1")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/pwd")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	resp = authenticateWithPassword(t, httpClient, redirectLocation, resp, user.Email, password)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/level1completed")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/level2")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/completed")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/consent")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	resp = postConsent(t, httpClient, redirectLocation, resp, []int{}) // Cancel consent
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusFound, resp.StatusCode)
+
+	redirectLocationUrl, err := url.Parse(resp.Header.Get("Location"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	errorCode := redirectLocationUrl.Query().Get("error")
+	errorDescription := redirectLocationUrl.Query().Get("error_description")
+
+	assert.Equal(t, "access_denied", errorCode)
+	assert.Equal(t, "The user did not provide consent", errorDescription)
+}
+
+func TestAuthorize_NoExistingSession_AcrLevel2Optional_Pwd_OtpEnabled_ConsentIsRequired_ConsentIsCancelled(t *testing.T) {
+	client := &models.Client{
+		ClientIdentifier:         "test-client-" + fake.LetterN(8),
+		Enabled:                  true,
+		AuthorizationCodeEnabled: true,
+		ConsentRequired:          true,
+		DefaultAcrLevel:          models.AcrLevel2Optional,
+	}
+
+	err := database.CreateClient(context.Background(), nil, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	redirectUri := &models.RedirectURI{
+		ClientId: client.Id,
+		URI:      fake.URL(),
+	}
+
+	err = database.CreateRedirectURI(context.Background(), nil, redirectUri)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	password := fake.Password(8)
+	passwordHashed, err := passwordhash.Hash(password)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	userEmail := fake.Email()
+	key, err := totp.Generate(totp.GenerateOpts{
+		Issuer:      "Goiabada",
+		AccountName: userEmail,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	user := &models.User{
+		Subject:            fake.UUID(),
+		Enabled:            true,
+		Email:              userEmail,
+		PasswordHash:       passwordHashed,
+		OTPSecretEncrypted: encryptOTPSecretForTest(t, key.Secret()),
+		OTPEnabled:         true,
+	}
+
+	err = database.CreateUser(context.Background(), nil, user)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resource1 := createResource(t)
+	permission1 := createPermission(t, resource1.Id)
+
+	resource2 := createResource(t)
+	permission2 := createPermission(t, resource2.Id)
+
+	assignPermissionToUser(t, user.Id, permission1.Id)
+	assignPermissionToUser(t, user.Id, permission2.Id)
+
+	requestCodeChallenge := fake.LetterN(43)
+	requestState := fake.LetterN(8)
+	requestNonce := fake.LetterN(8)
+	requestScope := "openid profile email " + resource1.ResourceIdentifier + ":" + permission1.PermissionIdentifier + " " +
+		resource2.ResourceIdentifier + ":" + permission2.PermissionIdentifier
+
+	destUrl := config.GetAuthServer().BaseURL + "/auth/authorize/?client_id=" + client.ClientIdentifier +
+		"&redirect_uri=" + url.QueryEscape(redirectUri.URI) +
+		"&response_type=code" +
+		"&code_challenge_method=S256" +
+		"&code_challenge=" + requestCodeChallenge +
+		"&scope=" + url.QueryEscape(requestScope) +
+		"&state=" + requestState +
+		"&nonce=" + requestNonce
+
+	httpClient := createHttpClient(t)
+
+	resp, err := httpClient.Get(destUrl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation := assertRedirect(t, resp, "/auth/level1")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/pwd")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	resp = authenticateWithPassword(t, httpClient, redirectLocation, resp, user.Email, password)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/level1completed")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/level2")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/otp")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	otpCode, err := totp.GenerateCode(key.Secret(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp = authenticateWithOtp(t, httpClient, redirectLocation, resp, otpCode)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/completed")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/consent")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	resp = postConsent(t, httpClient, redirectLocation, resp, []int{}) // Cancel consent
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusFound, resp.StatusCode)
+
+	redirectLocationUrl, err := url.Parse(resp.Header.Get("Location"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	errorCode := redirectLocationUrl.Query().Get("error")
+	errorDescription := redirectLocationUrl.Query().Get("error_description")
+
+	assert.Equal(t, "access_denied", errorCode)
+	assert.Equal(t, "The user did not provide consent", errorDescription)
+}
+
+func TestAuthorize_NoExistingSession_AcrLevel2Mandatory_Pwd_OtpDisabled_ConsentIsRequired_ConsentIsCancelled(t *testing.T) {
+	client := &models.Client{
+		ClientIdentifier:         "test-client-" + fake.LetterN(8),
+		Enabled:                  true,
+		AuthorizationCodeEnabled: true,
+		ConsentRequired:          true,
+		DefaultAcrLevel:          models.AcrLevel2Mandatory,
+	}
+
+	err := database.CreateClient(context.Background(), nil, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	redirectUri := &models.RedirectURI{
+		ClientId: client.Id,
+		URI:      fake.URL(),
+	}
+
+	err = database.CreateRedirectURI(context.Background(), nil, redirectUri)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	password := fake.Password(8)
+	passwordHashed, err := passwordhash.Hash(password)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	userEmail := fake.Email()
+	user := &models.User{
+		Subject:      fake.UUID(),
+		Enabled:      true,
+		Email:        userEmail,
+		PasswordHash: passwordHashed,
+		OTPEnabled:   false,
+	}
+
+	err = database.CreateUser(context.Background(), nil, user)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resource1 := createResource(t)
+	permission1 := createPermission(t, resource1.Id)
+
+	resource2 := createResource(t)
+	permission2 := createPermission(t, resource2.Id)
+
+	assignPermissionToUser(t, user.Id, permission1.Id)
+	assignPermissionToUser(t, user.Id, permission2.Id)
+
+	requestCodeChallenge := fake.LetterN(43)
+	requestState := fake.LetterN(8)
+	requestNonce := fake.LetterN(8)
+	requestScope := "openid profile email " + resource1.ResourceIdentifier + ":" + permission1.PermissionIdentifier + " " +
+		resource2.ResourceIdentifier + ":" + permission2.PermissionIdentifier
+
+	destUrl := config.GetAuthServer().BaseURL + "/auth/authorize/?client_id=" + client.ClientIdentifier +
+		"&redirect_uri=" + url.QueryEscape(redirectUri.URI) +
+		"&response_type=code" +
+		"&code_challenge_method=S256" +
+		"&code_challenge=" + requestCodeChallenge +
+		"&scope=" + url.QueryEscape(requestScope) +
+		"&state=" + requestState +
+		"&nonce=" + requestNonce
+
+	httpClient := createHttpClient(t)
+
+	resp, err := httpClient.Get(destUrl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation := assertRedirect(t, resp, "/auth/level1")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/pwd")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	resp = authenticateWithPassword(t, httpClient, redirectLocation, resp, user.Email, password)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/level1completed")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/level2")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/otp")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	otpSecret := getOtpSecretFromEnrollmentPage(t, resp)
+	otpCode, err := totp.GenerateCode(otpSecret, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp = authenticateWithOtp(t, httpClient, redirectLocation, resp, otpCode)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/completed")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/consent")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	resp = postConsent(t, httpClient, redirectLocation, resp, []int{}) // Cancel consent
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusFound, resp.StatusCode)
+
+	redirectLocationUrl, err := url.Parse(resp.Header.Get("Location"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	errorCode := redirectLocationUrl.Query().Get("error")
+	errorDescription := redirectLocationUrl.Query().Get("error_description")
+
+	assert.Equal(t, "access_denied", errorCode)
+	assert.Equal(t, "The user did not provide consent", errorDescription)
+}
+
+func TestAuthorize_NoExistingSession_AcrLevel2Mandatory_Pwd_OtpEnabled_ConsentIsRequired_ConsentIsCancelled(t *testing.T) {
+	client := &models.Client{
+		ClientIdentifier:         "test-client-" + fake.LetterN(8),
+		Enabled:                  true,
+		AuthorizationCodeEnabled: true,
+		ConsentRequired:          true,
+		DefaultAcrLevel:          models.AcrLevel2Mandatory,
+	}
+
+	err := database.CreateClient(context.Background(), nil, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	redirectUri := &models.RedirectURI{
+		ClientId: client.Id,
+		URI:      fake.URL(),
+	}
+
+	err = database.CreateRedirectURI(context.Background(), nil, redirectUri)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	password := fake.Password(8)
+	passwordHashed, err := passwordhash.Hash(password)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	userEmail := fake.Email()
+	key, err := totp.Generate(totp.GenerateOpts{
+		Issuer:      "Goiabada",
+		AccountName: userEmail,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	user := &models.User{
+		Subject:            fake.UUID(),
+		Enabled:            true,
+		Email:              userEmail,
+		PasswordHash:       passwordHashed,
+		OTPSecretEncrypted: encryptOTPSecretForTest(t, key.Secret()),
+		OTPEnabled:         true,
+	}
+
+	err = database.CreateUser(context.Background(), nil, user)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resource1 := createResource(t)
+	permission1 := createPermission(t, resource1.Id)
+
+	resource2 := createResource(t)
+	permission2 := createPermission(t, resource2.Id)
+
+	assignPermissionToUser(t, user.Id, permission1.Id)
+	assignPermissionToUser(t, user.Id, permission2.Id)
+
+	requestCodeChallenge := fake.LetterN(43)
+	requestState := fake.LetterN(8)
+	requestNonce := fake.LetterN(8)
+	requestScope := "openid profile email " + resource1.ResourceIdentifier + ":" + permission1.PermissionIdentifier + " " +
+		resource2.ResourceIdentifier + ":" + permission2.PermissionIdentifier
+
+	destUrl := config.GetAuthServer().BaseURL + "/auth/authorize/?client_id=" + client.ClientIdentifier +
+		"&redirect_uri=" + url.QueryEscape(redirectUri.URI) +
+		"&response_type=code" +
+		"&code_challenge_method=S256" +
+		"&code_challenge=" + requestCodeChallenge +
+		"&scope=" + url.QueryEscape(requestScope) +
+		"&state=" + requestState +
+		"&nonce=" + requestNonce
+
+	httpClient := createHttpClient(t)
+
+	resp, err := httpClient.Get(destUrl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation := assertRedirect(t, resp, "/auth/level1")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/pwd")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	resp = authenticateWithPassword(t, httpClient, redirectLocation, resp, user.Email, password)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/level1completed")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/level2")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/otp")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	otpCode, err := totp.GenerateCode(key.Secret(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp = authenticateWithOtp(t, httpClient, redirectLocation, resp, otpCode)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/completed")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/consent")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	resp = postConsent(t, httpClient, redirectLocation, resp, []int{}) // Cancel consent
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusFound, resp.StatusCode)
+
+	redirectLocationUrl, err := url.Parse(resp.Header.Get("Location"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	errorCode := redirectLocationUrl.Query().Get("error")
+	errorDescription := redirectLocationUrl.Query().Get("error_description")
+
+	assert.Equal(t, "access_denied", errorCode)
+	assert.Equal(t, "The user did not provide consent", errorDescription)
+}
+
+// Eleven scopes is the smallest count at which the old substring match over-granted: the
+// checkbox names are positional, so unchecking index 1 left "consent1" matching inside
+// "consent10" and the denied scope was granted anyway. This walks the real form end to end and
+// asserts the denial survives into both the code the client is handed and the persisted consent
+// row, which is the part no mock-backed test reaches (#79).
+func TestAuthorize_NoExistingSession_AcrLevel1_Pwd_ConsentIsRequired_ElevenScopes_DeniedScopeIsNotGranted(t *testing.T) {
+	client := &models.Client{
+		ClientIdentifier:         "test-client-" + fake.LetterN(8),
+		Enabled:                  true,
+		AuthorizationCodeEnabled: true,
+		ConsentRequired:          true,
+		DefaultAcrLevel:          models.AcrLevel1,
+	}
+
+	err := database.CreateClient(context.Background(), nil, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	redirectUri := &models.RedirectURI{
+		ClientId: client.Id,
+		URI:      fake.URL(),
+	}
+
+	err = database.CreateRedirectURI(context.Background(), nil, redirectUri)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	password := fake.Password(8)
+	passwordHashed, err := passwordhash.Hash(password)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	user := &models.User{
+		Subject:      fake.UUID(),
+		Enabled:      true,
+		Email:        fake.Email(),
+		PasswordHash: passwordHashed,
+	}
+
+	err = database.CreateUser(context.Background(), nil, user)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Eight resource-permission pairs on top of openid, profile and email is 11 scopes,
+	// indices 0 to 10.
+	permissionScopes := make([]string, 0, 8)
+	for i := 0; i < 8; i++ {
+		resource := createResource(t)
+		permission := createPermission(t, resource.Id)
+		assignPermissionToUser(t, user.Id, permission.Id)
+		permissionScopes = append(permissionScopes,
+			resource.ResourceIdentifier+":"+permission.PermissionIdentifier)
+	}
+
+	requestCodeChallenge := fake.LetterN(43)
+	requestState := fake.LetterN(8)
+	requestNonce := fake.LetterN(8)
+
+	// SetScope deduplicates and collapses whitespace but never sorts, so the consent screen's
+	// index space is this order.
+	requestedScopes := append([]string{"openid", "profile", "email"}, permissionScopes...)
+	requestScope := strings.Join(requestedScopes, " ")
+
+	destUrl := config.GetAuthServer().BaseURL + "/auth/authorize/?client_id=" + client.ClientIdentifier +
+		"&redirect_uri=" + url.QueryEscape(redirectUri.URI) +
+		"&response_type=code" +
+		"&code_challenge_method=S256" +
+		"&code_challenge=" + requestCodeChallenge +
+		"&scope=" + url.QueryEscape(requestScope) +
+		"&state=" + requestState +
+		"&nonce=" + requestNonce
+
+	httpClient := createHttpClient(t)
+
+	resp, err := httpClient.Get(destUrl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation := assertRedirect(t, resp, "/auth/level1")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/pwd")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	resp = authenticateWithPassword(t, httpClient, redirectLocation, resp, user.Email, password)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/level1completed")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/completed")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/consent")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	// Every box but index 1, which is profile.
+	resp = postConsent(t, httpClient, redirectLocation, resp, []int{0, 2, 3, 4, 5, 6, 7, 8, 9, 10})
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/issue")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	codeVal, stateVal := getCodeAndStateFromUrl(t, resp)
+	assert.Equal(t, requestState, stateVal)
+
+	code := loadCodeFromDatabase(t, codeVal)
+
+	expectedScope := strings.Join(append([]string{"openid", "email"}, permissionScopes...), " ")
+
+	assert.Equal(t, client.ClientIdentifier, code.Client.ClientIdentifier)
+	assert.Equal(t, expectedScope, code.Scope)
+	assert.NotContains(t, strings.Split(code.Scope, " "), "profile")
+	assert.Equal(t, requestState, code.State)
+	assert.Equal(t, requestNonce, code.Nonce)
+	assert.Equal(t, user.Id, code.User.Id)
+	assert.Equal(t, false, code.Used)
+
+	consent, err := database.GetConsentByUserIdAndClientId(context.Background(), nil, user.Id, client.Id)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	assert.NotNil(t, consent)
+	assert.Equal(t, user.Id, consent.UserId)
+	assert.Equal(t, client.Id, consent.ClientId)
+	assert.Equal(t, expectedScope, consent.Scope)
+	assert.NotContains(t, strings.Split(consent.Scope, " "), "profile")
+}

@@ -1,0 +1,1699 @@
+package integrationtests
+
+import (
+	"bytes"
+	"context"
+	"crypto/tls"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/cookiejar"
+	"net/url"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/PuerkitoBio/goquery"
+	"github.com/leodip/goiabada/authserver/internal/ceremony"
+	"github.com/leodip/goiabada/authserver/internal/config"
+	"github.com/leodip/goiabada/authserver/internal/encryption"
+	"github.com/leodip/goiabada/authserver/internal/models"
+	"github.com/leodip/goiabada/authserver/internal/oidc"
+	"github.com/leodip/goiabada/authserver/internal/passwordhash"
+	"github.com/leodip/goiabada/authserver/internal/testutil/fake"
+	"github.com/leodip/goiabada/core/constants"
+	"github.com/leodip/goiabada/core/hashutil"
+	"github.com/leodip/goiabada/core/i18n"
+	"github.com/leodip/goiabada/core/oauth"
+	"github.com/pquerna/otp/totp"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func createHttpClient(t *testing.T) *http.Client {
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &http.Client{
+		Jar: jar,
+	}
+
+	// disable follow redirect
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+
+	tr := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}
+	client.Transport = tr
+	return client
+}
+
+func assertRedirect(t *testing.T, response *http.Response, location string) string {
+	if response.StatusCode != http.StatusFound {
+		t.Fatalf("Expected status code %d, got %d", http.StatusFound, response.StatusCode)
+	}
+
+	redirectLocation, err := url.Parse(response.Header.Get("Location"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	assert.Equal(t, location, redirectLocation.Path)
+
+	return redirectLocation.String()
+}
+
+func loadPage(t *testing.T, client *http.Client, url string) *http.Response {
+	request, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := client.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp
+}
+
+// authenticateWithPassword submits the login form. pwdPage is the response that rendered it, and
+// the ceremony id is read out of it rather than constructed, so the submission carries what a
+// browser on that page would carry (#79).
+//
+// Where a submission follows a refused one, the page to pass is the refusal's own re-render, which
+// is what the user is looking at by then.
+func authenticateWithPassword(t *testing.T, client *http.Client, destUrl string,
+	pwdPage *http.Response, email string, password string) *http.Response {
+
+	formData := url.Values{
+		"email":      {email},
+		"password":   {password},
+		"ceremonyId": {getCeremonyIdFromPage(t, pwdPage)},
+	}
+
+	formDataString := formData.Encode()
+	requestBody := strings.NewReader(formDataString)
+	request, err := http.NewRequest("POST", destUrl, requestBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.Header.Set("Referer", destUrl)
+	request.Header.Set("Origin", config.GetAuthServer().BaseURL)
+
+	resp, err := client.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp
+}
+
+// authenticateWithOtp submits the OTP form, verification or enrollment. otpPage is the response
+// that rendered it, read the same way authenticateWithPassword reads its own (#79).
+func authenticateWithOtp(t *testing.T, client *http.Client, destUrl string, otpPage *http.Response,
+	otp string) *http.Response {
+
+	formData := url.Values{
+		"otp":        {otp},
+		"ceremonyId": {getCeremonyIdFromPage(t, otpPage)},
+	}
+
+	formDataString := formData.Encode()
+	requestBody := strings.NewReader(formDataString)
+	request, err := http.NewRequest("POST", destUrl, requestBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.Header.Set("Referer", destUrl)
+	request.Header.Set("Origin", config.GetAuthServer().BaseURL)
+
+	resp, err := client.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp
+}
+
+func getOtpSecretFromEnrollmentPage(t *testing.T, response *http.Response) string {
+	byteArr, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body = io.NopCloser(bytes.NewReader(byteArr))
+	doc, err := goquery.NewDocumentFromReader(strings.NewReader(string(byteArr)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	secret := doc.Find("pre.text-center")
+	if secret.Length() != 1 {
+		t.Fatal("expecting to find pre element with class 'text-center' but it was not found")
+	}
+	return secret.Text()
+}
+
+// getCeremonyIdFromPage reads the hidden ceremony id out of a rendered auth-flow page, so the
+// tests post the value the server actually rendered rather than one they made up. A field rename
+// on one side alone then fails here instead of passing silently (#79).
+//
+// The selector is scoped to inside the form, and matching anything other than exactly once is a
+// failure. That is the whole point of it: a hidden input placed OUTSIDE the <form> element is not
+// submitted by any browser, so every real submission would be refused, while a helper that finds
+// the value anywhere on the page and posts it by hand would sail past.
+//
+// The body is re-buffered, as getOtpSecretFromEnrollmentPage does, so a later reader of the same
+// response still sees it.
+func getCeremonyIdFromPage(t *testing.T, response *http.Response) string {
+	byteArr, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body = io.NopCloser(bytes.NewReader(byteArr))
+	doc, err := goquery.NewDocumentFromReader(strings.NewReader(string(byteArr)))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	field := doc.Find(`form input[name="ceremonyId"]`)
+	if field.Length() != 1 {
+		t.Fatalf("expecting exactly one ceremonyId input inside the form, found %d", field.Length())
+	}
+	ceremonyId, ok := field.Attr("value")
+	if !ok || ceremonyId == "" {
+		t.Fatal("the ceremonyId input carries no value")
+	}
+	return ceremonyId
+}
+
+func getCodeAndStateFromUrl(t *testing.T, resp *http.Response) (code string, state string) {
+	redirectLocation, err := url.Parse(resp.Header.Get("Location"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	code = redirectLocation.Query().Get("code")
+	state = redirectLocation.Query().Get("state")
+
+	assert.NotEmpty(t, code, "code should not be empty")
+	assert.NotEmpty(t, state, "state should not be empty")
+
+	assert.Equal(t, 128, len(code))
+
+	return code, state
+}
+
+func loadCodeFromDatabase(t *testing.T, codeVal string) *models.Code {
+	codeHash, err := hashutil.HashString(codeVal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	code, err := database.GetCodeByCodeHash(context.Background(), nil, codeHash, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = database.CodeLoadClient(context.Background(), nil, code)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = database.CodeLoadUser(context.Background(), nil, code)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return code
+}
+
+func assertWithinLastXSeconds(t *testing.T, timeToCheck time.Time, seconds float64) {
+	now := time.Now().UTC()
+	xSecondsAgo := now.Add(-time.Duration(seconds * float64(time.Second)))
+
+	assert.True(t, timeToCheck.After(xSecondsAgo) && timeToCheck.Before(now),
+		"Expected time to be within the last %.2f seconds", seconds)
+}
+
+func createResource(t *testing.T) *models.Resource {
+	resource := &models.Resource{
+		ResourceIdentifier: "res-" + fake.LetterN(8),
+	}
+	err := database.CreateResource(context.Background(), nil, resource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resource
+}
+
+func createResourceWithId(t *testing.T, resourceIdentifier string) *models.Resource {
+	resource := &models.Resource{
+		ResourceIdentifier: resourceIdentifier,
+	}
+	err := database.CreateResource(context.Background(), nil, resource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resource
+}
+
+func createPermission(t *testing.T, resourceId int64) *models.Permission {
+	permission := &models.Permission{
+		PermissionIdentifier: "perm-" + fake.LetterN(8),
+		ResourceId:           resourceId,
+	}
+	err := database.CreatePermission(context.Background(), nil, permission)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return permission
+}
+
+func createPermissionWithId(t *testing.T, resourceId int64, permissionIdentifier string) *models.Permission {
+	permission := &models.Permission{
+		PermissionIdentifier: permissionIdentifier,
+		ResourceId:           resourceId,
+	}
+	err := database.CreatePermission(context.Background(), nil, permission)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return permission
+}
+
+func assignPermissionToUser(t *testing.T, userId int64, permissionId int64) {
+	userPermission := &models.UserPermission{
+		UserId:       userId,
+		PermissionId: permissionId,
+	}
+	err := database.CreateUserPermission(context.Background(), nil, userPermission)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// postConsent submits the consent form. consentPage is the response that rendered it, and the
+// ceremony id is read out of it rather than constructed, so the submission carries what a browser
+// on that page would carry (#79).
+func postConsent(t *testing.T, client *http.Client, destUrl string, consentPage *http.Response,
+	consents []int) (resp *http.Response) {
+
+	formData := url.Values{}
+	formData.Add("ceremonyId", getCeremonyIdFromPage(t, consentPage))
+	for _, consent := range consents {
+		formData.Add(fmt.Sprintf("consent%d", consent), "[on]")
+	}
+	if len(consents) > 0 {
+		formData.Add("btnSubmit", "submit")
+	} else {
+		formData.Add("btnCancel", "cancel")
+	}
+
+	formDataString := formData.Encode()
+	requestBody := strings.NewReader(formDataString)
+	request, err := http.NewRequest("POST", destUrl, requestBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.Header.Set("Referer", destUrl)
+	request.Header.Set("Origin", config.GetAuthServer().BaseURL)
+
+	resp, err = client.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp
+}
+
+// createAuthenticatedHttpClient returns a browser holding a valid level 1 session, for the tests
+// that assert what an authorization ERROR looks like when it reaches the client.
+//
+// Since #213 the authorization endpoint no longer redirects a logged-out browser to a client's
+// redirect URI on a request that failed validation: RFC 9700 4.11.2 requires that "the
+// authorization server MUST always authenticate the user first ... before redirecting the user", so
+// a cookieless request is sent to /auth/level1 and the error is delivered after the login. The
+// tests below exist to check the error response itself, its code, description, response mode and
+// state echo, which is orthogonal to who is at the browser, so each is given a session and keeps
+// its assertions exactly as written (decision 6). The deferral has its own cases; it is not what
+// these are for.
+//
+// The client and user the session was created for are discarded on purpose. A session cookie
+// belongs to the browser and not to the client that minted it, so this authenticates a request for
+// whichever client the caller creates for itself.
+func createAuthenticatedHttpClient(t *testing.T) *http.Client {
+	httpClient, _, _, _ := createSessionWithAcrLevel1(t)
+	return httpClient
+}
+
+func createSessionWithAcrLevel1(t *testing.T) (*http.Client, *models.Client, *models.RedirectURI, *models.User) {
+	client := &models.Client{
+		ClientIdentifier:         "test-client-" + fake.LetterN(8),
+		Enabled:                  true,
+		AuthorizationCodeEnabled: true,
+		ConsentRequired:          false,
+		DefaultAcrLevel:          models.AcrLevel1,
+	}
+
+	err := database.CreateClient(context.Background(), nil, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	redirectUri := &models.RedirectURI{
+		ClientId: client.Id,
+		URI:      fake.URL(),
+	}
+
+	err = database.CreateRedirectURI(context.Background(), nil, redirectUri)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	password := fake.Password(8)
+	passwordHashed, err := passwordhash.Hash(password)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	user := &models.User{
+		Subject:      fake.UUID(),
+		Enabled:      true,
+		Email:        fake.Email(),
+		PasswordHash: passwordHashed,
+	}
+
+	err = database.CreateUser(context.Background(), nil, user)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	requestCodeChallenge := fake.LetterN(43)
+	requestState := fake.LetterN(8)
+	requestNonce := fake.LetterN(8)
+	requestScope := "openid profile email"
+
+	destUrl := config.GetAuthServer().BaseURL + "/auth/authorize/?client_id=" + client.ClientIdentifier +
+		"&redirect_uri=" + url.QueryEscape(redirectUri.URI) +
+		"&response_type=code" +
+		"&code_challenge_method=S256" +
+		"&code_challenge=" + requestCodeChallenge +
+		"&scope=" + url.QueryEscape(requestScope) +
+		"&state=" + requestState +
+		"&nonce=" + requestNonce
+
+	httpClient := createHttpClient(t)
+
+	resp, err := httpClient.Get(destUrl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation := assertRedirect(t, resp, "/auth/level1")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/pwd")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	resp = authenticateWithPassword(t, httpClient, redirectLocation, resp, user.Email, password)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/level1completed")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/completed")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/issue")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	codeVal, stateVal := getCodeAndStateFromUrl(t, resp)
+	assert.Equal(t, requestState, stateVal)
+
+	code := loadCodeFromDatabase(t, codeVal)
+
+	assert.Equal(t, client.ClientIdentifier, code.Client.ClientIdentifier)
+	assert.Equal(t, requestCodeChallenge, code.CodeChallenge.String)
+	assert.Equal(t, "S256", code.CodeChallengeMethod.String)
+	assert.Equal(t, requestScope, code.Scope)
+	assert.Equal(t, requestState, code.State)
+	assert.Equal(t, requestNonce, code.Nonce)
+	assert.Equal(t, redirectUri.URI, code.RedirectURI)
+	assert.Equal(t, user.Id, code.User.Id)
+	assert.Equal(t, "query", code.ResponseMode)
+	assertWithinLastXSeconds(t, code.AuthenticatedAt, 3)
+	assert.Equal(t, models.AcrLevel1.String(), code.AcrLevel)
+	assert.Equal(t, ceremony.AuthMethodPassword.String(), code.AuthMethods)
+	assert.Equal(t, false, code.Used)
+
+	return httpClient, client, redirectUri, user
+}
+
+func createSessionWithAcrLevel2Optional(t *testing.T) (*http.Client, *models.Client, *models.RedirectURI, *models.User) {
+	client := &models.Client{
+		ClientIdentifier:         "test-client-" + fake.LetterN(8),
+		Enabled:                  true,
+		AuthorizationCodeEnabled: true,
+		ConsentRequired:          false,
+		DefaultAcrLevel:          models.AcrLevel2Optional,
+	}
+
+	err := database.CreateClient(context.Background(), nil, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	redirectUri := &models.RedirectURI{
+		ClientId: client.Id,
+		URI:      fake.URL(),
+	}
+
+	err = database.CreateRedirectURI(context.Background(), nil, redirectUri)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	password := fake.Password(8)
+	passwordHashed, err := passwordhash.Hash(password)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	user := &models.User{
+		Subject:      fake.UUID(),
+		Enabled:      true,
+		Email:        fake.Email(),
+		PasswordHash: passwordHashed,
+	}
+
+	err = database.CreateUser(context.Background(), nil, user)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	requestCodeChallenge := fake.LetterN(43)
+	requestState := fake.LetterN(8)
+	requestNonce := fake.LetterN(8)
+	requestScope := "openid profile email"
+
+	destUrl := config.GetAuthServer().BaseURL + "/auth/authorize/?client_id=" + client.ClientIdentifier +
+		"&redirect_uri=" + url.QueryEscape(redirectUri.URI) +
+		"&response_type=code" +
+		"&code_challenge_method=S256" +
+		"&code_challenge=" + requestCodeChallenge +
+		"&scope=" + url.QueryEscape(requestScope) +
+		"&state=" + requestState +
+		"&nonce=" + requestNonce
+
+	httpClient := createHttpClient(t)
+
+	resp, err := httpClient.Get(destUrl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation := assertRedirect(t, resp, "/auth/level1")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/pwd")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	resp = authenticateWithPassword(t, httpClient, redirectLocation, resp, user.Email, password)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/level1completed")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/level2")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/completed")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/issue")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	codeVal, stateVal := getCodeAndStateFromUrl(t, resp)
+	assert.Equal(t, requestState, stateVal)
+
+	code := loadCodeFromDatabase(t, codeVal)
+
+	assert.Equal(t, client.ClientIdentifier, code.Client.ClientIdentifier)
+	assert.Equal(t, requestCodeChallenge, code.CodeChallenge.String)
+	assert.Equal(t, "S256", code.CodeChallengeMethod.String)
+	assert.Equal(t, requestScope, code.Scope)
+	assert.Equal(t, requestState, code.State)
+	assert.Equal(t, requestNonce, code.Nonce)
+	assert.Equal(t, redirectUri.URI, code.RedirectURI)
+	assert.Equal(t, user.Id, code.User.Id)
+	assert.Equal(t, "query", code.ResponseMode)
+	assertWithinLastXSeconds(t, code.AuthenticatedAt, 3)
+	assert.Equal(t, models.AcrLevel2Optional.String(), code.AcrLevel)
+	assert.Equal(t, ceremony.AuthMethodPassword.String(), code.AuthMethods)
+	assert.Equal(t, false, code.Used)
+
+	return httpClient, client, redirectUri, user
+}
+
+func createSessionWithAcrLevel2Mandatory(t *testing.T) (*http.Client, *models.Client, *models.RedirectURI, *models.User) {
+	client := &models.Client{
+		ClientIdentifier:         "test-client-" + fake.LetterN(8),
+		Enabled:                  true,
+		AuthorizationCodeEnabled: true,
+		ConsentRequired:          false,
+		DefaultAcrLevel:          models.AcrLevel2Mandatory,
+	}
+
+	err := database.CreateClient(context.Background(), nil, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	redirectUri := &models.RedirectURI{
+		ClientId: client.Id,
+		URI:      fake.URL(),
+	}
+
+	err = database.CreateRedirectURI(context.Background(), nil, redirectUri)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	password := fake.Password(8)
+	passwordHashed, err := passwordhash.Hash(password)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	userEmail := fake.Email()
+	key, err := totp.Generate(totp.GenerateOpts{
+		Issuer:      "Goiabada",
+		AccountName: userEmail,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	user := &models.User{
+		Subject:            fake.UUID(),
+		Enabled:            true,
+		Email:              fake.Email(),
+		PasswordHash:       passwordHashed,
+		OTPSecretEncrypted: encryptOTPSecretForTest(t, key.Secret()),
+		OTPEnabled:         true,
+	}
+
+	err = database.CreateUser(context.Background(), nil, user)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	requestCodeChallenge := fake.LetterN(43)
+	requestState := fake.LetterN(8)
+	requestNonce := fake.LetterN(8)
+	requestScope := "openid profile email"
+
+	destUrl := config.GetAuthServer().BaseURL + "/auth/authorize/?client_id=" + client.ClientIdentifier +
+		"&redirect_uri=" + url.QueryEscape(redirectUri.URI) +
+		"&response_type=code" +
+		"&code_challenge_method=S256" +
+		"&code_challenge=" + requestCodeChallenge +
+		"&scope=" + url.QueryEscape(requestScope) +
+		"&state=" + requestState +
+		"&nonce=" + requestNonce
+
+	httpClient := createHttpClient(t)
+
+	resp, err := httpClient.Get(destUrl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation := assertRedirect(t, resp, "/auth/level1")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/pwd")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	resp = authenticateWithPassword(t, httpClient, redirectLocation, resp, user.Email, password)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/level1completed")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/level2")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/otp")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	otpCode, err := totp.GenerateCode(key.Secret(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp = authenticateWithOtp(t, httpClient, redirectLocation, resp, otpCode)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/completed")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/issue")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	codeVal, stateVal := getCodeAndStateFromUrl(t, resp)
+	assert.Equal(t, requestState, stateVal)
+
+	code := loadCodeFromDatabase(t, codeVal)
+
+	assert.Equal(t, client.ClientIdentifier, code.Client.ClientIdentifier)
+	assert.Equal(t, requestCodeChallenge, code.CodeChallenge.String)
+	assert.Equal(t, "S256", code.CodeChallengeMethod.String)
+	assert.Equal(t, requestScope, code.Scope)
+	assert.Equal(t, requestState, code.State)
+	assert.Equal(t, requestNonce, code.Nonce)
+	assert.Equal(t, redirectUri.URI, code.RedirectURI)
+	assert.Equal(t, user.Id, code.User.Id)
+	assert.Equal(t, "query", code.ResponseMode)
+	assertWithinLastXSeconds(t, code.AuthenticatedAt, 3)
+	assert.Equal(t, models.AcrLevel2Mandatory.String(), code.AcrLevel)
+	assert.Equal(t, fmt.Sprintf("%s %s", ceremony.AuthMethodPassword.String(), ceremony.AuthMethodOTP.String()), code.AuthMethods)
+	assert.Equal(t, false, code.Used)
+
+	return httpClient, client, redirectUri, user
+}
+
+// encryptOTPSecretForTest encrypts a TOTP secret with the server's AES key, so a
+// test can persist a user whose OTP secret is stored the way production stores
+// it (issue #82: encrypted at rest). Set the result on user.OTPSecretEncrypted,
+// which is the only column a seed lives in since migration 000048 dropped
+// users.otp_secret (#98), and keep the plaintext in a local for generating codes.
+func encryptOTPSecretForTest(t *testing.T, plain string) []byte {
+	enc, err := encryption.EncryptData(plain)
+	assert.NoError(t, err)
+	return enc
+}
+
+// authCodeOptions varies the client and the ceremony createAuthCode runs. Its ZERO VALUE is
+// createAuthCode's original behaviour, a confidential client running a PKCE ceremony, so the
+// existing call sites pass nothing and are unaffected (#245).
+//
+// noPKCE has a precondition the caller owns: the seeded Settings.PKCERequired is true, so a
+// challenge-less ceremony is refused at /auth/authorize unless pkceRequired is also set to
+// false. That is deliberate rather than inferred here, because the two together are exactly
+// the misconfiguration the tests are about.
+type authCodeOptions struct {
+	isPublic     bool
+	noPKCE       bool
+	pkceRequired *bool
+	// user and userPassword run the ceremony as an EXISTING user instead of a freshly created
+	// one. Both are required together, because the ceremony goes through the real password form.
+	// Their purpose is a fixture no single call can build: one user holding grants on two
+	// different clients, which is what proves a client-scoped revocation leaves the user's other
+	// clients alone (#245, D2).
+	user         *models.User
+	userPassword string
+	// userAgent runs the ceremony as a different DEVICE. Two ceremonies for one user from the
+	// default client replace each other's session, because the server treats the same user on
+	// the same device as one session, so a fixture wanting two live sessions has to say which
+	// is which. This is the same trick secondSessionFor uses.
+	userAgent string
+}
+
+func createAuthCode(t *testing.T, clientSecret string, scope string, opts ...authCodeOptions) (*http.Client, *models.Code) {
+
+	var opt authCodeOptions
+	if len(opts) > 0 {
+		opt = opts[0]
+	}
+
+	clientSecretEncrypted, err := encryption.EncryptData(clientSecret)
+	assert.NoError(t, err)
+
+	client := &models.Client{
+		ClientIdentifier:         "test-client-" + fake.LetterN(8),
+		Enabled:                  true,
+		AuthorizationCodeEnabled: true,
+		IsPublic:                 opt.isPublic,
+		ConsentRequired:          false,
+		DefaultAcrLevel:          models.AcrLevel2Optional,
+		ClientSecretEncrypted:    clientSecretEncrypted,
+		PKCERequired:             opt.pkceRequired,
+	}
+	if opt.isPublic {
+		// A public client holds no secret. Leaving the encrypted one on the row would be a
+		// fixture that cannot occur in production, and the flip deletes it for that reason.
+		client.ClientSecretEncrypted = nil
+	}
+
+	err = database.CreateClient(context.Background(), nil, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	redirectUri := &models.RedirectURI{
+		ClientId: client.Id,
+		URI:      fake.URL(),
+	}
+
+	err = database.CreateRedirectURI(context.Background(), nil, redirectUri)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	password := opt.userPassword
+	user := opt.user
+	if user == nil {
+		password = fake.Password(8)
+		passwordHashed, createErr := passwordhash.Hash(password)
+		if createErr != nil {
+			t.Fatal(createErr)
+		}
+
+		user = &models.User{
+			Subject:      fake.UUID(),
+			Enabled:      true,
+			Email:        fake.Email(),
+			PasswordHash: passwordHashed,
+		}
+
+		createErr = database.CreateUser(context.Background(), nil, user)
+		if createErr != nil {
+			t.Fatal(createErr)
+		}
+	}
+
+	codeVerifier := "code-verifier"
+	requestCodeChallenge := oauth.GeneratePKCECodeChallenge(codeVerifier)
+	requestState := fake.LetterN(8)
+	requestNonce := fake.LetterN(8)
+
+	destUrl := config.GetAuthServer().BaseURL + "/auth/authorize/?client_id=" + client.ClientIdentifier +
+		"&redirect_uri=" + url.QueryEscape(redirectUri.URI) +
+		"&response_type=code"
+	if !opt.noPKCE {
+		destUrl += "&code_challenge_method=S256" +
+			"&code_challenge=" + requestCodeChallenge
+	}
+	destUrl += "&scope=" + url.QueryEscape(scope) +
+		"&state=" + requestState +
+		"&nonce=" + requestNonce
+
+	httpClient := createHttpClient(t)
+	if opt.userAgent != "" {
+		httpClient = createHttpClientWithUserAgent(t, opt.userAgent)
+	}
+
+	resp, err := httpClient.Get(destUrl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation := assertRedirect(t, resp, "/auth/level1")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/pwd")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	resp = authenticateWithPassword(t, httpClient, redirectLocation, resp, user.Email, password)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/level1completed")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/level2")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/completed")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/issue")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	codeVal, stateVal := getCodeAndStateFromUrl(t, resp)
+	assert.Equal(t, requestState, stateVal)
+
+	code := loadCodeFromDatabase(t, codeVal)
+	code.Code = codeVal
+	return httpClient, code
+}
+
+// createAuthCodeEnsuringUserScope creates a confidential client and a user, grants the user
+// all custom resource:permission scopes contained in the provided scope string, then runs the
+// authorization code flow to issue a code for that user and returns (httpClient, code).
+// It guarantees custom scopes survive filtering and end up in the token if requested.
+func createAuthCodeEnsuringUserScope(t *testing.T, clientSecret string, scope string) (*http.Client, *models.Code) {
+
+	clientSecretEncrypted, err := encryption.EncryptData(clientSecret)
+	assert.NoError(t, err)
+
+	client := &models.Client{
+		ClientIdentifier:         "acctscope-client-" + fake.LetterN(8),
+		Enabled:                  true,
+		AuthorizationCodeEnabled: true,
+		IsPublic:                 false,
+		ConsentRequired:          false,
+		DefaultAcrLevel:          models.AcrLevel2Optional,
+		ClientSecretEncrypted:    clientSecretEncrypted,
+	}
+
+	err = database.CreateClient(context.Background(), nil, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	redirectUri := &models.RedirectURI{ClientId: client.Id, URI: fake.URL()}
+	err = database.CreateRedirectURI(context.Background(), nil, redirectUri)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a user and pre-grant all custom resource scopes requested
+	password := fake.Password(10)
+	passwordHashed, err := passwordhash.Hash(password)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	user := &models.User{Subject: fake.UUID(), Enabled: true, Email: fake.Email(), PasswordHash: passwordHashed}
+	err = database.CreateUser(context.Background(), nil, user)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	scopes := strings.Split(scope, " ")
+	for _, s := range scopes {
+		if s == "" || oidc.IsClaimScope(s) || oidc.IsOfflineAccessScope(s) {
+			continue
+		}
+		parts := strings.Split(s, ":")
+		if len(parts) != 2 {
+			t.Fatalf("invalid scope format in helper: %s", s)
+		}
+		resourceIdentifier := parts[0]
+		permissionIdentifier := parts[1]
+
+		resource, grantErr := database.GetResourceByResourceIdentifier(context.Background(), nil, resourceIdentifier)
+		if grantErr != nil {
+			t.Fatal(grantErr)
+		}
+		if resource == nil {
+			t.Fatalf("resource not found: %s", resourceIdentifier)
+		}
+
+		perms, grantErr := database.GetPermissionsByResourceId(context.Background(), nil, resource.Id)
+		if grantErr != nil {
+			t.Fatal(grantErr)
+		}
+		var sel *models.Permission
+		for i := range perms {
+			if perms[i].PermissionIdentifier == permissionIdentifier {
+				sel = &perms[i]
+				break
+			}
+		}
+		if sel == nil {
+			t.Fatalf("permission not found: %s:%s", resourceIdentifier, permissionIdentifier)
+		}
+		grantErr = database.CreateUserPermission(context.Background(), nil, &models.UserPermission{UserId: user.Id, PermissionId: sel.Id})
+		if grantErr != nil {
+			t.Fatal(grantErr)
+		}
+	}
+
+	codeVerifier := "code-verifier"
+	requestCodeChallenge := oauth.GeneratePKCECodeChallenge(codeVerifier)
+	requestState := fake.LetterN(8)
+	requestNonce := fake.LetterN(8)
+
+	destUrl := config.GetAuthServer().BaseURL + "/auth/authorize/?client_id=" + client.ClientIdentifier +
+		"&redirect_uri=" + url.QueryEscape(redirectUri.URI) +
+		"&response_type=code" +
+		"&code_challenge_method=S256" +
+		"&code_challenge=" + requestCodeChallenge +
+		"&scope=" + url.QueryEscape(scope) +
+		"&state=" + requestState +
+		"&nonce=" + requestNonce
+
+	httpClient := createHttpClient(t)
+
+	resp, err := httpClient.Get(destUrl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation := assertRedirect(t, resp, "/auth/level1")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/pwd")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	resp = authenticateWithPassword(t, httpClient, redirectLocation, resp, user.Email, password)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/level1completed")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/level2")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/completed")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/issue")
+	resp = loadPage(t, httpClient, redirectLocation)
+	defer func() { _ = resp.Body.Close() }()
+
+	codeVal, stateVal := getCodeAndStateFromUrl(t, resp)
+	assert.Equal(t, requestState, stateVal)
+	code := loadCodeFromDatabase(t, codeVal)
+	code.Code = codeVal
+	return httpClient, code
+}
+
+// createUserAccessTokenWithScope issues an access token for a user making sure requested
+// custom scopes are granted to that user before the flow. Returns (accessToken, *user).
+func createUserAccessTokenWithScope(t *testing.T, scope string) (string, *models.User) {
+	clientSecret := fake.LetterN(32)
+	httpClient, code := createAuthCodeEnsuringUserScope(t, clientSecret, scope)
+
+	// Exchange code for tokens
+	tokenEndpoint := config.GetAuthServer().BaseURL + "/auth/token/"
+	form := url.Values{
+		"grant_type":    {"authorization_code"},
+		"client_id":     {code.Client.ClientIdentifier},
+		"client_secret": {clientSecret},
+		"code":          {code.Code},
+		"redirect_uri":  {code.RedirectURI},
+		"code_verifier": {"code-verifier"},
+	}
+	data := postToTokenEndpoint(t, httpClient, tokenEndpoint, form)
+	accessToken, ok := data["access_token"].(string)
+	assert.True(t, ok)
+	assert.NotEmpty(t, accessToken)
+	return accessToken, &code.User
+}
+
+func postToTokenEndpoint(t *testing.T, client *http.Client, url string, formData url.Values) map[string]interface{} {
+	formDataString := formData.Encode()
+	requestBody := strings.NewReader(formDataString)
+	request, err := http.NewRequest("POST", url, requestBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.Header.Set("Referer", url)
+	request.Header.Set("Origin", config.GetAuthServer().BaseURL)
+
+	resp, err := client.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var data interface{}
+	err = json.Unmarshal(body, &data)
+	if err != nil {
+		// Include the status and the body: the token endpoint renders an HTML
+		// error page on an internal failure, and the bare json error ("invalid
+		// character '<'") says nothing about what actually went wrong.
+		t.Fatalf("token endpoint did not return JSON: %v (status %d, body: %s)",
+			err, resp.StatusCode, string(body))
+	}
+
+	return data.(map[string]interface{})
+}
+
+// postToTokenEndpointWithBasicAuth sends a POST request to the token endpoint using HTTP Basic authentication
+func postToTokenEndpointWithBasicAuth(t *testing.T, client *http.Client, url string, formData url.Values, clientId, clientSecret string) map[string]interface{} {
+	formDataString := formData.Encode()
+	requestBody := strings.NewReader(formDataString)
+	request, err := http.NewRequest("POST", url, requestBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.Header.Set("Referer", url)
+	request.Header.Set("Origin", config.GetAuthServer().BaseURL)
+	request.SetBasicAuth(clientId, clientSecret)
+
+	resp, err := client.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var data interface{}
+	err = json.Unmarshal(body, &data)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return data.(map[string]interface{})
+}
+
+func dumpResponseBody(t *testing.T, response *http.Response) {
+	t.Log("Response body:")
+	byteArr, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body = io.NopCloser(bytes.NewReader(byteArr))
+	content := string(byteArr)
+	t.Log(content)
+}
+
+// createAdminClientWithToken creates a client with admin permissions and returns an access token
+func createAdminClientWithToken(t *testing.T) (string, *models.Client) {
+	// Generate client secret
+	clientSecret := fake.Password(32)
+	clientSecretEncrypted, err := encryption.EncryptData(clientSecret)
+	assert.NoError(t, err)
+
+	// Create client with admin permissions
+	client := &models.Client{
+		ClientIdentifier:         "admin-test-client-" + fake.LetterN(8),
+		Enabled:                  true,
+		ClientCredentialsEnabled: true,
+		IsPublic:                 false,
+		ClientSecretEncrypted:    clientSecretEncrypted,
+	}
+	err = database.CreateClient(context.Background(), nil, client)
+	assert.NoError(t, err)
+
+	// Get authserver resource and permission
+	authServerResource, err := database.GetResourceByResourceIdentifier(context.Background(), nil, constants.AuthServerResourceIdentifier)
+	assert.NoError(t, err)
+
+	permissions, err := database.GetPermissionsByResourceId(context.Background(), nil, authServerResource.Id)
+	assert.NoError(t, err)
+
+	var adminPermission *models.Permission
+	for idx, permission := range permissions {
+		if permission.PermissionIdentifier == constants.ManagePermissionIdentifier {
+			adminPermission = &permissions[idx]
+			break
+		}
+	}
+	assert.NotNil(t, adminPermission, "Should find manage permission")
+
+	// Assign admin permission to client
+	err = database.CreateClientPermission(context.Background(), nil, &models.ClientPermission{
+		ClientId:     client.Id,
+		PermissionId: adminPermission.Id,
+	})
+	assert.NoError(t, err)
+
+	// Get access token using client credentials flow
+	httpClient := createHttpClient(t)
+	destUrl := config.GetAuthServer().BaseURL + "/auth/token/"
+
+	formData := url.Values{
+		"grant_type":    {"client_credentials"},
+		"client_id":     {client.ClientIdentifier},
+		"client_secret": {clientSecret},
+		"scope":         {constants.AuthServerResourceIdentifier + ":" + constants.ManagePermissionIdentifier},
+	}
+
+	data := postToTokenEndpoint(t, httpClient, destUrl, formData)
+	accessToken, ok := data["access_token"].(string)
+	assert.True(t, ok, "access_token should be a string")
+	assert.NotEmpty(t, accessToken, "access_token should not be empty")
+
+	return accessToken, client
+}
+
+// makeAPIRequest makes an authenticated API request
+// The error checks below are require, not assert: a non-fatal assert would let
+// the helper return a nil *http.Response, and the caller then dereferences it,
+// turning a plain connectivity failure into a SIGSEGV that aborts the whole
+// package. require stops at the real cause.
+func makeAPIRequest(t *testing.T, method, url, accessToken string, body interface{}) *http.Response {
+	var reqBody *bytes.Reader
+	if body != nil {
+		jsonBody, err := json.Marshal(body)
+		require.NoError(t, err)
+		reqBody = bytes.NewReader(jsonBody)
+	} else {
+		reqBody = bytes.NewReader([]byte{})
+	}
+
+	req, err := http.NewRequest(method, url, reqBody)
+	require.NoError(t, err)
+
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+
+	httpClient := createHttpClient(t)
+	resp, err := httpClient.Do(req)
+	require.NoError(t, err)
+
+	return resp
+}
+
+// Helper function to create a test resource
+func createTestResource(t *testing.T, identifier, description string) *models.Resource {
+	resource := &models.Resource{
+		ResourceIdentifier: identifier,
+		Description:        description,
+	}
+	err := database.CreateResource(context.Background(), nil, resource)
+	assert.NoError(t, err)
+	return resource
+}
+
+// deleteTestUsers removes fixture users and reports a delete that did nothing.
+//
+// The tier's older idiom was `_ = database.DeleteUser(context.Background(), nil, user.Id)`, which
+// hides the two ways a cleanup silently fails to clean up: an insert that never
+// happened leaves Id == 0, so the delete matches no row, and an engine that
+// refuses the delete says so only in the error. Either way the rows stay, and
+// with them every later fixture that reuses an address.
+func deleteTestUsers(t *testing.T, users []*models.User) {
+	t.Helper()
+	for _, user := range users {
+		if user == nil {
+			continue
+		}
+		assert.NotZero(t, user.Id, "fixture user %q was never created, so cleanup cannot delete it", user.Email)
+		assert.NoError(t, database.DeleteUser(context.Background(), nil, user.Id), "unable to delete fixture user %q", user.Email)
+	}
+}
+
+// uniqueEmail inserts a random run into addr's local part, so a fixture address
+// stays readable in a leftover row while no two calls of it can collide.
+//
+// It exists because this tier's fixtures spell their addresses as descriptive
+// literals, and a literal is only safe while every row carrying it is deleted
+// again. run-tests.sh drops the sqlite file on exit, but goiabada_integration on
+// mysql, postgres and mssql is never dropped, so one leaked row there fails the
+// same test on every run after it, with a UNIQUE violation raised from a fixture
+// rather than from the behaviour under test.
+func uniqueEmail(addr string) string {
+	local, domain, found := strings.Cut(addr, "@")
+	if !found {
+		panic("uniqueEmail: " + addr + " is not an address")
+	}
+	// The API rejects an address over 60 bytes (validators.email_validator), and
+	// fixtures reach that endpoint, so the run added here is short and the
+	// longest address in the tier stays well inside the limit.
+	return local + "-" + strings.ToLower(fake.LetterN(8)) + "@" + domain
+}
+
+// Helper function to create a test group
+func createTestGroup(t *testing.T) *models.Group {
+	group := &models.Group{
+		GroupIdentifier:      "test-group-" + fake.UUID()[:8],
+		Description:          "Test Group",
+		IncludeInIdToken:     true,
+		IncludeInAccessToken: false,
+	}
+	err := database.CreateGroup(context.Background(), nil, group)
+	assert.NoError(t, err)
+	return group
+}
+
+// Helper function to create a test permission
+func createTestPermission(t *testing.T, resourceId int64, identifier, description string) *models.Permission {
+	permission := &models.Permission{
+		ResourceId:           resourceId,
+		PermissionIdentifier: identifier,
+		Description:          description,
+	}
+	err := database.CreatePermission(context.Background(), nil, permission)
+	assert.NoError(t, err)
+	return permission
+}
+
+// ============================================================================
+// Client Display Testing Helpers
+// ============================================================================
+
+// parseHTMLResponse reads the response body and returns a goquery document
+// while preserving the response body for potential re-reading
+func parseHTMLResponse(t *testing.T, response *http.Response) *goquery.Document {
+	byteArr, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body = io.NopCloser(bytes.NewReader(byteArr))
+
+	doc, err := goquery.NewDocumentFromReader(strings.NewReader(string(byteArr)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return doc
+}
+
+// assertClientNameInHTML verifies the client name is displayed correctly
+// Supports both auth layout and consent layout patterns
+func assertClientNameInHTML(t *testing.T, doc *goquery.Document, expectedName string) {
+	var found bool
+	var actualName string
+
+	// Auth layout pattern: <span class="mt-1 text-sm text-base-content/80">CLIENT_NAME</span>
+	doc.Find("span.text-sm").Each(func(i int, s *goquery.Selection) {
+		class, _ := s.Attr("class")
+		if strings.Contains(class, "text-base-content") && strings.Contains(class, "mt-1") {
+			actualName = strings.TrimSpace(s.Text())
+			if actualName == expectedName {
+				found = true
+			}
+		}
+	})
+
+	// Consent layout pattern: <h4 class="text-lg font-bold">CLIENT_NAME</h4>
+	if !found {
+		doc.Find("h4.text-lg").Each(func(i int, s *goquery.Selection) {
+			actualName = strings.TrimSpace(s.Text())
+			if actualName == expectedName {
+				found = true
+			}
+		})
+	}
+
+	if !found {
+		t.Logf("Expected client name: %s", expectedName)
+		t.Logf("Actual client name found: %s", actualName)
+
+		// Debug: Show all h4 tags found
+		var h4Count int
+		doc.Find("h4").Each(func(i int, s *goquery.Selection) {
+			h4Count++
+			t.Logf("Found h4 #%d: class='%s', text='%s'", i, s.AttrOr("class", ""), strings.TrimSpace(s.Text()))
+		})
+		t.Logf("Total h4 tags found: %d", h4Count)
+
+		dumpResponseBody(t, &http.Response{Body: io.NopCloser(strings.NewReader(doc.Text()))})
+	}
+
+	assert.True(t, found, "Client name '%s' should be displayed in HTML", expectedName)
+}
+
+// assertClientLogoInHTML verifies logo image is present/absent as expected
+func assertClientLogoInHTML(t *testing.T, doc *goquery.Document, clientIdentifier string, expectLogo bool) {
+	expectedSrc := "/client/logo/" + clientIdentifier
+	var logoFound bool
+
+	doc.Find("img").Each(func(i int, s *goquery.Selection) {
+		src, exists := s.Attr("src")
+		if exists && src == expectedSrc {
+			logoFound = true
+		}
+	})
+
+	if expectLogo {
+		assert.True(t, logoFound,
+			"Logo image with src '%s' should be present when ShowLogo=true and logo exists", expectedSrc)
+	} else {
+		assert.False(t, logoFound,
+			"Logo image with src '%s' should not be present when ShowLogo=false or no logo uploaded", expectedSrc)
+	}
+}
+
+// assertClientDescriptionInHTML verifies description is present/absent and matches expected
+func assertClientDescriptionInHTML(t *testing.T, doc *goquery.Document, expectedDescription string, expectPresent bool) {
+	if !expectPresent {
+		// When not expecting description, verify it's not in either layout pattern
+		if expectedDescription != "" {
+			var foundInAuthLayout bool
+			doc.Find("span.text-xs").Each(func(i int, s *goquery.Selection) {
+				class, _ := s.Attr("class")
+				if strings.Contains(class, "text-base-content") {
+					if strings.Contains(s.Text(), expectedDescription) {
+						foundInAuthLayout = true
+					}
+				}
+			})
+
+			var foundInConsentLayout bool
+			doc.Find("p.text-sm").Each(func(i int, s *goquery.Selection) {
+				class, _ := s.Attr("class")
+				if strings.Contains(class, "opacity-70") {
+					if strings.Contains(s.Text(), expectedDescription) {
+						foundInConsentLayout = true
+					}
+				}
+			})
+
+			assert.False(t, foundInAuthLayout || foundInConsentLayout,
+				"Description should not be visible when ShowDescription=false or description empty")
+		}
+		return
+	}
+
+	// When expecting description, check both layout patterns
+	var found bool
+
+	// Auth layout pattern: <span class="text-xs text-base-content/80">
+	doc.Find("span.text-xs").Each(func(i int, s *goquery.Selection) {
+		class, _ := s.Attr("class")
+		if strings.Contains(class, "text-base-content") {
+			text := strings.TrimSpace(s.Text())
+			if text == expectedDescription {
+				found = true
+			}
+		}
+	})
+
+	// Consent layout pattern: <p class="text-sm opacity-70">
+	if !found {
+		doc.Find("p.opacity-70").Each(func(i int, s *goquery.Selection) {
+			text := strings.TrimSpace(s.Text())
+			if text == expectedDescription {
+				found = true
+			}
+		})
+	}
+
+	if !found {
+		// Debug: Show all p tags with opacity-70 found
+		t.Logf("Expected description: '%s'", expectedDescription)
+		doc.Find("p").Each(func(i int, s *goquery.Selection) {
+			class := s.AttrOr("class", "")
+			if strings.Contains(class, "opacity") || strings.Contains(class, "text-sm") {
+				t.Logf("Found p: class='%s', text='%s'", class, strings.TrimSpace(s.Text()))
+			}
+		})
+	}
+
+	assert.True(t, found,
+		"Description '%s' should be visible when ShowDescription=true and description not empty", expectedDescription)
+}
+
+// assertClientWebsiteUrlInHTML verifies website URL link is present/absent as expected
+func assertClientWebsiteUrlInHTML(t *testing.T, doc *goquery.Document, expectedURL string, expectPresent bool) {
+	if expectedURL == "" && !expectPresent {
+		return
+	}
+
+	var linkFound bool
+	doc.Find("a").Each(func(i int, s *goquery.Selection) {
+		href, exists := s.Attr("href")
+		if exists && href == expectedURL {
+			linkFound = true
+
+			if expectPresent {
+				// Verify link attributes
+				target, _ := s.Attr("target")
+				assert.Equal(t, "_blank", target, "Website link should open in new tab")
+
+				rel, _ := s.Attr("rel")
+				assert.Equal(t, "noopener noreferrer", rel, "Website link should have security attributes")
+			}
+		}
+	})
+
+	if expectPresent {
+		assert.True(t, linkFound,
+			"Website URL link with href '%s' should be present when ShowWebsiteURL=true and URL not empty", expectedURL)
+	} else {
+		assert.False(t, linkFound,
+			"Website URL link with href '%s' should not be present when ShowWebsiteURL=false or URL empty", expectedURL)
+	}
+}
+
+// ClientDisplaySettings holds configuration for test client creation
+type ClientDisplaySettings struct {
+	ClientIdentifier string
+	DisplayName      string
+	Description      string
+	WebsiteURL       string
+	ShowLogo         bool
+	ShowDisplayName  bool
+	ShowDescription  bool
+	ShowWebsiteURL   bool
+	UploadLogo       bool // Whether to actually upload a logo
+	ConsentRequired  bool
+	DefaultAcrLevel  models.AcrLevel
+}
+
+// createClientWithDisplaySettings creates a client with specified display settings
+// and optional logo upload. Returns the created client.
+func createClientWithDisplaySettings(t *testing.T, settings ClientDisplaySettings) *models.Client {
+	client := &models.Client{
+		ClientIdentifier:         settings.ClientIdentifier,
+		DisplayName:              settings.DisplayName,
+		Description:              settings.Description,
+		WebsiteURL:               settings.WebsiteURL,
+		ShowLogo:                 settings.ShowLogo,
+		ShowDisplayName:          settings.ShowDisplayName,
+		ShowDescription:          settings.ShowDescription,
+		ShowWebsiteURL:           settings.ShowWebsiteURL,
+		Enabled:                  true,
+		AuthorizationCodeEnabled: true,
+		ConsentRequired:          settings.ConsentRequired,
+		DefaultAcrLevel:          settings.DefaultAcrLevel,
+	}
+
+	err := database.CreateClient(context.Background(), nil, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Upload logo if requested
+	if settings.UploadLogo {
+		// Create a simple 1x1 PNG image
+		logoData := []byte{
+			0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, // PNG signature
+			0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52, // IHDR chunk
+			0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+			0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4,
+			0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41,
+			0x54, 0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00,
+			0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
+			0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE,
+			0x42, 0x60, 0x82,
+		}
+
+		clientLogo := &models.ClientLogo{
+			ClientId: client.Id,
+			Logo:     logoData,
+		}
+
+		err = database.CreateClientLogo(context.Background(), nil, clientLogo)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	return client
+}
+
+// navigateToPasswordScreen starts an auth flow and navigates to the password screen
+// Returns the HTTP response for the password page
+func navigateToPasswordScreen(t *testing.T, httpClient *http.Client, client *models.Client, redirectUri string) *http.Response {
+	return navigateToPasswordScreenWithUILocales(t, httpClient, client, redirectUri, "")
+}
+
+// navigateToPasswordScreenWithUILocales is the same as navigateToPasswordScreen
+// but appends an ui_locales query parameter (space-separated BCP 47 tags) when
+// non-empty, exercising the OIDC hint preservation across the redirect chain.
+func navigateToPasswordScreenWithUILocales(t *testing.T, httpClient *http.Client, client *models.Client, redirectUri, uiLocales string) *http.Response {
+	requestCodeChallenge := fake.LetterN(43)
+	requestState := fake.LetterN(8)
+	requestNonce := fake.LetterN(8)
+	requestScope := "openid profile email"
+
+	destUrl := config.GetAuthServer().BaseURL + "/auth/authorize/?client_id=" + client.ClientIdentifier +
+		"&redirect_uri=" + url.QueryEscape(redirectUri) +
+		"&response_type=code" +
+		"&code_challenge_method=S256" +
+		"&code_challenge=" + requestCodeChallenge +
+		"&scope=" + url.QueryEscape(requestScope) +
+		"&state=" + requestState +
+		"&nonce=" + requestNonce
+	if uiLocales != "" {
+		destUrl += "&ui_locales=" + url.QueryEscape(uiLocales)
+	}
+
+	resp, err := httpClient.Get(destUrl)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	redirectLocation := assertRedirect(t, resp, "/auth/level1")
+	_ = resp.Body.Close()
+	resp = loadPage(t, httpClient, redirectLocation)
+
+	redirectLocation = assertRedirect(t, resp, "/auth/pwd")
+	_ = resp.Body.Close()
+	resp = loadPage(t, httpClient, redirectLocation)
+	// Note: caller is responsible for closing this response
+
+	return resp
+}
+
+// navigateToOtpScreen starts an auth flow, authenticates with password, and navigates to OTP screen
+// Returns the HTTP response for the OTP page
+func navigateToOtpScreen(t *testing.T, httpClient *http.Client, client *models.Client, user *models.User,
+	password string, redirectUri string) *http.Response {
+
+	requestCodeChallenge := fake.LetterN(43)
+	requestState := fake.LetterN(8)
+	requestNonce := fake.LetterN(8)
+	requestScope := "openid profile email"
+
+	destUrl := config.GetAuthServer().BaseURL + "/auth/authorize/?client_id=" + client.ClientIdentifier +
+		"&redirect_uri=" + url.QueryEscape(redirectUri) +
+		"&response_type=code" +
+		"&code_challenge_method=S256" +
+		"&code_challenge=" + requestCodeChallenge +
+		"&scope=" + url.QueryEscape(requestScope) +
+		"&state=" + requestState +
+		"&nonce=" + requestNonce
+
+	resp, err := httpClient.Get(destUrl)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	redirectLocation := assertRedirect(t, resp, "/auth/level1")
+	_ = resp.Body.Close()
+	resp = loadPage(t, httpClient, redirectLocation)
+
+	redirectLocation = assertRedirect(t, resp, "/auth/pwd")
+	_ = resp.Body.Close()
+	resp = loadPage(t, httpClient, redirectLocation)
+
+	// The password page is held rather than closed here: the submission reads the ceremony id out
+	// of it, and a closed body cannot be read (#79).
+	pwdPage := resp
+	resp = authenticateWithPassword(t, httpClient, redirectLocation, pwdPage, user.Email, password)
+	_ = pwdPage.Body.Close()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/level1completed")
+	_ = resp.Body.Close()
+	resp = loadPage(t, httpClient, redirectLocation)
+
+	redirectLocation = assertRedirect(t, resp, "/auth/level2")
+	_ = resp.Body.Close()
+	resp = loadPage(t, httpClient, redirectLocation)
+
+	redirectLocation = assertRedirect(t, resp, "/auth/otp")
+	_ = resp.Body.Close()
+	resp = loadPage(t, httpClient, redirectLocation)
+	// Note: caller is responsible for closing this response
+
+	return resp
+}
+
+// navigateToConsentScreen completes auth flow and navigates to consent screen
+// Returns the HTTP response for the consent page
+func navigateToConsentScreen(t *testing.T, httpClient *http.Client, client *models.Client,
+	user *models.User, password string, redirectUri string) *http.Response {
+
+	requestCodeChallenge := fake.LetterN(43)
+	requestState := fake.LetterN(8)
+	requestNonce := fake.LetterN(8)
+	requestScope := "openid profile email"
+
+	destUrl := config.GetAuthServer().BaseURL + "/auth/authorize/?client_id=" + client.ClientIdentifier +
+		"&redirect_uri=" + url.QueryEscape(redirectUri) +
+		"&response_type=code" +
+		"&code_challenge_method=S256" +
+		"&code_challenge=" + requestCodeChallenge +
+		"&scope=" + url.QueryEscape(requestScope) +
+		"&state=" + requestState +
+		"&nonce=" + requestNonce
+
+	resp, err := httpClient.Get(destUrl)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	redirectLocation := assertRedirect(t, resp, "/auth/level1")
+	_ = resp.Body.Close()
+	resp = loadPage(t, httpClient, redirectLocation)
+
+	redirectLocation = assertRedirect(t, resp, "/auth/pwd")
+	_ = resp.Body.Close()
+	resp = loadPage(t, httpClient, redirectLocation)
+
+	// The password page is held rather than closed here: the submission reads the ceremony id out
+	// of it, and a closed body cannot be read (#79).
+	pwdPage := resp
+	resp = authenticateWithPassword(t, httpClient, redirectLocation, pwdPage, user.Email, password)
+	_ = pwdPage.Body.Close()
+
+	redirectLocation = assertRedirect(t, resp, "/auth/level1completed")
+	_ = resp.Body.Close()
+	resp = loadPage(t, httpClient, redirectLocation)
+
+	redirectLocation = assertRedirect(t, resp, "/auth/completed")
+	_ = resp.Body.Close()
+	resp = loadPage(t, httpClient, redirectLocation)
+
+	redirectLocation = assertRedirect(t, resp, "/auth/consent")
+	_ = resp.Body.Close()
+	resp = loadPage(t, httpClient, redirectLocation)
+	// Note: caller is responsible for closing this response
+
+	return resp
+}
+
+// assertStateMismatchPage reads the page a state mismatch renders and holds it to the catalog
+// entry that belongs to the condition, not merely to "some error page".
+//
+// The distinction is the point. The ceremony-mismatch page beside it says another sign-in was
+// started in this browser, which is a different diagnosis and a different remedy from "you went
+// back to a step the server has finished with", and a check that accepted either would let the
+// two be confused (#279 decision 21).
+func assertStateMismatchPage(t *testing.T, resp *http.Response) {
+	t.Helper()
+
+	doc, err := goquery.NewDocumentFromReader(resp.Body)
+	require.NoError(t, err)
+
+	body := doc.Text()
+	assert.Contains(t, body, i18n.T(context.Background(), "auth_error.state_mismatch.title"))
+	assert.Contains(t, body, i18n.T(context.Background(), "auth_error.state_mismatch.message"))
+	assert.NotContains(t, body, i18n.T(context.Background(), "auth_error.ceremony_mismatch.message"),
+		"a state mismatch is not a ceremony mismatch, and the pages must not be interchangeable")
+}

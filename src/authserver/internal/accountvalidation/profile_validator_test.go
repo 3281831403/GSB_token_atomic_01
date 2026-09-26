@@ -1,0 +1,851 @@
+package accountvalidation
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"testing"
+	"time"
+
+	"errors"
+
+	mocks_data "github.com/leodip/goiabada/authserver/internal/data/mocks"
+	"github.com/leodip/goiabada/authserver/internal/models"
+	"github.com/leodip/goiabada/authserver/internal/testutil/fake"
+	"github.com/leodip/goiabada/core/gender"
+	"github.com/leodip/goiabada/core/i18n"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
+)
+
+// assertLocalizedError asserts that err is an *i18n.LocalizedError carrying the
+// expected code and rendering the expected English sentence.
+//
+// The sentence is asserted as well as the code because a code assertion alone
+// passes whatever the catalog happens to say: rewording an entry to describe a
+// different rule leaves every such test green while the user reads the wrong
+// instruction. Rewording validator.password.uppercase_required to ask for a
+// lowercase character survived the whole suite before this landed (#230).
+func assertLocalizedError(t *testing.T, err error, expectedCode string, expectedMessage string) {
+	t.Helper()
+	assert.Error(t, err)
+	locErr, ok := err.(*i18n.LocalizedError)
+	assert.True(t, ok, "expected *i18n.LocalizedError, got %T", err)
+	if ok {
+		assert.Equal(t, expectedCode, locErr.Code)
+		assert.Equal(t, expectedMessage, locErr.EnglishFallback())
+	}
+}
+
+// The English sentence each validator.profile.* code renders, transcribed from
+// src/core/i18n/catalogs/active.en.toml. The tables below are keyed by code and
+// carry many rows per code, so the sentence is stated once here rather than
+// repeated on every row; a code reaching a table without an entry here asserts
+// against the empty string and fails.
+//
+// validator.profile.website_too_long is absent deliberately: it is the one
+// profile message carrying an argument, so its sentence is asserted at the call
+// site that knows the limit.
+var profileErrorMessages = map[string]string{
+	i18n.ErrCodeProfileGivenNameInvalid: "Please enter a valid given name. It should contain only letters, " +
+		"spaces, hyphens, and apostrophes and be between 2 and 48 characters in length.",
+	i18n.ErrCodeProfileMiddleNameInvalid: "Please enter a valid middle name. It should contain only letters, " +
+		"spaces, hyphens, and apostrophes and be between 2 and 48 characters in length.",
+	i18n.ErrCodeProfileFamilyNameInvalid: "Please enter a valid family name. It should contain only letters, " +
+		"spaces, hyphens, and apostrophes and be between 2 and 48 characters in length.",
+	i18n.ErrCodeProfileUsernameInvalid: "Usernames must start with a letter and consist only of letters, " +
+		"numbers, and underscores. They must be between 2 and 24 characters long.",
+	i18n.ErrCodeProfileNicknameInvalid: "Nicknames must start with a letter and consist only of letters, " +
+		"numbers, and underscores. They must be between 2 and 24 characters long.",
+	i18n.ErrCodeProfileUsernameTaken:    "Sorry, this username is already taken.",
+	i18n.ErrCodeProfileWebsiteInvalid:   "Please enter a valid website URL.",
+	i18n.ErrCodeProfileGenderInvalid:    "Gender is invalid.",
+	i18n.ErrCodeProfileDobInvalidFormat: "The date of birth is invalid. Please use the format YYYY-MM-DD.",
+	i18n.ErrCodeProfileDobInFuture:      "The date of birth can't be in the future.",
+	i18n.ErrCodeProfileZoneInfoInvalid:  "The zone info is invalid.",
+	i18n.ErrCodeProfileLocaleInvalid:    "The locale is invalid.",
+}
+
+// =============================================================================
+// Tests for ValidateName
+//
+// The shared name pattern is `^[\p{L}\s'-]{2,48}$`: Unicode letters, spaces,
+// apostrophes and hyphens, 2 to 48 characters. An empty name is allowed, since
+// given / middle / family names are all optional.
+// =============================================================================
+
+func TestValidateName_Accepted(t *testing.T) {
+	validator := NewProfileValidator(mocks_data.NewDatabase(t))
+
+	testCases := []struct {
+		name  string
+		value string
+	}{
+		{"simple name", "Jane"},
+		{"two characters is the minimum", "Jo"},
+		{"hyphenated", "Mary-Jane"},
+		{"apostrophe", "O'Brien"},
+		{"space separated", "Mary Jane"},
+		{"accented letters", "José"},
+		{"cedilla", "Gonçalves"},
+		{"non-latin script", "Ольга"},
+		{"chinese characters", "李明"},
+		{"exactly 48 characters", strings.Repeat("a", 48)},
+		{"empty is allowed because the field is optional", ""},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validator.ValidateName(tc.value, i18n.ErrCodeProfileGivenNameInvalid)
+
+			assert.NoError(t, err)
+		})
+	}
+}
+
+// A name must contain at least one letter and may only use a literal space as a
+// separator. That rules out a value made entirely of separators and any value
+// spanning multiple lines.
+func TestValidateName_RejectsWhitespaceOnlyAndControlCharacters(t *testing.T) {
+	validator := NewProfileValidator(mocks_data.NewDatabase(t))
+
+	testCases := []struct {
+		name  string
+		value string
+	}{
+		{"two spaces only", "  "},
+		{"many spaces only", strings.Repeat(" ", 10)},
+		{"hyphens only", "--"},
+		{"apostrophes only", "''"},
+		{"mixed separators without a letter", " '- "},
+		{"embedded newline", "Jane\nDoe"},
+		{"embedded tab", "Jane\tDoe"},
+		{"embedded carriage return", "Jane\rDoe"},
+		{"trailing newline", "Jane\n"},
+		{"leading newline", "\nJane"},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validator.ValidateName(tc.value, i18n.ErrCodeProfileGivenNameInvalid)
+
+			assertLocalizedError(t, err, i18n.ErrCodeProfileGivenNameInvalid,
+				profileErrorMessages[i18n.ErrCodeProfileGivenNameInvalid])
+		})
+	}
+}
+
+// Padding with spaces is still accepted as long as a letter is present; the
+// pattern is not a trimming rule.
+func TestValidateName_AcceptsPaddedNames(t *testing.T) {
+	validator := NewProfileValidator(mocks_data.NewDatabase(t))
+
+	for _, value := range []string{" Jane", "Jane ", "  Jane  "} {
+		t.Run(value, func(t *testing.T) {
+			err := validator.ValidateName(value, i18n.ErrCodeProfileGivenNameInvalid)
+
+			assert.NoError(t, err)
+		})
+	}
+}
+
+// The subject on the input must resolve to a real user. A stale or forged
+// subject is an error rather than a localized validation failure, and must not
+// panic on the nil comparison that follows.
+func TestValidateProfile_UnresolvableSubjectReturnsError(t *testing.T) {
+	testCases := []struct {
+		name           string
+		usernameLookup func(mockDB *mocks_data.Database)
+	}{
+		{
+			name:           "username is free",
+			usernameLookup: func(mockDB *mocks_data.Database) {},
+		},
+		{
+			name: "username is taken by another user",
+			usernameLookup: func(mockDB *mocks_data.Database) {
+				// Never reached: the subject check short circuits first.
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			mockDB := mocks_data.NewDatabase(t)
+			validator := NewProfileValidator(mockDB)
+
+			mockDB.On("GetUserBySubject", mock.Anything, mock.Anything, "unknown-subject").Return(nil, nil).Once()
+			tc.usernameLookup(mockDB)
+
+			err := validator.ValidateProfile(context.Background(), &ValidateProfileInput{
+				Username: "jdoe",
+				Subject:  "unknown-subject",
+			})
+
+			assert.Error(t, err)
+			assert.Contains(t, err.Error(), "subject not found: unknown-subject")
+			_, isLocalized := err.(*i18n.LocalizedError)
+			assert.False(t, isLocalized, "an unresolvable subject is not a user-facing validation error")
+		})
+	}
+}
+
+func TestValidateName_Rejected(t *testing.T) {
+	validator := NewProfileValidator(mocks_data.NewDatabase(t))
+
+	testCases := []struct {
+		name  string
+		value string
+	}{
+		{"single character", "J"},
+		{"49 characters", strings.Repeat("a", 49)},
+		{"contains a digit", "Jane2"},
+		{"contains an underscore", "Jane_Doe"},
+		{"contains punctuation", "Jane."},
+		{"contains an at sign", "Jane@Doe"},
+		{"leading digit", "1Jane"},
+		{"emoji", "Jane😀"},
+		// Decision 3 of #275: the name shape is the only guard against markup in a
+		// name once nothing sanitizes. One row per character, so relaxing the
+		// pattern for either of them fails here with a reason attached.
+		{"pins decision 3 of #275: less-than is refused by the name shape", "Ann<e"},
+		{"pins decision 3 of #275: greater-than is refused by the name shape", "Ann>e"},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validator.ValidateName(tc.value, i18n.ErrCodeProfileGivenNameInvalid)
+
+			assertLocalizedError(t, err, i18n.ErrCodeProfileGivenNameInvalid,
+				profileErrorMessages[i18n.ErrCodeProfileGivenNameInvalid])
+		})
+	}
+}
+
+// The caller chooses the error code so the localized message names the right
+// field. ValidateName must return whichever code it was given.
+func TestValidateName_ReturnsTheCallerSuppliedCode(t *testing.T) {
+	validator := NewProfileValidator(mocks_data.NewDatabase(t))
+
+	codes := []string{
+		i18n.ErrCodeProfileGivenNameInvalid,
+		i18n.ErrCodeProfileMiddleNameInvalid,
+		i18n.ErrCodeProfileFamilyNameInvalid,
+	}
+
+	for _, code := range codes {
+		t.Run(code, func(t *testing.T) {
+			err := validator.ValidateName("J", code)
+
+			assertLocalizedError(t, err, code, profileErrorMessages[code])
+		})
+	}
+}
+
+// =============================================================================
+// Tests for ValidateProfile
+// =============================================================================
+
+func TestValidateProfile_EmptyInputIsValid(t *testing.T) {
+	validator := NewProfileValidator(mocks_data.NewDatabase(t))
+
+	// With no username there is no database lookup at all; NewDatabase(t) would
+	// fail the test if one happened.
+	err := validator.ValidateProfile(context.Background(), &ValidateProfileInput{})
+
+	assert.NoError(t, err)
+}
+
+// -----------------------------------------------------------------------------
+// Username
+// -----------------------------------------------------------------------------
+
+func TestValidateProfile_UsernameFormat(t *testing.T) {
+	subject := fake.UUID()
+
+	testCases := []struct {
+		name         string
+		username     string
+		expectedCode string
+	}{
+		{"letters only", "jdoe", ""},
+		{"letters and digits", "jdoe2", ""},
+		{"with underscore", "j_doe", ""},
+		{"two characters is the minimum", "jd", ""},
+		{"24 characters is the maximum", "j" + strings.Repeat("a", 23), ""},
+		{"single character is too short", "j", i18n.ErrCodeProfileUsernameInvalid},
+		{"25 characters is too long", "j" + strings.Repeat("a", 24), i18n.ErrCodeProfileUsernameInvalid},
+		{"must not start with a digit", "2jdoe", i18n.ErrCodeProfileUsernameInvalid},
+		{"must not start with an underscore", "_jdoe", i18n.ErrCodeProfileUsernameInvalid},
+		{"no hyphen", "j-doe", i18n.ErrCodeProfileUsernameInvalid},
+		{"no dot", "j.doe", i18n.ErrCodeProfileUsernameInvalid},
+		{"no space", "j doe", i18n.ErrCodeProfileUsernameInvalid},
+		{"no at sign", "j@doe", i18n.ErrCodeProfileUsernameInvalid},
+		{"no accented letters", "josé", i18n.ErrCodeProfileUsernameInvalid},
+		// Decision 3 of #275: the username pattern is the only guard against
+		// markup here once nothing sanitizes.
+		{"pins decision 3 of #275: no less-than", "us<er", i18n.ErrCodeProfileUsernameInvalid},
+		{"pins decision 3 of #275: no greater-than", "us>er", i18n.ErrCodeProfileUsernameInvalid},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			mockDB := mocks_data.NewDatabase(t)
+			validator := NewProfileValidator(mockDB)
+
+			// The format check runs after the uniqueness lookups, so both are
+			// always reached when a username is present.
+			user := &models.User{Id: 1, Subject: subject}
+			mockDB.On("GetUserBySubject", mock.Anything, mock.Anything, subject).Return(user, nil).Once()
+			mockDB.On("GetUserByUsername", mock.Anything, mock.Anything, tc.username).Return(nil, nil).Once()
+
+			err := validator.ValidateProfile(context.Background(), &ValidateProfileInput{
+				Username: tc.username,
+				Subject:  subject,
+			})
+
+			if tc.expectedCode == "" {
+				assert.NoError(t, err)
+				return
+			}
+			assertLocalizedError(t, err, tc.expectedCode, profileErrorMessages[tc.expectedCode])
+		})
+	}
+}
+
+func TestValidateProfile_UsernameTakenByAnotherUser(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewProfileValidator(mockDB)
+
+	subject := fake.UUID()
+	otherSubject := fake.UUID()
+
+	mockDB.On("GetUserBySubject", mock.Anything, mock.Anything, subject).Return(
+		&models.User{Id: 1, Subject: subject}, nil).Once()
+	mockDB.On("GetUserByUsername", mock.Anything, mock.Anything, "jdoe").Return(
+		&models.User{Id: 2, Subject: otherSubject}, nil).Once()
+
+	err := validator.ValidateProfile(context.Background(), &ValidateProfileInput{
+		Username: "jdoe",
+		Subject:  subject,
+	})
+
+	assertLocalizedError(t, err, i18n.ErrCodeProfileUsernameTaken,
+		profileErrorMessages[i18n.ErrCodeProfileUsernameTaken])
+}
+
+// Keeping your own username must not be reported as taken.
+func TestValidateProfile_UsernameOwnedBySameUserIsAllowed(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewProfileValidator(mockDB)
+
+	subject := fake.UUID()
+	user := &models.User{Id: 1, Subject: subject}
+
+	mockDB.On("GetUserBySubject", mock.Anything, mock.Anything, subject).Return(user, nil).Once()
+	mockDB.On("GetUserByUsername", mock.Anything, mock.Anything, "jdoe").Return(user, nil).Once()
+
+	err := validator.ValidateProfile(context.Background(), &ValidateProfileInput{
+		Username: "jdoe",
+		Subject:  subject,
+	})
+
+	assert.NoError(t, err)
+}
+
+func TestValidateProfile_UsernameLookupErrorsPropagate(t *testing.T) {
+	subject := fake.UUID()
+	dbErr := errors.New("database is down")
+
+	t.Run("GetUserBySubject fails", func(t *testing.T) {
+		mockDB := mocks_data.NewDatabase(t)
+		validator := NewProfileValidator(mockDB)
+
+		mockDB.On("GetUserBySubject", mock.Anything, mock.Anything, subject).Return(nil, dbErr).Once()
+
+		err := validator.ValidateProfile(context.Background(), &ValidateProfileInput{
+			Username: "jdoe",
+			Subject:  subject,
+		})
+
+		assert.Error(t, err)
+		_, isLocalized := err.(*i18n.LocalizedError)
+		assert.False(t, isLocalized, "a database failure is not a validation error")
+	})
+
+	t.Run("GetUserByUsername fails", func(t *testing.T) {
+		mockDB := mocks_data.NewDatabase(t)
+		validator := NewProfileValidator(mockDB)
+
+		mockDB.On("GetUserBySubject", mock.Anything, mock.Anything, subject).Return(
+			&models.User{Id: 1, Subject: subject}, nil).Once()
+		mockDB.On("GetUserByUsername", mock.Anything, mock.Anything, "jdoe").Return(nil, dbErr).Once()
+
+		err := validator.ValidateProfile(context.Background(), &ValidateProfileInput{
+			Username: "jdoe",
+			Subject:  subject,
+		})
+
+		assert.Error(t, err)
+		_, isLocalized := err.(*i18n.LocalizedError)
+		assert.False(t, isLocalized)
+	})
+}
+
+// -----------------------------------------------------------------------------
+// Names, nickname, website
+// -----------------------------------------------------------------------------
+
+// ValidateProfile delegates to ValidateName for each of the three name fields,
+// and must surface the code matching the field that actually failed.
+func TestValidateProfile_NameFieldsReportTheirOwnCode(t *testing.T) {
+	testCases := []struct {
+		name         string
+		input        ValidateProfileInput
+		expectedCode string
+	}{
+		{
+			name:         "given name",
+			input:        ValidateProfileInput{GivenName: "J"},
+			expectedCode: i18n.ErrCodeProfileGivenNameInvalid,
+		},
+		{
+			name:         "middle name",
+			input:        ValidateProfileInput{MiddleName: "Q1"},
+			expectedCode: i18n.ErrCodeProfileMiddleNameInvalid,
+		},
+		{
+			name:         "family name",
+			input:        ValidateProfileInput{FamilyName: "Doe_"},
+			expectedCode: i18n.ErrCodeProfileFamilyNameInvalid,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			validator := NewProfileValidator(mocks_data.NewDatabase(t))
+
+			err := validator.ValidateProfile(context.Background(), &tc.input)
+
+			assertLocalizedError(t, err, tc.expectedCode, profileErrorMessages[tc.expectedCode])
+		})
+	}
+}
+
+// The given name is checked before the middle name, which is checked before the
+// family name. That ordering decides which error the user sees first.
+func TestValidateProfile_NameFieldsAreCheckedInOrder(t *testing.T) {
+	validator := NewProfileValidator(mocks_data.NewDatabase(t))
+
+	err := validator.ValidateProfile(context.Background(), &ValidateProfileInput{
+		GivenName:  "J",
+		MiddleName: "Q1",
+		FamilyName: "Doe_",
+	})
+
+	assertLocalizedError(t, err, i18n.ErrCodeProfileGivenNameInvalid,
+		profileErrorMessages[i18n.ErrCodeProfileGivenNameInvalid])
+}
+
+func TestValidateProfile_ValidNamesPass(t *testing.T) {
+	validator := NewProfileValidator(mocks_data.NewDatabase(t))
+
+	err := validator.ValidateProfile(context.Background(), &ValidateProfileInput{
+		GivenName:  "Jane",
+		MiddleName: "Mary-Anne",
+		FamilyName: "O'Brien",
+	})
+
+	assert.NoError(t, err)
+}
+
+// The nickname uses the same pattern as the username.
+func TestValidateProfile_Nickname(t *testing.T) {
+	testCases := []struct {
+		name         string
+		nickname     string
+		expectedCode string
+	}{
+		{"valid", "jd", ""},
+		{"with digits and underscore", "jd_2", ""},
+		{"24 characters", "j" + strings.Repeat("a", 23), ""},
+		{"too short", "j", i18n.ErrCodeProfileNicknameInvalid},
+		{"too long", "j" + strings.Repeat("a", 24), i18n.ErrCodeProfileNicknameInvalid},
+		{"leading digit", "2jd", i18n.ErrCodeProfileNicknameInvalid},
+		{"hyphen", "j-d", i18n.ErrCodeProfileNicknameInvalid},
+		{"space", "j d", i18n.ErrCodeProfileNicknameInvalid},
+		{"empty is allowed", "", ""},
+		// Decision 3 of #275: the nickname pattern is the only guard against
+		// markup here once nothing sanitizes.
+		{"pins decision 3 of #275: no less-than", "ni<ck", i18n.ErrCodeProfileNicknameInvalid},
+		{"pins decision 3 of #275: no greater-than", "ni>ck", i18n.ErrCodeProfileNicknameInvalid},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			validator := NewProfileValidator(mocks_data.NewDatabase(t))
+
+			err := validator.ValidateProfile(context.Background(), &ValidateProfileInput{Nickname: tc.nickname})
+
+			if tc.expectedCode == "" {
+				assert.NoError(t, err)
+				return
+			}
+			assertLocalizedError(t, err, tc.expectedCode, profileErrorMessages[tc.expectedCode])
+		})
+	}
+}
+
+func TestValidateProfile_Website(t *testing.T) {
+	testCases := []struct {
+		name         string
+		website      string
+		expectedCode string
+	}{
+		{"https", "https://example.com", ""},
+		{"http", "http://example.com", ""},
+		{"no scheme", "example.com", ""},
+		{"with www", "www.example.com", ""},
+		{"with a path", "https://example.com/about", ""},
+		{"with a subdomain", "https://blog.example.com", ""},
+		{"with a hyphenated host", "https://my-site.example.com", ""},
+		{"empty is allowed", "", ""},
+		{"no dot", "https://example", i18n.ErrCodeProfileWebsiteInvalid},
+		{"trailing dot only", "example.", i18n.ErrCodeProfileWebsiteInvalid},
+		{"single-character tld", "example.c", i18n.ErrCodeProfileWebsiteInvalid},
+		{"space inside", "https://exa mple.com", i18n.ErrCodeProfileWebsiteInvalid},
+		{"unsupported scheme", "ftp://example.com", i18n.ErrCodeProfileWebsiteInvalid},
+		{"just a word", "notaurl", i18n.ErrCodeProfileWebsiteInvalid},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			validator := NewProfileValidator(mocks_data.NewDatabase(t))
+
+			err := validator.ValidateProfile(context.Background(), &ValidateProfileInput{Website: tc.website})
+
+			if tc.expectedCode == "" {
+				assert.NoError(t, err)
+				return
+			}
+			assertLocalizedError(t, err, tc.expectedCode, profileErrorMessages[tc.expectedCode])
+		})
+	}
+}
+
+// The website length cap is 96 characters. Note that the format check runs
+// first, so an over-long value must still be a well-formed URL to reach it.
+func TestValidateProfile_WebsiteTooLong(t *testing.T) {
+	validator := NewProfileValidator(mocks_data.NewDatabase(t))
+
+	// "https://" (8) + host + "/" + padding, over 96 characters in total.
+	longWebsite := "https://example.com/" + strings.Repeat("a", 80)
+	assert.Greater(t, len(longWebsite), 96)
+
+	err := validator.ValidateProfile(context.Background(), &ValidateProfileInput{Website: longWebsite})
+
+	assertLocalizedError(t, err, i18n.ErrCodeProfileWebsiteTooLong,
+		"Please ensure the website URL is no longer than 96 characters.")
+
+	locErr, ok := err.(*i18n.LocalizedError)
+	assert.True(t, ok)
+	if ok {
+		assert.Equal(t, 96, locErr.Args["max"], "the message must carry the limit for interpolation")
+	}
+}
+
+func TestValidateProfile_WebsiteAtTheLengthLimitIsAccepted(t *testing.T) {
+	validator := NewProfileValidator(mocks_data.NewDatabase(t))
+
+	prefix := "https://example.com/"
+	website := prefix + strings.Repeat("a", 96-len(prefix))
+	assert.Len(t, website, 96)
+
+	err := validator.ValidateProfile(context.Background(), &ValidateProfileInput{Website: website})
+
+	assert.NoError(t, err)
+}
+
+// -----------------------------------------------------------------------------
+// Gender
+// -----------------------------------------------------------------------------
+
+func TestValidateProfile_Gender(t *testing.T) {
+	testCases := []struct {
+		name         string
+		gender       string
+		expectedCode string
+	}{
+		{"female", fmt.Sprintf("%d", int(gender.GenderFemale)), ""},
+		{"male", fmt.Sprintf("%d", int(gender.GenderMale)), ""},
+		{"other", fmt.Sprintf("%d", int(gender.GenderOther)), ""},
+		{"empty is allowed", "", ""},
+		{"not a number", "female", i18n.ErrCodeProfileGenderInvalid},
+		{"out of range high", "3", i18n.ErrCodeProfileGenderInvalid},
+		{"negative", "-1", i18n.ErrCodeProfileGenderInvalid},
+		{"float", "1.5", i18n.ErrCodeProfileGenderInvalid},
+		{"whitespace", " 1", i18n.ErrCodeProfileGenderInvalid},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			validator := NewProfileValidator(mocks_data.NewDatabase(t))
+
+			err := validator.ValidateProfile(context.Background(), &ValidateProfileInput{Gender: tc.gender})
+
+			if tc.expectedCode == "" {
+				assert.NoError(t, err)
+				return
+			}
+			assertLocalizedError(t, err, tc.expectedCode, profileErrorMessages[tc.expectedCode])
+		})
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Date of birth
+// -----------------------------------------------------------------------------
+
+func TestValidateProfile_DateOfBirthFormat(t *testing.T) {
+	testCases := []struct {
+		name         string
+		dob          string
+		expectedCode string
+	}{
+		{"valid date", "1990-05-15", ""},
+		{"leap day", "2000-02-29", ""},
+		{"empty is allowed", "", ""},
+		{"slashes instead of hyphens", "1990/05/15", i18n.ErrCodeProfileDobInvalidFormat},
+		{"day first", "15-05-1990", i18n.ErrCodeProfileDobInvalidFormat},
+		{"missing day", "1990-05", i18n.ErrCodeProfileDobInvalidFormat},
+		{"not a date", "not-a-date", i18n.ErrCodeProfileDobInvalidFormat},
+		{"month 13", "1990-13-01", i18n.ErrCodeProfileDobInvalidFormat},
+		{"day 32", "1990-01-32", i18n.ErrCodeProfileDobInvalidFormat},
+		{"non-leap february 29", "1990-02-29", i18n.ErrCodeProfileDobInvalidFormat},
+		{"includes a time", "1990-05-15T10:00:00Z", i18n.ErrCodeProfileDobInvalidFormat},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			validator := NewProfileValidator(mocks_data.NewDatabase(t))
+
+			err := validator.ValidateProfile(context.Background(), &ValidateProfileInput{DateOfBirth: tc.dob})
+
+			if tc.expectedCode == "" {
+				assert.NoError(t, err)
+				return
+			}
+			assertLocalizedError(t, err, tc.expectedCode, profileErrorMessages[tc.expectedCode])
+		})
+	}
+}
+
+// Two days ahead of UTC, not one. One day ahead is deliberately accepted now: with no
+// timezone on the input the server cannot tell "tomorrow" from "today in UTC+14".
+//
+// This test used to use one day ahead and assert rejection, while
+// TestValidateProfile_DateOfBirthLocalTodayIsAccepted asserted the same string was
+// accepted. During the hour each day when the local and UTC dates differ those are the
+// identical input with opposite expectations, so no implementation could satisfy both.
+// TestValidateProfile_DateOfBirthTimezoneToleranceBoundary pins the resolution without
+// depending on the clock.
+func TestValidateProfile_DateOfBirthInTheFuture(t *testing.T) {
+	validator := NewProfileValidator(mocks_data.NewDatabase(t))
+
+	dayAfterTomorrow := time.Now().UTC().AddDate(0, 0, 2).Format("2006-01-02")
+
+	err := validator.ValidateProfile(context.Background(), &ValidateProfileInput{DateOfBirth: dayAfterTomorrow})
+
+	assertLocalizedError(t, err, i18n.ErrCodeProfileDobInFuture,
+		profileErrorMessages[i18n.ErrCodeProfileDobInFuture])
+}
+
+// The tolerance boundary, expressed as offsets from the UTC date, so it holds at every
+// hour and in every server timezone. The three tests around this one derive their input
+// from time.Now() and therefore only exercise the interesting case for part of the day,
+// which is why the original bug stayed hidden for three days and then failed in CI.
+func TestValidateProfile_DateOfBirthTimezoneToleranceBoundary(t *testing.T) {
+	utcNow := time.Now().UTC()
+
+	testCases := []struct {
+		name       string
+		daysAhead  int
+		wantReject bool
+	}{
+		{"the UTC date itself is accepted", 0, false},
+		// Somebody's today, at any positive offset up to UTC+14.
+		{"one day ahead of UTC is accepted", 1, false},
+		// Nobody's today: offsets stop at UTC+14, so this cannot be a local date.
+		{"two days ahead of UTC is rejected", 2, true},
+		{"a year ahead is rejected", 365, true},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			validator := NewProfileValidator(mocks_data.NewDatabase(t))
+			date := utcNow.AddDate(0, 0, tc.daysAhead).Format("2006-01-02")
+
+			err := validator.ValidateProfile(context.Background(), &ValidateProfileInput{DateOfBirth: date})
+
+			if tc.wantReject {
+				assertLocalizedError(t, err, i18n.ErrCodeProfileDobInFuture,
+					profileErrorMessages[i18n.ErrCodeProfileDobInFuture])
+				return
+			}
+			assert.NoError(t, err)
+		})
+	}
+}
+
+// The comparison is date-only and anchored in UTC, so the current UTC date is
+// never treated as future-dated regardless of the server's timezone. This test
+// is the regression guard for that: it fails whenever "today" is derived from
+// local components again, but only during the hours where local and UTC dates
+// differ, so read a failure here as a timezone-anchoring bug rather than flake.
+func TestValidateProfile_DateOfBirthTodayIsAccepted(t *testing.T) {
+	validator := NewProfileValidator(mocks_data.NewDatabase(t))
+
+	today := time.Now().UTC().Format("2006-01-02")
+
+	err := validator.ValidateProfile(context.Background(), &ValidateProfileInput{DateOfBirth: today})
+
+	assert.NoError(t, err)
+}
+
+// The local date is also accepted, whether it is the same day as UTC or the day
+// before. This covers the other side of a timezone offset.
+func TestValidateProfile_DateOfBirthLocalTodayIsAccepted(t *testing.T) {
+	validator := NewProfileValidator(mocks_data.NewDatabase(t))
+
+	localToday := time.Now().Format("2006-01-02")
+
+	err := validator.ValidateProfile(context.Background(), &ValidateProfileInput{DateOfBirth: localToday})
+
+	assert.NoError(t, err)
+}
+
+func TestValidateProfile_DateOfBirthYesterdayIsAccepted(t *testing.T) {
+	validator := NewProfileValidator(mocks_data.NewDatabase(t))
+
+	yesterday := time.Now().UTC().AddDate(0, 0, -1).Format("2006-01-02")
+
+	err := validator.ValidateProfile(context.Background(), &ValidateProfileInput{DateOfBirth: yesterday})
+
+	assert.NoError(t, err)
+}
+
+// A date comfortably in the past is accepted regardless of timezone, so this
+// case holds no matter where the server runs.
+func TestValidateProfile_DateOfBirthWellInThePastIsAccepted(t *testing.T) {
+	validator := NewProfileValidator(mocks_data.NewDatabase(t))
+
+	err := validator.ValidateProfile(context.Background(), &ValidateProfileInput{DateOfBirth: "1990-05-15"})
+
+	assert.NoError(t, err)
+}
+
+// -----------------------------------------------------------------------------
+// Zone info and locale
+//
+// Both are checked against the generated catalogs, so the tests source their
+// valid values from those catalogs rather than hardcoding one that a tzdata
+// refresh could remove.
+// -----------------------------------------------------------------------------
+
+func TestValidateProfile_ZoneInfo(t *testing.T) {
+	validator := NewProfileValidator(mocks_data.NewDatabase(t))
+
+	t.Run("a zone from the catalog is accepted", func(t *testing.T) {
+		err := validator.ValidateProfile(context.Background(), &ValidateProfileInput{ZoneInfo: "America/Sao_Paulo"})
+
+		assert.NoError(t, err)
+	})
+
+	t.Run("empty is allowed", func(t *testing.T) {
+		err := validator.ValidateProfile(context.Background(), &ValidateProfileInput{ZoneInfo: ""})
+
+		assert.NoError(t, err)
+	})
+
+	t.Run("rejections", func(t *testing.T) {
+		for _, zone := range []string{"Not/AZone", "UTC+3", "america/sao_paulo", "Sao_Paulo"} {
+			t.Run(zone, func(t *testing.T) {
+				err := validator.ValidateProfile(context.Background(), &ValidateProfileInput{ZoneInfo: zone})
+
+				assertLocalizedError(t, err, i18n.ErrCodeProfileZoneInfoInvalid,
+					profileErrorMessages[i18n.ErrCodeProfileZoneInfoInvalid])
+			})
+		}
+	})
+}
+
+func TestValidateProfile_Locale(t *testing.T) {
+	validator := NewProfileValidator(mocks_data.NewDatabase(t))
+
+	t.Run("a locale from the catalog is accepted", func(t *testing.T) {
+		err := validator.ValidateProfile(context.Background(), &ValidateProfileInput{Locale: "pt-BR"})
+
+		assert.NoError(t, err)
+	})
+
+	t.Run("empty is allowed", func(t *testing.T) {
+		err := validator.ValidateProfile(context.Background(), &ValidateProfileInput{Locale: ""})
+
+		assert.NoError(t, err)
+	})
+
+	t.Run("rejections", func(t *testing.T) {
+		for _, locale := range []string{"xx-XX", "not-a-locale", "PT-br", "pt_BR"} {
+			t.Run(locale, func(t *testing.T) {
+				err := validator.ValidateProfile(context.Background(), &ValidateProfileInput{Locale: locale})
+
+				assertLocalizedError(t, err, i18n.ErrCodeProfileLocaleInvalid,
+					profileErrorMessages[i18n.ErrCodeProfileLocaleInvalid])
+			})
+		}
+	})
+}
+
+// -----------------------------------------------------------------------------
+// A fully populated valid profile
+// -----------------------------------------------------------------------------
+
+func TestValidateProfile_FullyPopulatedValidProfile(t *testing.T) {
+	mockDB := mocks_data.NewDatabase(t)
+	validator := NewProfileValidator(mockDB)
+
+	subject := fake.UUID()
+	user := &models.User{Id: 1, Subject: subject}
+
+	mockDB.On("GetUserBySubject", mock.Anything, mock.Anything, subject).Return(user, nil).Once()
+	mockDB.On("GetUserByUsername", mock.Anything, mock.Anything, "jdoe").Return(user, nil).Once()
+
+	err := validator.ValidateProfile(context.Background(), &ValidateProfileInput{
+		Username:            "jdoe",
+		GivenName:           "Jane",
+		MiddleName:          "Mary",
+		FamilyName:          "O'Brien",
+		Nickname:            "jd",
+		Website:             "https://example.com",
+		Gender:              fmt.Sprintf("%d", int(gender.GenderFemale)),
+		DateOfBirth:         "1990-05-15",
+		ZoneInfoCountryName: "Brazil",
+		ZoneInfo:            "America/Sao_Paulo",
+		Locale:              "pt-BR",
+		Subject:             subject,
+	})
+
+	assert.NoError(t, err)
+}
+
+// ZoneInfoCountryName is carried on the input but is not validated, so any
+// value passes. Pinning that prevents a false assumption that it is checked.
+func TestValidateProfile_ZoneInfoCountryNameIsNotValidated(t *testing.T) {
+	validator := NewProfileValidator(mocks_data.NewDatabase(t))
+
+	err := validator.ValidateProfile(context.Background(), &ValidateProfileInput{
+		ZoneInfoCountryName: "Not A Real Country",
+	})
+
+	assert.NoError(t, err)
+}

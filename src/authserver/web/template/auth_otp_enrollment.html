@@ -1,0 +1,51 @@
+{{define "title"}}{{ .appName }} - {{ T $.ctx "auth.otp_enrollment.page_title" }}{{end}}
+{{define "head"}}
+
+{{end}}
+
+{{define "body"}}
+
+
+    <h2 class='mb-2 text-xl font-semibold text-center'>{{ T $.ctx "auth.otp_enrollment.title" }}</h2>
+    <form action="" method="post">
+
+        <input type="hidden" name="ceremonyId" value="{{.ceremonyId}}" />
+
+        <div class="mb-3">
+
+            <p class="mt-5">{{ T $.ctx "auth.otp_enrollment.intro" }}</p>
+
+            <p class="mt-2"><strong class="text-lg">1.</strong> {{ T $.ctx "auth.otp_enrollment.step1_prefix" }}<a
+                    href="https://www.microsoft.com/en/security/mobile-authenticator-app"><span
+                        class="inline-block transition duration-200 text-primary hover:text-primary hover:underline hover:cursor-pointer">{{ T $.ctx "auth.otp_enrollment.step1_microsoft_label" }}</span></a>{{ T $.ctx "auth.otp_enrollment.step1_separator1" }}<a
+                    href="https://support.google.com/accounts/answer/1066447"><span
+                        class="inline-block transition duration-200 text-primary hover:text-primary hover:underline hover:cursor-pointer">{{ T $.ctx "auth.otp_enrollment.step1_google_label" }}</span></a>{{ T $.ctx "auth.otp_enrollment.step1_separator2" }}<a href="https://freeotp.github.io/"><span
+                        class="inline-block transition duration-200 text-primary hover:text-primary hover:underline hover:cursor-pointer">{{ T $.ctx "auth.otp_enrollment.step1_freeotp_label" }}</span></a>{{ T $.ctx "auth.otp_enrollment.step1_suffix" }}
+            </p>
+
+            <p class="mt-2"><strong class="text-lg">2.</strong> {{ T $.ctx "auth.otp_enrollment.step2" }}</p>
+
+            <img class="mx-auto mt-4 border rounded" src="data:image/png;base64,{{.base64Image}}" alt="{{ T $.ctx "auth.otp_enrollment.qr_alt" }}" />
+
+            <p class="mt-2">{{ T $.ctx "auth.otp_enrollment.scan_alternative" }}</p>
+            <pre class="mt-2 text-center">{{.secretKey}}</pre>
+
+            <p class="mt-2"><strong class="text-lg">3.</strong> {{ T $.ctx "auth.otp_enrollment.step3" }}</p>
+
+            <div class="w-full mt-4 form-control">
+                <input type="text" name="otp" value="" placeholder="123456" autofocus
+                    class="w-full input input-bordered" autocomplete="off" />
+            </div>
+
+        </div>
+
+        {{if .error}}
+            <p class="mt-2 text-center text-error">{{.error}}</p>
+        {{end}}
+
+        <button class="w-full mt-2 btn btn-primary">{{ T $.ctx "auth.otp.button" }}</button>
+
+    </form>
+
+
+{{end}}

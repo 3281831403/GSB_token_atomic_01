@@ -1,0 +1,84 @@
+package apihandlers
+
+import (
+	"bytes"
+	"database/sql"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	mocks_audit "github.com/leodip/goiabada/authserver/internal/audit/mocks"
+	mocks_data "github.com/leodip/goiabada/authserver/internal/data/mocks"
+	"github.com/leodip/goiabada/authserver/internal/models"
+	"github.com/leodip/goiabada/core/api"
+	"github.com/leodip/goiabada/core/constants"
+	"github.com/leodip/goiabada/core/validators"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
+)
+
+// TestHandleAPIResourcePermissionsPut_BuiltInPermissionMissingFromDB verifies that when
+// a built-in permission is missing from the system resource's database rows, the handler
+// returns HTTP 500 with an appropriate integrity error message.
+// This is a unit test because simulating a missing built-in permission in integration tests
+// would cascade FK deletions that can't be rolled back.
+func TestHandleAPIResourcePermissionsPut_BuiltInPermissionMissingFromDB(t *testing.T) {
+	database := mocks_data.NewDatabase(t)
+	auditLogger := mocks_audit.NewAuditLogger(t)
+	identifierValidator := validators.NewIdentifierValidator()
+
+	handler := HandleAPIResourcePermissionsPut(database, identifierValidator, auditLogger)
+
+	// System-level resource (authserver)
+	resource := &models.Resource{
+		Id:                 1,
+		ResourceIdentifier: constants.AuthServerResourceIdentifier,
+	}
+
+	// Return existing permissions that are MISSING the "manage" built-in permission
+	existingPerms := []models.Permission{
+		{Id: 10, PermissionIdentifier: constants.UserinfoPermissionIdentifier, ResourceId: 1, Description: "Userinfo"},
+		{Id: 11, PermissionIdentifier: constants.ManageAccountPermissionIdentifier, ResourceId: 1, Description: "Manage account"},
+		// "manage" is intentionally missing
+		{Id: 13, PermissionIdentifier: constants.AdminReadPermissionIdentifier, ResourceId: 1, Description: "Admin read"},
+		{Id: 14, PermissionIdentifier: constants.ManageUsersPermissionIdentifier, ResourceId: 1, Description: "Manage users"},
+		{Id: 15, PermissionIdentifier: constants.ManageClientsPermissionIdentifier, ResourceId: 1, Description: "Manage clients"},
+		{Id: 16, PermissionIdentifier: constants.ManageSettingsPermissionIdentifier, ResourceId: 1, Description: "Manage settings"},
+	}
+
+	database.On("GetResourceById", mock.Anything, (*sql.Tx)(nil), int64(1)).Return(resource, nil)
+	database.On("GetPermissionsByResourceId", mock.Anything, (*sql.Tx)(nil), int64(1)).Return(existingPerms, nil)
+
+	// Build a valid request body that includes all the permissions we have
+	var permUpserts []api.ResourcePermissionUpsert
+	for _, p := range existingPerms {
+		permUpserts = append(permUpserts, api.ResourcePermissionUpsert{
+			Id:                   p.Id,
+			PermissionIdentifier: p.PermissionIdentifier,
+			Description:          p.Description,
+		})
+	}
+	reqBody := api.UpdateResourcePermissionsRequest{Permissions: permUpserts}
+	body, _ := json.Marshal(reqBody)
+
+	req, _ := http.NewRequest("PUT", "/api/v1/admin/resources/1/permissions", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req = setChiURLParam(req, "resourceId", "1")
+	rr := httptest.NewRecorder()
+
+	handler.ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusInternalServerError, rr.Code)
+
+	// The detail is in the log, not on the wire: every 500 on this surface answers the one
+	// code and the one sentence, and the identifier that is missing goes to the operator as a
+	// structured attribute (#279 decision 7).
+	var response map[string]interface{}
+	err := json.Unmarshal(rr.Body.Bytes(), &response)
+	assert.NoError(t, err)
+	assert.Equal(t, "INTERNAL_SERVER_ERROR", response["error_code"])
+	assert.Contains(t, response["error_description"], "An unexpected server error has occurred")
+
+	database.AssertExpectations(t)
+}
